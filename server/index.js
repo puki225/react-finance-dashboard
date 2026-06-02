@@ -85,7 +85,7 @@ app.get('/api/revenue-trend', async (req, res) => {
   }
 });
 
-// Gateway split
+// Gateway split (totals for legend)
 app.get('/api/gateway-split', async (req, res) => {
   const { from, to } = req.query;
   const dateFrom = from || '2020-01-01';
@@ -103,6 +103,33 @@ app.get('/api/gateway-split', async (req, res) => {
       GROUP BY gateway
       ORDER BY revenue DESC
     `, [dateFrom, dateTo]);
+
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Gateway split over time (for stacked bar chart)
+app.get('/api/gateway-trend', async (req, res) => {
+  const { from, to, period } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : 'day';
+
+  try {
+    const result = await pool.query(`
+      SELECT
+        DATE_TRUNC($1, order_date)::date AS period,
+        gateway,
+        SUM(net_revenue)::numeric AS revenue
+      FROM shopify_orders
+      WHERE order_date::date BETWEEN $2 AND $3
+        AND financial_status != 'voided'
+      GROUP BY 1, 2
+      ORDER BY 1, 2
+    `, [trunc, dateFrom, dateTo]);
 
     res.json(result.rows);
   } catch (err) {
