@@ -1,7 +1,7 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import {
   AreaChart, Area, BarChart, Bar,
-  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
+  XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer
 } from 'recharts';
 import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
@@ -35,7 +35,7 @@ const GatewayTooltip = ({ active, payload, label }) => {
   const total = payload.reduce((s, p) => s + (p.value || 0), 0);
   return (
     <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
-      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{label}</div>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDate(label)}</div>
       {payload.map((p, i) => (
         <div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>
           {p.name}: {fmt(p.value)}
@@ -48,26 +48,58 @@ const GatewayTooltip = ({ active, payload, label }) => {
   );
 };
 
+// Pivot flat [{period, gateway, revenue}] → [{period, shopify_payments: x, paypal: y, ...}]
+function pivotGatewayData(rows) {
+  const map = {};
+  const keys = new Set();
+  for (const row of rows) {
+    if (!map[row.period]) map[row.period] = { period: row.period };
+    map[row.period][row.gateway] = parseFloat(row.revenue || 0);
+    keys.add(row.gateway);
+  }
+  return { data: Object.values(map).sort((a, b) => a.period > b.period ? 1 : -1), keys: [...keys] };
+}
+
+// Compute Y domain with 5% padding above, floor just below min
+function computeDomain(data, keys) {
+  if (!data || !data.length) return ['auto', 'auto'];
+  let min = Infinity, max = -Infinity;
+  for (const row of data) {
+    for (const k of keys) {
+      const v = parseFloat(row[k] || 0);
+      if (v < min) min = v;
+      if (v > max) max = v;
+    }
+  }
+  if (!isFinite(min) || !isFinite(max)) return ['auto', 'auto'];
+  const pad = (max - min) * 0.1 || max * 0.1 || 100;
+  const lo = Math.max(0, Math.floor((min - pad) / 100) * 100);
+  const hi = Math.ceil((max + pad) / 100) * 100;
+  return [lo, hi];
+}
+
 export default function SalesSummary() {
   const [range, setRange] = useState(getRange({ days: 30 }));
   const [period, setPeriod] = useState('day');
 
   const { data: summary, loading: loadingSummary } = useApi('/api/summary', range);
   const { data: trend, loading: loadingTrend } = useApi('/api/revenue-trend', { ...range, period });
-  const { data: gateway, loading: loadingGateway } = useApi('/api/gateway-split', range);
+  const { data: gatewayRaw, loading: loadingGateway } = useApi('/api/gateway-trend', { ...range, period });
+  const { data: gatewaySummary } = useApi('/api/gateway-split', range);
   const { data: fees } = useApi('/api/fees', range);
   const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8 });
 
   const loading = loadingSummary || loadingTrend;
 
-  // Transform gateway flat array → single stacked bar data point
-  const gatewayBarData = gateway && gateway.length
-    ? [gateway.reduce((acc, g) => {
-        acc[g.gateway] = parseFloat(g.revenue || 0);
-        return acc;
-      }, { name: 'Revenue' })]
-    : [];
-  const gatewayKeys = (gateway || []).map(g => g.gateway);
+  const { data: gatewayData, keys: gatewayKeys } = useMemo(
+    () => pivotGatewayData(gatewayRaw || []),
+    [gatewayRaw]
+  );
+
+  const revenueDomain = useMemo(
+    () => computeDomain(trend || [], ['gross_revenue', 'net_revenue']),
+    [trend]
+  );
 
   return (
     <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
@@ -124,14 +156,20 @@ export default function SalesSummary() {
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
-              <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+              <XAxis
+                dataKey="period"
+                tickFormatter={fmtDate}
+                tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }}
+                axisLine={false}
+                tickLine={false}
+              />
               <YAxis
                 tickFormatter={fmt}
                 tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }}
                 axisLine={false}
                 tickLine={false}
                 width={70}
-                domain={['auto', 'auto']}
+                domain={revenueDomain}
               />
               <Tooltip content={<CustomTooltip />} />
               <Area type="monotone" dataKey="gross_revenue" name="Gross" stroke="#7c6af7" strokeWidth={2} fill="url(#gradGross)" />
@@ -144,7 +182,7 @@ export default function SalesSummary() {
       {/* Bottom row: Gateway stacked bar + Orders bar */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
 
-        {/* Gateway Split — stacked bar */}
+        {/* Gateway Split — stacked bar over time */}
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Payment Gateway</h2>
           {loadingGateway ? (
@@ -152,25 +190,42 @@ export default function SalesSummary() {
           ) : (
             <>
               <ResponsiveContainer width="100%" height={140}>
-                <BarChart data={gatewayBarData} layout="vertical" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" horizontal={false} />
-                  <XAxis type="number" tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                  <YAxis type="category" dataKey="name" hide />
+                <BarChart data={gatewayData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
+                  <XAxis
+                    dataKey="period"
+                    tickFormatter={fmtDate}
+                    tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    tickFormatter={fmt}
+                    tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }}
+                    axisLine={false}
+                    tickLine={false}
+                    width={55}
+                  />
                   <Tooltip content={<GatewayTooltip />} />
                   {gatewayKeys.map((key, i) => (
-                    <Bar key={key} dataKey={key} stackId="a" fill={COLORS[i % COLORS.length]} radius={i === gatewayKeys.length - 1 ? [0, 4, 4, 0] : [0, 0, 0, 0]} />
+                    <Bar
+                      key={key}
+                      dataKey={key}
+                      name={key.replace(/_/g, ' ')}
+                      stackId="a"
+                      fill={COLORS[i % COLORS.length]}
+                      radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]}
+                    />
                   ))}
                 </BarChart>
               </ResponsiveContainer>
               {/* Legend */}
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 16px', marginTop: 16 }}>
-                {(gateway || []).map((g, i) => (
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
+                {(gatewaySummary || []).map((g, i) => (
                   <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <div style={{ width: 8, height: 8, borderRadius: 2, background: COLORS[i % COLORS.length], flexShrink: 0 }} />
-                    <div>
-                      <span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace('_', ' ')}</span>
-                      <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginLeft: 6 }}>{fmt(g.revenue)} · {g.orders} orders</span>
-                    </div>
+                    <span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span>
+                    <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</span>
                   </div>
                 ))}
               </div>
@@ -234,7 +289,7 @@ export default function SalesSummary() {
                 </td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{fmt(o.gross_revenue)}</td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{fmt(o.net_revenue)}</td>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace('_', ' ')}</td>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
               </tr>
             ))}
