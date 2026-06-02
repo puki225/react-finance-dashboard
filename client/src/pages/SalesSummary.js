@@ -1,6 +1,6 @@
 import React, { useState } from 'react';
 import {
-  AreaChart, Area, BarChart, Bar, PieChart, Pie, Cell,
+  AreaChart, Area, BarChart, Bar,
   XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend
 } from 'recharts';
 import KpiCard from '../components/KpiCard';
@@ -30,6 +30,24 @@ const CustomTooltip = ({ active, payload, label }) => {
   );
 };
 
+const GatewayTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  const total = payload.reduce((s, p) => s + (p.value || 0), 0);
+  return (
+    <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{label}</div>
+      {payload.map((p, i) => (
+        <div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>
+          {p.name}: {fmt(p.value)}
+        </div>
+      ))}
+      <div style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)', borderTop: '1px solid #ffffff18', marginTop: 6, paddingTop: 6 }}>
+        Total: {fmt(total)}
+      </div>
+    </div>
+  );
+};
+
 export default function SalesSummary() {
   const [range, setRange] = useState(getRange({ days: 30 }));
   const [period, setPeriod] = useState('day');
@@ -41,6 +59,15 @@ export default function SalesSummary() {
   const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8 });
 
   const loading = loadingSummary || loadingTrend;
+
+  // Transform gateway flat array → single stacked bar data point
+  const gatewayBarData = gateway && gateway.length
+    ? [gateway.reduce((acc, g) => {
+        acc[g.gateway] = parseFloat(g.revenue || 0);
+        return acc;
+      }, { name: 'Revenue' })]
+    : [];
+  const gatewayKeys = (gateway || []).map(g => g.gateway);
 
   return (
     <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
@@ -98,7 +125,14 @@ export default function SalesSummary() {
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
               <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-              <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} />
+              <YAxis
+                tickFormatter={fmt}
+                tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }}
+                axisLine={false}
+                tickLine={false}
+                width={70}
+                domain={['auto', 'auto']}
+              />
               <Tooltip content={<CustomTooltip />} />
               <Area type="monotone" dataKey="gross_revenue" name="Gross" stroke="#7c6af7" strokeWidth={2} fill="url(#gradGross)" />
               <Area type="monotone" dataKey="net_revenue" name="Net" stroke="#34d399" strokeWidth={2} fill="url(#gradNet)" />
@@ -107,36 +141,40 @@ export default function SalesSummary() {
         )}
       </div>
 
-      {/* Bottom row: Gateway + Orders bar */}
+      {/* Bottom row: Gateway stacked bar + Orders bar */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
 
-        {/* Gateway Split */}
+        {/* Gateway Split — stacked bar */}
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Payment Gateway</h2>
           {loadingGateway ? (
             <div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>
           ) : (
-            <div style={{ display: 'flex', alignItems: 'center', gap: 24 }}>
-              <ResponsiveContainer width="50%" height={160}>
-                <PieChart>
-                  <Pie data={gateway || []} dataKey="revenue" nameKey="gateway" cx="50%" cy="50%" innerRadius={45} outerRadius={70} paddingAngle={3}>
-                    {(gateway || []).map((_, i) => <Cell key={i} fill={COLORS[i % COLORS.length]} />)}
-                  </Pie>
-                  <Tooltip formatter={(v) => fmt(v)} contentStyle={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, fontFamily: 'DM Mono', fontSize: 12 }} />
-                </PieChart>
+            <>
+              <ResponsiveContainer width="100%" height={140}>
+                <BarChart data={gatewayBarData} layout="vertical" margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" horizontal={false} />
+                  <XAxis type="number" tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                  <YAxis type="category" dataKey="name" hide />
+                  <Tooltip content={<GatewayTooltip />} />
+                  {gatewayKeys.map((key, i) => (
+                    <Bar key={key} dataKey={key} stackId="a" fill={COLORS[i % COLORS.length]} radius={i === gatewayKeys.length - 1 ? [0, 4, 4, 0] : [0, 0, 0, 0]} />
+                  ))}
+                </BarChart>
               </ResponsiveContainer>
-              <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+              {/* Legend */}
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '8px 16px', marginTop: 16 }}>
                 {(gateway || []).map((g, i) => (
-                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: '50%', background: COLORS[i % COLORS.length], flexShrink: 0 }} />
+                  <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: COLORS[i % COLORS.length], flexShrink: 0 }} />
                     <div>
-                      <div style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace('_', ' ')}</div>
-                      <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</div>
+                      <span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace('_', ' ')}</span>
+                      <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginLeft: 6 }}>{fmt(g.revenue)} · {g.orders} orders</span>
                     </div>
                   </div>
                 ))}
               </div>
-            </div>
+            </>
           )}
         </div>
 
