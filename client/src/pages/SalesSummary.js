@@ -48,7 +48,6 @@ const GatewayTooltip = ({ active, payload, label }) => {
   );
 };
 
-// Pivot flat [{period, gateway, revenue}] → [{period, shopify_payments: x, paypal: y, ...}]
 function pivotGatewayData(rows) {
   const map = {};
   const keys = new Set();
@@ -60,7 +59,6 @@ function pivotGatewayData(rows) {
   return { data: Object.values(map).sort((a, b) => a.period > b.period ? 1 : -1), keys: [...keys] };
 }
 
-// Compute Y domain with 5% padding above, floor just below min
 function computeDomain(data, keys) {
   if (!data || !data.length) return ['auto', 'auto'];
   let min = Infinity, max = -Infinity;
@@ -78,18 +76,18 @@ function computeDomain(data, keys) {
   return [lo, hi];
 }
 
+const PERIODS = ['day', 'week', 'month', 'year'];
+
 export default function SalesSummary() {
   const [range, setRange] = useState(getRange({ days: 30 }));
   const [period, setPeriod] = useState('day');
 
-  const { data: summary, loading: loadingSummary } = useApi('/api/summary', range);
+  const { data: summary } = useApi('/api/summary', range);
   const { data: trend, loading: loadingTrend } = useApi('/api/revenue-trend', { ...range, period });
   const { data: gatewayRaw, loading: loadingGateway } = useApi('/api/gateway-trend', { ...range, period });
   const { data: gatewaySummary } = useApi('/api/gateway-split', range);
   const { data: fees } = useApi('/api/fees', range);
   const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8 });
-
-  const loading = loadingSummary || loadingTrend;
 
   const { data: gatewayData, keys: gatewayKeys } = useMemo(
     () => pivotGatewayData(gatewayRaw || []),
@@ -103,8 +101,6 @@ export default function SalesSummary() {
 
   return (
     <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
-
-      {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Sales Summary</h1>
@@ -112,23 +108,19 @@ export default function SalesSummary() {
         </div>
         <DateRangePicker value={range} onChange={setRange} />
       </div>
-
-      {/* KPI Cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
         <KpiCard label="Gross Revenue" value={summary?.gross_revenue} type="currency" color="#7c6af7" />
         <KpiCard label="Net Revenue" value={summary?.net_revenue} type="currency" color="#34d399" />
         <KpiCard label="Orders" value={summary?.total_orders} type="number" color="#fbbf24" />
         <KpiCard label="Avg Order Value" value={summary?.avg_order_value} type="currency" color="#a78bfa" />
-        <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={`${summary?.refund_count || 0} orders`} />
+        <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={String(summary?.refund_count || 0) + ' orders'} />
         <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" />
       </div>
-
-      {/* Revenue Trend */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Revenue Trend</h2>
           <div style={{ display: 'flex', gap: 6 }}>
-            {['day', 'week', 'month'].map(p => (
+            {PERIODS.map(p => (
               <button key={p} onClick={() => setPeriod(p)} style={{
                 padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600,
                 border: '1px solid ' + (period === p ? 'var(--accent)' : 'var(--border)'),
@@ -156,21 +148,8 @@ export default function SalesSummary() {
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
-              <XAxis
-                dataKey="period"
-                tickFormatter={fmtDate}
-                tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }}
-                axisLine={false}
-                tickLine={false}
-              />
-              <YAxis
-                tickFormatter={fmt}
-                tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }}
-                axisLine={false}
-                tickLine={false}
-                width={70}
-                domain={revenueDomain}
-              />
+              <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+              <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={revenueDomain} />
               <Tooltip content={<CustomTooltip />} />
               <Area type="monotone" dataKey="gross_revenue" name="Gross" stroke="#7c6af7" strokeWidth={2} fill="url(#gradGross)" />
               <Area type="monotone" dataKey="net_revenue" name="Net" stroke="#34d399" strokeWidth={2} fill="url(#gradNet)" />
@@ -178,11 +157,7 @@ export default function SalesSummary() {
           </ResponsiveContainer>
         )}
       </div>
-
-      {/* Bottom row: Gateway stacked bar + Orders bar */}
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-
-        {/* Gateway Split — stacked bar over time */}
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Payment Gateway</h2>
           {loadingGateway ? (
@@ -192,34 +167,14 @@ export default function SalesSummary() {
               <ResponsiveContainer width="100%" height={140}>
                 <BarChart data={gatewayData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
-                  <XAxis
-                    dataKey="period"
-                    tickFormatter={fmtDate}
-                    tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }}
-                    axisLine={false}
-                    tickLine={false}
-                  />
-                  <YAxis
-                    tickFormatter={fmt}
-                    tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }}
-                    axisLine={false}
-                    tickLine={false}
-                    width={55}
-                  />
+                  <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                  <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={55} />
                   <Tooltip content={<GatewayTooltip />} />
                   {gatewayKeys.map((key, i) => (
-                    <Bar
-                      key={key}
-                      dataKey={key}
-                      name={key.replace(/_/g, ' ')}
-                      stackId="a"
-                      fill={COLORS[i % COLORS.length]}
-                      radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]}
-                    />
+                    <Bar key={key} dataKey={key} name={key.replace(/_/g, ' ')} stackId="a" fill={COLORS[i % COLORS.length]} radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]} />
                   ))}
                 </BarChart>
               </ResponsiveContainer>
-              {/* Legend */}
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
                 {(gatewaySummary || []).map((g, i) => (
                   <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
@@ -232,8 +187,6 @@ export default function SalesSummary() {
             </>
           )}
         </div>
-
-        {/* Orders over time */}
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Order Volume</h2>
           {loadingTrend ? (
@@ -251,8 +204,6 @@ export default function SalesSummary() {
           )}
         </div>
       </div>
-
-      {/* Recent Orders Table */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Recent Orders</h2>
@@ -273,20 +224,8 @@ export default function SalesSummary() {
               >
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>#{o.shopify_order_number}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDate(o.order_date)}</td>
-                <td style={{ padding: '12px 16px' }}>
-                  <span style={{
-                    padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600,
-                    background: o.financial_status === 'paid' ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420',
-                    color: o.financial_status === 'paid' ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24'
-                  }}>{o.financial_status}</span>
-                </td>
-                <td style={{ padding: '12px 16px' }}>
-                  <span style={{
-                    padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600,
-                    background: o.fulfillment_status === 'fulfilled' ? '#34d39915' : '#6b6b8020',
-                    color: o.fulfillment_status === 'fulfilled' ? '#34d399' : 'var(--muted)'
-                  }}>{o.fulfillment_status || 'unfulfilled'}</span>
-                </td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.financial_status === 'paid' ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: o.financial_status === 'paid' ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.fulfillment_status === 'fulfilled' ? '#34d39915' : '#6b6b8020', color: o.fulfillment_status === 'fulfilled' ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{fmt(o.gross_revenue)}</td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{fmt(o.net_revenue)}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
@@ -296,7 +235,6 @@ export default function SalesSummary() {
           </tbody>
         </table>
       </div>
-
     </div>
   );
 }
