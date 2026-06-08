@@ -8,10 +8,26 @@ import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
 
 const fmt = (n) => '£' + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
-const fmtDate = (d) => {
+
+// Returns a tick formatter that appends a short year (e.g. '25) when data spans multiple years
+function makeFmtDate(data) {
+  const years = new Set((data || []).map(d => d.period ? new Date(d.period).getFullYear() : null).filter(Boolean));
+  const multiYear = years.size > 1;
+  return (d) => {
+    if (!d) return '';
+    const date = new Date(d);
+    const day = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+    if (!multiYear) return day;
+    const yr = String(date.getFullYear()).slice(2);
+    return day + " '" + yr;
+  };
+}
+
+// Tooltip always shows full date including year
+const fmtDateFull = (d) => {
   if (!d) return '';
   const date = new Date(d);
-  return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  return date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
 };
 
 const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
@@ -20,7 +36,7 @@ const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   return (
     <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
-      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDate(label)}</div>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>
       {payload.map((p, i) => (
         <div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>
           {p.name}: {fmt(p.value)}
@@ -35,7 +51,7 @@ const GatewayTooltip = ({ active, payload, label }) => {
   const total = payload.reduce((s, p) => s + (p.value || 0), 0);
   return (
     <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
-      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDate(label)}</div>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>
       {payload.map((p, i) => (
         <div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>
           {p.name}: {fmt(p.value)}
@@ -99,8 +115,12 @@ export default function SalesSummary() {
     [trend]
   );
 
+  const fmtTick = useMemo(() => makeFmtDate(trend), [trend]);
+  const fmtGatewayTick = useMemo(() => makeFmtDate(gatewayData), [gatewayData]);
+
   return (
     <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
+
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Sales Summary</h1>
@@ -108,6 +128,7 @@ export default function SalesSummary() {
         </div>
         <DateRangePicker value={range} onChange={setRange} />
       </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
         <KpiCard label="Gross Revenue" value={summary?.gross_revenue} type="currency" color="#7c6af7" />
         <KpiCard label="Net Revenue" value={summary?.net_revenue} type="currency" color="#34d399" />
@@ -116,6 +137,7 @@ export default function SalesSummary() {
         <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={String(summary?.refund_count || 0) + ' orders'} />
         <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" />
       </div>
+
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Revenue Trend</h2>
@@ -148,7 +170,7 @@ export default function SalesSummary() {
                 </linearGradient>
               </defs>
               <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
-              <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+              <XAxis dataKey="period" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
               <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={revenueDomain} />
               <Tooltip content={<CustomTooltip />} />
               <Area type="monotone" dataKey="gross_revenue" name="Gross" stroke="#7c6af7" strokeWidth={2} fill="url(#gradGross)" />
@@ -157,6 +179,7 @@ export default function SalesSummary() {
           </ResponsiveContainer>
         )}
       </div>
+
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Payment Gateway</h2>
@@ -167,7 +190,7 @@ export default function SalesSummary() {
               <ResponsiveContainer width="100%" height={140}>
                 <BarChart data={gatewayData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
-                  <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                  <XAxis dataKey="period" tickFormatter={fmtGatewayTick} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
                   <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={55} />
                   <Tooltip content={<GatewayTooltip />} />
                   {gatewayKeys.map((key, i) => (
@@ -187,6 +210,7 @@ export default function SalesSummary() {
             </>
           )}
         </div>
+
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Order Volume</h2>
           {loadingTrend ? (
@@ -195,7 +219,7 @@ export default function SalesSummary() {
             <ResponsiveContainer width="100%" height={160}>
               <BarChart data={trend || []} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
-                <XAxis dataKey="period" tickFormatter={fmtDate} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                <XAxis dataKey="period" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
                 <YAxis tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={30} />
                 <Tooltip contentStyle={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, fontFamily: 'DM Mono', fontSize: 12 }} />
                 <Bar dataKey="orders" name="Orders" fill="#fbbf24" radius={[3, 3, 0, 0]} opacity={0.85} />
@@ -204,6 +228,7 @@ export default function SalesSummary() {
           )}
         </div>
       </div>
+
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Recent Orders</h2>
@@ -223,7 +248,7 @@ export default function SalesSummary() {
                 onMouseLeave={e => e.currentTarget.style.background = 'transparent'}
               >
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>#{o.shopify_order_number}</td>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDate(o.order_date)}</td>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(o.order_date)}</td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.financial_status === 'paid' ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: o.financial_status === 'paid' ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.fulfillment_status === 'fulfilled' ? '#34d39915' : '#6b6b8020', color: o.fulfillment_status === 'fulfilled' ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{fmt(o.gross_revenue)}</td>
@@ -235,6 +260,7 @@ export default function SalesSummary() {
           </tbody>
         </table>
       </div>
+
     </div>
   );
 }
