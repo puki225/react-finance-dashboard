@@ -62,7 +62,7 @@ app.get('/api/revenue-trend', async (req, res) => {
   const { from, to, period } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
-  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : 'day';
+  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
 
   try {
     const result = await pool.query(`
@@ -116,7 +116,7 @@ app.get('/api/gateway-trend', async (req, res) => {
   const { from, to, period } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
-  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : 'day';
+  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
 
   try {
     const result = await pool.query(`
