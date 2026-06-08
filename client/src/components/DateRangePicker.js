@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 
 const PRESETS = [
+  { label: '1D',  days: 0,    dtd: true },
   { label: '7D',  days: 7 },
   { label: '30D', days: 30 },
   { label: '90D', days: 90 },
@@ -15,6 +16,7 @@ function getRange(preset) {
     const from = new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0];
     return { from, to };
   }
+  if (preset.dtd) return { from: to, to };
   const from = new Date(Date.now() - preset.days * 86400000).toISOString().split('T')[0];
   return { from, to };
 }
