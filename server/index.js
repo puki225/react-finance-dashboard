@@ -110,16 +110,18 @@ app.get('/api/gateway-split', async (req, res) => {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT COALESCE(payment_method, 'Other') AS gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
+        SELECT 'Amazon' AS gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
         FROM amazon_orders WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
-        GROUP BY payment_method ORDER BY revenue DESC
       `, [dateFrom, dateTo]);
     } else if (channel === 'all') {
       result = await pool.query(`
-        SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue FROM (
-          SELECT gateway, net_revenue FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
+        SELECT gateway, SUM(orders)::int AS orders, SUM(revenue)::numeric AS revenue FROM (
+          SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
+          FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
+          GROUP BY gateway
           UNION ALL
-          SELECT COALESCE(payment_method, 'Other') AS gateway, net_revenue FROM amazon_orders WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
+          SELECT 'Amazon' AS gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
+          FROM amazon_orders WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
         ) combined GROUP BY gateway ORDER BY revenue DESC
       `, [dateFrom, dateTo]);
     } else {
@@ -143,9 +145,9 @@ app.get('/api/gateway-trend', async (req, res) => {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, COALESCE(payment_method, 'Other') AS gateway, SUM(net_revenue)::numeric AS revenue
+        SELECT DATE_TRUNC($1, order_date)::date AS period, 'Amazon' AS gateway, SUM(net_revenue)::numeric AS revenue
         FROM amazon_orders WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
-        GROUP BY 1, 2 ORDER BY 1, 2
+        GROUP BY 1 ORDER BY 1
       `, [trunc, dateFrom, dateTo]);
     } else if (channel === 'all') {
       result = await pool.query(`
@@ -153,7 +155,7 @@ app.get('/api/gateway-trend', async (req, res) => {
           SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue AS revenue FROM shopify_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
           UNION ALL
-          SELECT DATE_TRUNC($1, order_date)::date AS period, COALESCE(payment_method, 'Other') AS gateway, net_revenue AS revenue FROM amazon_orders
+          SELECT DATE_TRUNC($1, order_date)::date AS period, 'Amazon' AS gateway, net_revenue AS revenue FROM amazon_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
         ) combined GROUP BY 1, 2 ORDER BY 1, 2
       `, [trunc, dateFrom, dateTo]);
@@ -192,7 +194,7 @@ app.get('/api/recent-orders', async (req, res) => {
       result = await pool.query(`
         SELECT amazon_order_id AS shopify_order_number, order_date, status AS financial_status,
           fulfillment_channel AS fulfillment_status, gross_revenue, net_revenue, 0 AS total_refunded,
-          COALESCE(payment_method, 'Other') AS gateway, shipping_country, 'amazon' AS channel
+          'Amazon' AS gateway, shipping_country, 'amazon' AS channel
         FROM amazon_orders WHERE status != 'Canceled' ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
     } else if (channel === 'all') {
@@ -203,7 +205,7 @@ app.get('/api/recent-orders', async (req, res) => {
           FROM shopify_orders WHERE financial_status != 'voided'
           UNION ALL
           SELECT amazon_order_id, order_date, status AS financial_status, fulfillment_channel AS fulfillment_status,
-            gross_revenue, net_revenue, 0 AS total_refunded, COALESCE(payment_method, 'Other') AS gateway, shipping_country, 'amazon' AS channel
+            gross_revenue, net_revenue, 0 AS total_refunded, 'Amazon' AS gateway, shipping_country, 'amazon' AS channel
           FROM amazon_orders WHERE status != 'Canceled'
         ) combined ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
