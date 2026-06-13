@@ -38,15 +38,15 @@ app.get('/api/summary', async (req, res) => {
           SELECT gross_revenue, net_revenue, discount_amount, total_refunded FROM shopify_orders
           WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
           UNION ALL
-          SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount, 0 AS total_refunded FROM amazon_orders
+          SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount, COALESCE(total_refunded, 0) AS total_refunded FROM amazon_orders
           WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
         ) combined
       `, [dateFrom, dateTo]);
     } else if (channel === 'amazon') {
       result = await pool.query(`
         SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(promotion_discount)::numeric AS total_discounts, 0::numeric AS total_refunded,
-          AVG(net_revenue)::numeric AS avg_order_value, 0::int AS refund_count
+          SUM(promotion_discount)::numeric AS total_discounts, SUM(COALESCE(total_refunded, 0))::numeric AS total_refunded,
+          AVG(net_revenue)::numeric AS avg_order_value, COUNT(*) FILTER (WHERE total_refunded > 0)::int AS refund_count
         FROM amazon_orders WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
       `, [dateFrom, dateTo]);
     } else {
@@ -193,7 +193,7 @@ app.get('/api/recent-orders', async (req, res) => {
     if (channel === 'amazon') {
       result = await pool.query(`
         SELECT amazon_order_id AS shopify_order_number, order_date, status AS financial_status,
-          fulfillment_channel AS fulfillment_status, gross_revenue, net_revenue, 0 AS total_refunded,
+          fulfillment_channel AS fulfillment_status, gross_revenue, net_revenue, COALESCE(total_refunded, 0) AS total_refunded,
           'Amazon' AS gateway, shipping_country, 'amazon' AS channel
         FROM amazon_orders WHERE status != 'Canceled' ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
@@ -205,7 +205,7 @@ app.get('/api/recent-orders', async (req, res) => {
           FROM shopify_orders WHERE financial_status != 'voided'
           UNION ALL
           SELECT amazon_order_id, order_date, status AS financial_status, fulfillment_channel AS fulfillment_status,
-            gross_revenue, net_revenue, 0 AS total_refunded, 'Amazon' AS gateway, shipping_country, 'amazon' AS channel
+            gross_revenue, net_revenue, COALESCE(total_refunded, 0) AS total_refunded, 'Amazon' AS gateway, shipping_country, 'amazon' AS channel
           FROM amazon_orders WHERE status != 'Canceled'
         ) combined ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
