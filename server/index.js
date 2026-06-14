@@ -142,7 +142,34 @@ app.get('/api/revenue-trend', async (req, res) => {
         GROUP BY 1 ORDER BY 1
       `, [trunc, dateFrom, dateTo]);
     }
-    res.json(result.rows);
+
+    // Refunds attributed by refund_date, grouped to the same period granularity,
+    // subtracted from net_revenue (same logic as /api/summary).
+    let refundResult;
+    if (channel === 'amazon' || channel === 'shopify') {
+      refundResult = await pool.query(`
+        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+        FROM v_refunds_by_date WHERE channel = $2 AND refund_date::date BETWEEN $3 AND $4
+        GROUP BY 1
+      `, [trunc, channel, dateFrom, dateTo]);
+    } else {
+      refundResult = await pool.query(`
+        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+        FROM v_refunds_by_date WHERE refund_date::date BETWEEN $2 AND $3
+        GROUP BY 1
+      `, [trunc, dateFrom, dateTo]);
+    }
+    const refundsByPeriod = {};
+    for (const r of refundResult.rows) {
+      refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
+    }
+
+    const rows = result.rows.map(r => {
+      const key = r.period.toISOString().split('T')[0];
+      const refunds = refundsByPeriod[key] || 0;
+      return { ...r, net_revenue: (parseFloat(r.net_revenue || 0) - refunds).toFixed(2) };
+    });
+    res.json(rows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
