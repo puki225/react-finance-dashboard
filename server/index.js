@@ -188,31 +188,45 @@ app.get('/api/fees', async (req, res) => {
 // Recent orders
 app.get('/api/recent-orders', async (req, res) => {
   const { limit, channel = 'all' } = req.query;
+  // Order-level rollup of v_sku_revenue for Amazon, so gross/net reflect
+  // the SKU-level gross-to-net bridge (incl. list-price fallback for Pending orders)
+  const amazonRevenueRollup = `
+    SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue,
+      BOOL_OR(is_estimated_price) AS is_estimated_price
+    FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
+  `;
   try {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT amazon_order_id AS shopify_order_number, order_date, status AS financial_status,
-          fulfillment_channel AS fulfillment_status, gross_revenue, net_revenue, COALESCE(total_refunded, 0) AS total_refunded,
-          'Amazon' AS gateway, shipping_country, 'amazon' AS channel
-        FROM amazon_orders WHERE status != 'Canceled' ORDER BY order_date DESC LIMIT $1
+        SELECT o.amazon_order_id AS shopify_order_number, o.order_date, o.status AS financial_status,
+          o.fulfillment_channel AS fulfillment_status, COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
+          COALESCE(r.net_revenue, o.net_revenue) AS net_revenue, COALESCE(o.total_refunded, 0) AS total_refunded,
+          'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel, COALESCE(r.is_estimated_price, false) AS is_estimated_price
+        FROM amazon_orders o
+        LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
+        WHERE o.status != 'Canceled' ORDER BY o.order_date DESC LIMIT $1
       `, [limit || 10]);
     } else if (channel === 'all') {
       result = await pool.query(`
         SELECT * FROM (
           SELECT shopify_order_number::text AS shopify_order_number, order_date, financial_status, fulfillment_status,
-            gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel
+            gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
           FROM shopify_orders WHERE financial_status != 'voided'
           UNION ALL
-          SELECT amazon_order_id, order_date, status AS financial_status, fulfillment_channel AS fulfillment_status,
-            gross_revenue, net_revenue, COALESCE(total_refunded, 0) AS total_refunded, 'Amazon' AS gateway, shipping_country, 'amazon' AS channel
-          FROM amazon_orders WHERE status != 'Canceled'
+          SELECT o.amazon_order_id, o.order_date, o.status AS financial_status, o.fulfillment_channel AS fulfillment_status,
+            COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue, COALESCE(r.net_revenue, o.net_revenue) AS net_revenue,
+            COALESCE(o.total_refunded, 0) AS total_refunded, 'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel,
+            COALESCE(r.is_estimated_price, false) AS is_estimated_price
+          FROM amazon_orders o
+          LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
+          WHERE o.status != 'Canceled'
         ) combined ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
     } else {
       result = await pool.query(`
         SELECT shopify_order_number, order_date, financial_status, fulfillment_status,
-          gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel
+          gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
         FROM shopify_orders WHERE financial_status != 'voided' ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
     }
