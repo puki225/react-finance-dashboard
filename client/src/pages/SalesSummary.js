@@ -16,7 +16,8 @@ const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
 
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
-  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}</div>);
+  const refunds = parseFloat(payload[0]?.payload?.refunds || 0);
+  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}{refunds > 0 && (<div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: '#f87171' }}>Refunds: {fmt(refunds)}</div>)}</div>);
 };
 
 const GatewayTooltip = ({ active, payload, label }) => {
