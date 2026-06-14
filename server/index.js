@@ -273,6 +273,32 @@ app.get('/api/recent-orders', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Refunds attributed by the date the refund was posted (not order date)
+app.get('/api/refunds-by-date', async (req, res) => {
+  const { from, to, channel = 'all', limit } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  try {
+    let result;
+    if (channel === 'amazon' || channel === 'shopify') {
+      result = await pool.query(`
+        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
+        FROM v_refunds_by_date
+        WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
+        ORDER BY refund_date DESC LIMIT $4
+      `, [channel, dateFrom, dateTo, limit || 20]);
+    } else {
+      result = await pool.query(`
+        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
+        FROM v_refunds_by_date
+        WHERE refund_date::date BETWEEN $1 AND $2
+        ORDER BY refund_date DESC LIMIT $3
+      `, [dateFrom, dateTo, limit || 20]);
+    }
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
