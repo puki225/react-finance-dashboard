@@ -152,7 +152,12 @@ export default function SalesSummary() {
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(o.order_date)}</td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d39915' : '#6b6b8020', color: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{fmt(o.gross_revenue)}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>
+                  {fmt(o.gross_revenue)}
+                  {o.is_estimated_price && (
+                    <span title="Estimated from last known price — order pending settlement" style={{ marginLeft: 6, padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600, background: '#fbbf2420', color: '#fbbf24', fontFamily: 'var(--font)', letterSpacing: '0.04em' }}>EST</span>
+                  )}
+                </td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{fmt(o.net_revenue)}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
