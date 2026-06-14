@@ -167,7 +167,7 @@ app.get('/api/revenue-trend', async (req, res) => {
     const rows = result.rows.map(r => {
       const key = r.period.toISOString().split('T')[0];
       const refunds = refundsByPeriod[key] || 0;
-      return { ...r, net_revenue: (parseFloat(r.net_revenue || 0) - refunds).toFixed(2) };
+      return { ...r, net_revenue: (parseFloat(r.net_revenue || 0) - refunds).toFixed(2), refunds: refunds.toFixed(2) };
     });
     res.json(rows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
