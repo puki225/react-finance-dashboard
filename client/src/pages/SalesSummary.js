@@ -56,6 +56,7 @@ export default function SalesSummary() {
   const { data: gatewaySummary } = useApi('/api/gateway-split', params);
   const { data: fees } = useApi('/api/fees', range);
   const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8, channel });
+  const { data: recentRefunds } = useApi('/api/refunds-by-date', { ...params, limit: 8 });
 
   const { data: gatewayData, keys: gatewayKeys } = useMemo(() => pivotGatewayData(gatewayRaw || []), [gatewayRaw]);
   const revenueDomain = useMemo(() => computeDomain(trend || [], ['gross_revenue', 'net_revenue']), [trend]);
@@ -162,6 +163,30 @@ export default function SalesSummary() {
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: o.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{o.channel || 'shopify'}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Refunds Processed</h2>
+          <p style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>By refund date — may relate to orders placed in earlier periods</p>
+        </div>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Date', 'Channel', 'Order', 'SKU', 'Qty', 'Amount'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
+          <tbody>
+            {(recentRefunds || []).length === 0 && (
+              <tr><td colSpan={6} style={{ padding: '24px 16px', textAlign: 'center', fontSize: 13, color: 'var(--muted)' }}>No refunds in this period</td></tr>
+            )}
+            {(recentRefunds || []).map((r, i) => (
+              <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(r.refund_date)}</td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: r.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: r.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{r.channel}</span></td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{r.channel === 'shopify' ? '#' : ''}{r.order_id}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.sku || '—'}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.quantity_refunded ?? '—'}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)' }}>{fmt(r.amount_refunded)}</td>
               </tr>
             ))}
           </tbody>
