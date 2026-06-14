@@ -29,7 +29,7 @@ app.get('/api/summary', async (req, res) => {
   const dateTo = to || new Date().toISOString().split('T')[0];
   // Amazon orders enriched with v_sku_revenue rollup (gross/net incl. list-price fallback for Pending orders)
   const amazonEnriched = `
-    SELECT o.amazon_order_id, o.order_date, o.status, o.promotion_discount, o.total_refunded,
+    SELECT o.amazon_order_id, o.order_date, o.status, o.promotion_discount,
       COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
       COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
     FROM amazon_orders o
@@ -43,13 +43,13 @@ app.get('/api/summary', async (req, res) => {
     if (channel === 'all') {
       result = await pool.query(`
         SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(discount_amount)::numeric AS total_discounts, SUM(total_refunded)::numeric AS total_refunded,
-          AVG(net_revenue)::numeric AS avg_order_value, COUNT(*) FILTER (WHERE total_refunded > 0)::int AS refund_count
+          SUM(discount_amount)::numeric AS total_discounts,
+          AVG(net_revenue)::numeric AS avg_order_value
         FROM (
-          SELECT gross_revenue, net_revenue, discount_amount, total_refunded FROM shopify_orders
+          SELECT gross_revenue, net_revenue, discount_amount FROM shopify_orders
           WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
           UNION ALL
-          SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount, COALESCE(total_refunded, 0) AS total_refunded
+          SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount
           FROM (${amazonEnriched}) a
           WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
         ) combined
@@ -57,20 +57,41 @@ app.get('/api/summary', async (req, res) => {
     } else if (channel === 'amazon') {
       result = await pool.query(`
         SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(promotion_discount)::numeric AS total_discounts, SUM(COALESCE(total_refunded, 0))::numeric AS total_refunded,
-          AVG(net_revenue)::numeric AS avg_order_value, COUNT(*) FILTER (WHERE total_refunded > 0)::int AS refund_count
+          SUM(promotion_discount)::numeric AS total_discounts,
+          AVG(net_revenue)::numeric AS avg_order_value
         FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
       `, [dateFrom, dateTo]);
     } else {
       result = await pool.query(`
         SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(discount_amount)::numeric AS total_discounts, SUM(total_refunded)::numeric AS total_refunded,
-          AVG(net_revenue)::numeric AS avg_order_value, COUNT(*) FILTER (WHERE total_refunded > 0)::int AS refund_count
+          SUM(discount_amount)::numeric AS total_discounts,
+          AVG(net_revenue)::numeric AS avg_order_value
         FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
       `, [dateFrom, dateTo]);
     }
     const row = result.rows[0];
-    res.json({ ...row, refund_rate: row.total_orders > 0 ? ((row.refund_count / row.total_orders) * 100).toFixed(1) : 0 });
+
+    // Refunds attributed by refund_date (not order_date) — independent of the order population above
+    let refundResult;
+    if (channel === 'amazon' || channel === 'shopify') {
+      refundResult = await pool.query(`
+        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
+        FROM v_refunds_by_date WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
+      `, [channel, dateFrom, dateTo]);
+    } else {
+      refundResult = await pool.query(`
+        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
+        FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2
+      `, [dateFrom, dateTo]);
+    }
+    const refundRow = refundResult.rows[0];
+
+    res.json({
+      ...row,
+      total_refunded: refundRow.total_refunded,
+      refund_count: refundRow.refund_count,
+      refund_rate: row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
+    });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
