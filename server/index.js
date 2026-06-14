@@ -88,6 +88,7 @@ app.get('/api/summary', async (req, res) => {
 
     res.json({
       ...row,
+      net_revenue: (parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0)).toFixed(2),
       total_refunded: refundRow.total_refunded,
       refund_count: refundRow.refund_count,
       refund_rate: row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
