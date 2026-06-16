@@ -394,7 +394,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
         FROM shopify_order_lines sol
-        LEFT JOIN all_refunds_by_sku r ON r.sku = sol.sku
+        LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku, sp.image_url
@@ -418,7 +418,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-        LEFT JOIN all_refunds_by_sku r ON r.sku = aol.sku
+        LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         GROUP BY aol.sku, sp.image_url
