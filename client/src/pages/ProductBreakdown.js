@@ -56,11 +56,16 @@ function CountryDropdown({ sku, from, to, channel }) {
 }
 
 export default function ProductBreakdown() {
-  const [range, setRange] = useState(getRange({ days: 30 }));
-  const [channel, setChannel] = useState('all');
-  const [sort, setSort] = useState('gross_sales');
-  const [dir, setDir] = useState('desc');
+  const [range, setRange] = useState(() => {
+    try { const s = localStorage.getItem('gb_prod_range'); return s ? JSON.parse(s) : getRange({ days: 30 }); } catch { return getRange({ days: 30 }); }
+  });
+  const [channel, setChannel] = useState(() => localStorage.getItem('gb_prod_channel') || 'all');
+  const [sort, setSort] = useState(() => localStorage.getItem('gb_prod_sort') || 'gross_sales');
+  const [dir, setDir] = useState(() => localStorage.getItem('gb_prod_dir') || 'desc');
   const [expandedSku, setExpandedSku] = useState(null);
+
+  const handleRange = (r) => { setRange(r); localStorage.setItem('gb_prod_range', JSON.stringify(r)); };
+  const handleChannel = (c) => { setChannel(c); localStorage.setItem('gb_prod_channel', c); };
   const params = { ...range, channel, sort, dir };
 
   const { data: rows, loading } = useApi('/api/product-breakdown', params);
@@ -78,8 +83,16 @@ export default function ProductBreakdown() {
   }, [rows]);
 
   const handleSort = (key) => {
-    if (sort === key) setDir(d => d === 'desc' ? 'asc' : 'desc');
-    else { setSort(key); setDir('desc'); }
+    if (sort === key) {
+      const newDir = dir === 'desc' ? 'asc' : 'desc';
+      setDir(newDir);
+      localStorage.setItem('gb_prod_dir', newDir);
+    } else {
+      setSort(key);
+      setDir('desc');
+      localStorage.setItem('gb_prod_sort', key);
+      localStorage.setItem('gb_prod_dir', 'desc');
+    }
   };
 
   const SortIcon = ({ col }) => {
@@ -99,10 +112,10 @@ export default function ProductBreakdown() {
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
             {CHANNELS.map(c => (
-              <button key={c.id} onClick={() => setChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>
+              <button key={c.id} onClick={() => handleChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>
             ))}
           </div>
-          <DateRangePicker value={range} onChange={setRange} />
+          <DateRangePicker value={range} onChange={handleRange} />
         </div>
       </div>
 
