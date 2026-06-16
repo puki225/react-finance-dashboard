@@ -390,7 +390,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(sol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
           SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity)::numeric(12,2) AS net_revenue,
+          (SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
         FROM shopify_order_lines sol
@@ -412,7 +412,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(aol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
           SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
+          (SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
         FROM amazon_order_lines aol
@@ -466,7 +466,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(s.units_sold, 0) + COALESCE(a.units_sold, 0))::int AS units_sold,
           COALESCE(r.units_refunded, 0)::int AS units_refunded,
           (COALESCE(s.gross_sales, 0) + COALESCE(a.gross_sales, 0))::numeric(12,2) AS gross_sales,
-          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0))::numeric(12,2) AS net_revenue,
+          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
           COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded
         FROM shopify_skus s
