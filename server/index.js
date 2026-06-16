@@ -340,6 +340,177 @@ app.get('/api/refunds-by-date', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+
+// Product Breakdown — per SKU, both channels, date filtered
+app.get('/api/product-breakdown', async (req, res) => {
+  const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc' } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts'];
+  const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
+  const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
+  try {
+    // Refunds by SKU (refund-date attributed, for refund totals per SKU)
+    const refundCte = `
+      refunds_by_sku AS (
+        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
+        FROM amazon_order_line_refunds
+        WHERE sku IS NOT NULL
+        GROUP BY sku
+      )
+    `;
+
+    let result;
+    if (channel === 'shopify') {
+      result = await pool.query(`
+        WITH ${refundCte}
+        SELECT
+          sol.sku,
+          MAX(sol.product_title) AS product_title,
+          NULL AS asin,
+          'shopify' AS channels,
+          SUM(sol.quantity)::int AS units_sold,
+          COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
+          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
+          SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity)::numeric(12,2) AS net_revenue,
+          SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
+          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
+        FROM shopify_order_lines sol
+        LEFT JOIN refunds_by_sku r ON r.sku = sol.sku
+        WHERE sol.order_date::date BETWEEN $1 AND $2
+        GROUP BY sol.sku
+        ORDER BY ${sortCol} ${sortDir}
+      `, [dateFrom, dateTo]);
+    } else if (channel === 'amazon') {
+      result = await pool.query(`
+        WITH ${refundCte}
+        SELECT
+          aol.sku,
+          MAX(aol.title) AS product_title,
+          MAX(aol.asin) AS asin,
+          'amazon' AS channels,
+          SUM(aol.quantity)::int AS units_sold,
+          COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
+          SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
+          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+        LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
+        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+        GROUP BY aol.sku
+        ORDER BY ${sortCol} ${sortDir}
+      `, [dateFrom, dateTo]);
+    } else {
+      // Both channels — FULL OUTER JOIN on sku
+      result = await pool.query(`
+        WITH ${refundCte},
+        shopify_skus AS (
+          SELECT
+            sol.sku,
+            MAX(sol.product_title) AS product_title,
+            NULL AS asin,
+            SUM(sol.quantity)::int AS units_sold,
+            SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
+            SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity)::numeric(12,2) AS net_revenue,
+            SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts
+          FROM shopify_order_lines sol
+          WHERE sol.order_date::date BETWEEN $1 AND $2
+          GROUP BY sol.sku
+        ),
+        amazon_skus AS (
+          SELECT
+            aol.sku,
+            MAX(aol.title) AS product_title,
+            MAX(aol.asin) AS asin,
+            SUM(aol.quantity)::int AS units_sold,
+            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
+            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
+            SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts
+          FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+          WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+          GROUP BY aol.sku
+        )
+        SELECT
+          COALESCE(s.sku, a.sku) AS sku,
+          COALESCE(a.product_title, s.product_title) AS product_title,
+          a.asin,
+          CASE WHEN s.sku IS NOT NULL AND a.sku IS NOT NULL THEN 'both'
+               WHEN s.sku IS NOT NULL THEN 'shopify'
+               ELSE 'amazon' END AS channels,
+          (COALESCE(s.units_sold, 0) + COALESCE(a.units_sold, 0))::int AS units_sold,
+          COALESCE(r.units_refunded, 0)::int AS units_refunded,
+          (COALESCE(s.gross_sales, 0) + COALESCE(a.gross_sales, 0))::numeric(12,2) AS gross_sales,
+          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0))::numeric(12,2) AS net_revenue,
+          (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
+          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded
+        FROM shopify_skus s
+        FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
+        LEFT JOIN refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
+        ORDER BY ${sortCol} ${sortDir}
+      `, [dateFrom, dateTo]);
+    }
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Product Breakdown — country split for a single SKU
+app.get('/api/product-breakdown/countries', async (req, res) => {
+  const { sku, from, to, channel = 'all' } = req.query;
+  if (!sku) return res.status(400).json({ error: 'sku required' });
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  try {
+    let result;
+    if (channel === 'shopify') {
+      result = await pool.query(`
+        SELECT COALESCE(so.shipping_country, 'Unknown') AS country, 'shopify' AS channel,
+          SUM(sol.quantity)::int AS units_sold,
+          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales
+        FROM shopify_order_lines sol
+        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
+        GROUP BY 1 ORDER BY gross_sales DESC
+      `, [sku, dateFrom, dateTo]);
+    } else if (channel === 'amazon') {
+      result = await pool.query(`
+        SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
+          SUM(aol.quantity)::int AS units_sold,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+        WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
+        GROUP BY 1 ORDER BY gross_sales DESC
+      `, [sku, dateFrom, dateTo]);
+    } else {
+      result = await pool.query(`
+        SELECT country, channel, SUM(units_sold)::int AS units_sold, SUM(gross_sales)::numeric(12,2) AS gross_sales FROM (
+          SELECT COALESCE(so.shipping_country, 'Unknown') AS country, 'shopify' AS channel,
+            sol.quantity AS units_sold, (sol.unit_price * sol.quantity) AS gross_sales
+          FROM shopify_order_lines sol
+          JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+          WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
+          UNION ALL
+          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
+            aol.quantity AS units_sold,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales
+          FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+          WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
+        ) combined
+        GROUP BY country, channel ORDER BY gross_sales DESC
+      `, [sku, dateFrom, dateTo]);
+    }
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
