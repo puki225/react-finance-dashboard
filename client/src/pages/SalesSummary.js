@@ -45,10 +45,29 @@ const PERIODS = ['day', 'week', 'month', 'year'];
 const CHANNELS = [{ id: 'all', label: 'All' }, { id: 'shopify', label: 'Shopify' }, { id: 'amazon', label: 'Amazon' }];
 const channelBtn = (active) => ({ padding: '5px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, border: '1px solid ' + (active ? 'var(--accent2)' : 'var(--border)'), background: active ? 'var(--accent2)20' : 'transparent', color: active ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', letterSpacing: '0.04em', transition: 'all 0.15s' });
 
+// Fixed colour map keyed by gateway name — ensures legend, bars, and tooltips always match
+const GATEWAY_COLORS = {
+  'shopify payments': '#7c6af7',
+  'shopify_payments': '#7c6af7',
+  'paypal': '#34d399',
+  'amazon payout': '#fbbf24',
+  'amazon': '#fbbf24',
+};
+const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
+function gatewayColor(name, index) {
+  return GATEWAY_COLORS[name?.toLowerCase()] || COLORS[index % COLORS.length];
+}
+
 export default function SalesSummary() {
-  const [range, setRange] = useState(getRange({ days: 30 }));
-  const [period, setPeriod] = useState('day');
-  const [channel, setChannel] = useState('all');
+  const [range, setRange] = useState(() => {
+    try { const s = localStorage.getItem('gb_sales_range'); return s ? JSON.parse(s) : getRange({ days: 30 }); } catch { return getRange({ days: 30 }); }
+  });
+  const [period, setPeriod] = useState(() => localStorage.getItem('gb_sales_period') || 'day');
+  const [channel, setChannel] = useState(() => localStorage.getItem('gb_sales_channel') || 'all');
+
+  const handleRange = (r) => { setRange(r); localStorage.setItem('gb_sales_range', JSON.stringify(r)); };
+  const handlePeriod = (p) => { setPeriod(p); localStorage.setItem('gb_sales_period', p); };
+  const handleChannel = (c) => { setChannel(c); localStorage.setItem('gb_sales_channel', c); };
   const params = { ...range, channel };
 
   const { data: summary } = useApi('/api/summary', params);
@@ -71,9 +90,9 @@ export default function SalesSummary() {
         <div><h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Sales Summary</h1><p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>All channels</p></div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
-            {CHANNELS.map(c => (<button key={c.id} onClick={() => setChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>))}
+            {CHANNELS.map(c => (<button key={c.id} onClick={() => handleChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>))}
           </div>
-          <DateRangePicker value={range} onChange={setRange} />
+          <DateRangePicker value={range} onChange={handleRange} />
         </div>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
@@ -88,7 +107,7 @@ export default function SalesSummary() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Revenue Trend</h2>
           <div style={{ display: 'flex', gap: 6 }}>
-            {PERIODS.map(p => (<button key={p} onClick={() => setPeriod(p)} style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: '1px solid ' + (period === p ? 'var(--accent)' : 'var(--border)'), background: period === p ? 'var(--accent)' : 'transparent', color: period === p ? '#fff' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>{p}</button>))}
+            {PERIODS.map(p => (<button key={p} onClick={() => handlePeriod(p)} style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: '1px solid ' + (period === p ? 'var(--accent)' : 'var(--border)'), background: period === p ? 'var(--accent)' : 'transparent', color: period === p ? '#fff' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>{p}</button>))}
           </div>
         </div>
         {loadingTrend ? (<div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
@@ -119,11 +138,11 @@ export default function SalesSummary() {
                   <XAxis dataKey="period" tickFormatter={fmtGatewayTick} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
                   <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={55} />
                   <Tooltip content={<GatewayTooltip />} />
-                  {gatewayKeys.map((key, i) => (<Bar key={key} dataKey={key} name={key.replace(/_/g, ' ')} stackId="a" fill={COLORS[i % COLORS.length]} radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]} />))}
+                  {gatewayKeys.map((key, i) => (<Bar key={key} dataKey={key} name={key.replace(/_/g, ' ')} stackId="a" fill={gatewayColor(key, i)} radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]} />))}
                 </BarChart>
               </ResponsiveContainer>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
-                {(gatewaySummary || []).map((g, i) => (<div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: COLORS[i % COLORS.length], flexShrink: 0 }} /><span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span><span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</span></div>))}
+                {(gatewaySummary || []).map((g, i) => (<div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: gatewayColor(g.gateway, i), flexShrink: 0 }} /><span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span><span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</span></div>))}
               </div>
             </>
           )}
