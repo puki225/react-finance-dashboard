@@ -1,9 +1,10 @@
 import React, { useState } from 'react';
 import SalesSummary from './pages/SalesSummary';
+import ProductBreakdown from './pages/ProductBreakdown';
 
 const NAV = [
   { id: 'sales',     label: 'Sales Summary',      icon: '◈', active: true },
-  { id: 'products',  label: 'Product Breakdown',   icon: '◉', active: false },
+  { id: 'products',  label: 'Product Breakdown',   icon: '◉', active: true },
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: false },
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: false },
@@ -98,7 +99,7 @@ export default function App() {
             <div style={{ fontSize: 10, color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 8 }}>Channels</div>
             <div style={{ display: 'flex', gap: 6 }}>
               <span style={{ fontSize: 11, padding: '3px 8px', borderRadius: 4, background: '#7c6af720', color: 'var(--accent2)', fontWeight: 600 }}>Shopify</span>
-              <span style={{ fontSize: 11, padding: '3px 8px', borderRadius: 4, background: '#6b6b8015', color: 'var(--muted)', fontWeight: 600 }}>Amazon</span>
+              <span style={{ fontSize: 11, padding: '3px 8px', borderRadius: 4, background: '#fbbf2420', color: '#fbbf24', fontWeight: 600 }}>Amazon</span>
             </div>
           </div>
         )}
@@ -107,7 +108,7 @@ export default function App() {
       {/* Main content */}
       <div style={{ flex: 1, overflow: 'auto', background: 'var(--bg)' }}>
         {active === 'sales'     && <SalesSummary />}
-        {active === 'products'  && <Placeholder label="Product Breakdown" />}
+        {active === 'products'  && <ProductBreakdown />}
         {active === 'pnl'       && <Placeholder label="P&L" />}
         {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
         {active === 'inventory' && <Placeholder label="Inventory" />}
