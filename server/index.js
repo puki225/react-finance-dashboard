@@ -178,20 +178,16 @@ app.get('/api/gateway-split', async (req, res) => {
   const { from, to, channel = 'all' } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
-  const amazonEnriched = `
-    SELECT o.order_date, o.status, COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
-    FROM amazon_orders o
-    LEFT JOIN (
-      SELECT order_id, SUM(net_revenue)::numeric(12,2) AS net_revenue
-      FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
-    ) r ON r.order_id = o.amazon_order_id
-  `;
+  // Amazon: net_transfer from amazon_payouts by fund_transfer_date (actual payout)
+  // Shopify: net_revenue from shopify_orders by order_date (order revenue)
   try {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT 'Amazon' AS gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
-        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
+        SELECT 'Amazon Payout' AS gateway, COUNT(*)::int AS orders, SUM(net_transfer)::numeric AS revenue
+        FROM amazon_payouts
+        WHERE fund_transfer_date::date BETWEEN $1 AND $2
+        AND net_transfer != 0
       `, [dateFrom, dateTo]);
     } else if (channel === 'all') {
       result = await pool.query(`
@@ -200,8 +196,10 @@ app.get('/api/gateway-split', async (req, res) => {
           FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
           GROUP BY gateway
           UNION ALL
-          SELECT 'Amazon' AS gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
-          FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
+          SELECT 'Amazon Payout' AS gateway, COUNT(*)::int AS orders, SUM(net_transfer)::numeric AS revenue
+          FROM amazon_payouts
+          WHERE fund_transfer_date::date BETWEEN $1 AND $2
+          AND net_transfer != 0
         ) combined GROUP BY gateway ORDER BY revenue DESC
       `, [dateFrom, dateTo]);
     } else {
@@ -221,20 +219,13 @@ app.get('/api/gateway-trend', async (req, res) => {
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
   const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
-  const amazonEnriched = `
-    SELECT o.order_date, o.status, COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
-    FROM amazon_orders o
-    LEFT JOIN (
-      SELECT order_id, SUM(net_revenue)::numeric(12,2) AS net_revenue
-      FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
-    ) r ON r.order_id = o.amazon_order_id
-  `;
   try {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, 'Amazon' AS gateway, SUM(net_revenue)::numeric AS revenue
-        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
+        SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, SUM(net_transfer)::numeric AS revenue
+        FROM amazon_payouts
+        WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
         GROUP BY 1 ORDER BY 1
       `, [trunc, dateFrom, dateTo]);
     } else if (channel === 'all') {
@@ -243,8 +234,9 @@ app.get('/api/gateway-trend', async (req, res) => {
           SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue AS revenue FROM shopify_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
           UNION ALL
-          SELECT DATE_TRUNC($1, order_date)::date AS period, 'Amazon' AS gateway, net_revenue AS revenue FROM (${amazonEnriched}) a
-          WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
+          SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, net_transfer AS revenue
+          FROM amazon_payouts
+          WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
         ) combined GROUP BY 1, 2 ORDER BY 1, 2
       `, [trunc, dateFrom, dateTo]);
     } else {
