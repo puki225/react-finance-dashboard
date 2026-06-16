@@ -166,13 +166,19 @@ export default function ProductBreakdown() {
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}
               >
                 {/* Product */}
-                <div style={{ padding: '14px 8px', display: 'flex', flexDirection: 'column', gap: 3 }}>
-                  <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text)', lineHeight: 1.3 }}>
-                    {row.product_title || row.sku}
-                  </span>
-                  <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
-                    <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{row.sku}</span>
+                <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center', gap: 12 }}>
+                  {/* Image */}
+                  <div style={{ width: 48, height: 48, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                    {row.image_url
+                      ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} />
+                      : <span style={{ fontSize: 18, opacity: 0.2 }}>◉</span>
+                    }
+                  </div>
+                  {/* SKU + ASIN */}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
+                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.sku}</span>
                     {row.asin && <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{row.asin}</span>}
+                    <span style={{ fontSize: 11, color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }} title={row.product_title}>{row.product_title}</span>
                   </div>
                 </div>
 
