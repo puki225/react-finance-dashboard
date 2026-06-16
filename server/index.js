@@ -359,9 +359,9 @@ app.get('/api/product-breakdown', async (req, res) => {
         GROUP BY sku
       ),
       shopify_refunds_by_sku AS (
-        SELECT sol.sku, SUM(sol.amount_refunded)::numeric AS total_refunded, SUM(sol.quantity_refunded)::int AS units_refunded
-        FROM shopify_order_lines sol
-        JOIN shopify_transactions st ON st.shopify_order_id = sol.shopify_order_id
+        SELECT sol.sku, SUM(st.amount)::numeric AS total_refunded, COUNT(DISTINCT st.shopify_transaction_id)::int AS units_refunded
+        FROM shopify_transactions st
+        JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
         WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku
       ),
