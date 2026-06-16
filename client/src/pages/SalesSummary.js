@@ -1,546 +1,216 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const path = require('path');
-const { Pool } = require('pg');
+import React, { useState, useMemo } from 'react';
+import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import KpiCard from '../components/KpiCard';
+import DateRangePicker, { getRange } from '../components/DateRangePicker';
+import { useApi } from '../hooks/useApi';
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+const fmt = (n) => '£' + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 
-const pool = new Pool({
-  host: process.env.DB_HOST,
-  port: process.env.DB_PORT || 5432,
-  database: process.env.DB_NAME,
-  user: process.env.DB_USER,
-  password: process.env.DB_PASSWORD,
-  ssl: { rejectUnauthorized: false }
-});
+function makeFmtDate(data) {
+  const years = new Set((data || []).map(d => d.period ? new Date(d.period).getFullYear() : null).filter(Boolean));
+  const multiYear = years.size > 1;
+  return (d) => { if (!d) return ''; const date = new Date(d); const day = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }); return multiYear ? day + " '" + String(date.getFullYear()).slice(2) : day; };
+}
+const fmtDateFull = (d) => { if (!d) return ''; return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
+const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
 
-app.use(cors());
-app.use(express.json());
-app.use(express.static(path.join(__dirname, '../client/build')));
+const CustomTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  const refunds = parseFloat(payload[0]?.payload?.refunds || 0);
+  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}{refunds > 0 && (<div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: '#f87171' }}>Refunds: {fmt(refunds)}</div>)}</div>);
+};
 
-// ─── API ROUTES ───────────────────────────────────────────────
+const GatewayTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  const total = payload.reduce((s, p) => s + (p.value || 0), 0);
+  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}<div style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)', borderTop: '1px solid #ffffff18', marginTop: 6, paddingTop: 6 }}>Total: {fmt(total)}</div></div>);
+};
 
-// KPI Summary
-app.get('/api/summary', async (req, res) => {
-  const { from, to, channel = 'all' } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  // Amazon orders enriched with v_sku_revenue rollup (gross/net incl. list-price fallback for Pending orders)
-  const amazonEnriched = `
-    SELECT o.amazon_order_id, o.order_date, o.status, o.promotion_discount,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
-    FROM amazon_orders o
-    LEFT JOIN (
-      SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
-      FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
-    ) r ON r.order_id = o.amazon_order_id
-  `;
-  try {
-    let result;
-    if (channel === 'all') {
-      result = await pool.query(`
-        SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(discount_amount)::numeric AS total_discounts,
-          AVG(net_revenue)::numeric AS avg_order_value
-        FROM (
-          SELECT gross_revenue, net_revenue, discount_amount FROM shopify_orders
-          WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
-          UNION ALL
-          SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount
-          FROM (${amazonEnriched}) a
-          WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
-        ) combined
-      `, [dateFrom, dateTo]);
-    } else if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(promotion_discount)::numeric AS total_discounts,
-          AVG(net_revenue)::numeric AS avg_order_value
-        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
-      `, [dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
-          SUM(discount_amount)::numeric AS total_discounts,
-          AVG(net_revenue)::numeric AS avg_order_value
-        FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
-      `, [dateFrom, dateTo]);
-    }
-    const row = result.rows[0];
+function pivotGatewayData(rows) {
+  const map = {}; const keys = new Set();
+  for (const row of rows) { if (!map[row.period]) map[row.period] = { period: row.period }; map[row.period][row.gateway] = parseFloat(row.revenue || 0); keys.add(row.gateway); }
+  return { data: Object.values(map).sort((a, b) => a.period > b.period ? 1 : -1), keys: [...keys] };
+}
 
-    // Refunds attributed by refund_date (not order_date) — independent of the order population above
-    let refundResult;
-    if (channel === 'amazon' || channel === 'shopify') {
-      refundResult = await pool.query(`
-        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
-        FROM v_refunds_by_date WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
-      `, [channel, dateFrom, dateTo]);
-    } else {
-      refundResult = await pool.query(`
-        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
-        FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2
-      `, [dateFrom, dateTo]);
-    }
-    const refundRow = refundResult.rows[0];
+function computeDomain(data, keys) {
+  if (!data || !data.length) return ['auto', 'auto'];
+  let min = Infinity, max = -Infinity;
+  for (const row of data) { for (const k of keys) { const v = parseFloat(row[k] || 0); if (v < min) min = v; if (v > max) max = v; } }
+  if (!isFinite(min) || !isFinite(max)) return ['auto', 'auto'];
+  const pad = (max - min) * 0.1 || max * 0.1 || 100;
+  return [Math.max(0, Math.floor((min - pad) / 100) * 100), Math.ceil((max + pad) / 100) * 100];
+}
 
-    res.json({
-      ...row,
-      net_revenue: (parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0)).toFixed(2),
-      total_refunded: refundRow.total_refunded,
-      refund_count: refundRow.refund_count,
-      refund_rate: row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
-    });
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
+const PERIODS = ['day', 'week', 'month', 'year'];
+const CHANNELS = [{ id: 'all', label: 'All' }, { id: 'shopify', label: 'Shopify' }, { id: 'amazon', label: 'Amazon' }];
+const channelBtn = (active) => ({ padding: '5px 14px', borderRadius: 6, fontSize: 12, fontWeight: 600, border: '1px solid ' + (active ? 'var(--accent2)' : 'var(--border)'), background: active ? 'var(--accent2)20' : 'transparent', color: active ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', letterSpacing: '0.04em', transition: 'all 0.15s' });
 
-// Revenue over time
-app.get('/api/revenue-trend', async (req, res) => {
-  const { from, to, period, channel = 'all' } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
-  const amazonEnriched = `
-    SELECT o.order_date,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue,
-      o.status
-    FROM amazon_orders o
-    LEFT JOIN (
-      SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
-      FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
-    ) r ON r.order_id = o.amazon_order_id
-  `;
-  try {
-    let result;
-    if (channel === 'all') {
-      result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
-          SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
-        FROM (
-          SELECT order_date, gross_revenue, net_revenue FROM shopify_orders
-          WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
-          UNION ALL
-          SELECT order_date, gross_revenue, net_revenue FROM (${amazonEnriched}) a
-          WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
-        ) combined GROUP BY 1 ORDER BY 1
-      `, [trunc, dateFrom, dateTo]);
-    } else if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
-          SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
-        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
-        GROUP BY 1 ORDER BY 1
-      `, [trunc, dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
-          SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
-        FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
-        GROUP BY 1 ORDER BY 1
-      `, [trunc, dateFrom, dateTo]);
-    }
+// Fixed colour map keyed by gateway name — ensures legend, bars, and tooltips always match
+const GATEWAY_COLORS = {
+  'shopify payments': '#7c6af7',
+  'shopify_payments': '#7c6af7',
+  'paypal': '#34d399',
+  'amazon payout': '#fbbf24',
+  'amazon': '#fbbf24',
+};
+function gatewayColor(name, index) {
+  return GATEWAY_COLORS[name?.toLowerCase()] || COLORS[index % COLORS.length];
+}
 
-    // Refunds attributed by refund_date, grouped to the same period granularity,
-    // subtracted from net_revenue (same logic as /api/summary).
-    let refundResult;
-    if (channel === 'amazon' || channel === 'shopify') {
-      refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
-        FROM v_refunds_by_date WHERE channel = $2 AND refund_date::date BETWEEN $3 AND $4
-        GROUP BY 1
-      `, [trunc, channel, dateFrom, dateTo]);
-    } else {
-      refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
-        FROM v_refunds_by_date WHERE refund_date::date BETWEEN $2 AND $3
-        GROUP BY 1
-      `, [trunc, dateFrom, dateTo]);
-    }
-    const refundsByPeriod = {};
-    for (const r of refundResult.rows) {
-      refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
-    }
+export default function SalesSummary() {
+  const [range, setRange] = useState(() => {
+    try { const s = localStorage.getItem('gb_sales_range'); return s ? JSON.parse(s) : getRange({ days: 30 }); } catch { return getRange({ days: 30 }); }
+  });
+  const [period, setPeriod] = useState(() => localStorage.getItem('gb_sales_period') || 'day');
+  const [channel, setChannel] = useState(() => localStorage.getItem('gb_sales_channel') || 'all');
 
-    const rows = result.rows.map(r => {
-      const key = r.period.toISOString().split('T')[0];
-      const refunds = refundsByPeriod[key] || 0;
-      return { ...r, net_revenue: (parseFloat(r.net_revenue || 0) - refunds).toFixed(2), refunds: refunds.toFixed(2) };
-    });
-    res.json(rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
+  const handleRange = (r) => { setRange(r); localStorage.setItem('gb_sales_range', JSON.stringify(r)); };
+  const handlePeriod = (p) => { setPeriod(p); localStorage.setItem('gb_sales_period', p); };
+  const handleChannel = (c) => { setChannel(c); localStorage.setItem('gb_sales_channel', c); };
+  const params = { ...range, channel };
 
-// Gateway / Payout split
-app.get('/api/gateway-split', async (req, res) => {
-  const { from, to, channel = 'all' } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  // Amazon: net_transfer from amazon_payouts by fund_transfer_date (actual payout)
-  // Shopify: net_revenue from shopify_orders by order_date (order revenue)
-  try {
-    let result;
-    if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT 'Amazon Payout' AS gateway, COUNT(*)::int AS orders, SUM(net_transfer)::numeric AS revenue
-        FROM amazon_payouts
-        WHERE fund_transfer_date::date BETWEEN $1 AND $2
-        AND net_transfer != 0
-      `, [dateFrom, dateTo]);
-    } else if (channel === 'all') {
-      result = await pool.query(`
-        SELECT gateway, SUM(orders)::int AS orders, SUM(revenue)::numeric AS revenue FROM (
-          SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
-          FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
-          GROUP BY gateway
-          UNION ALL
-          SELECT 'Amazon Payout' AS gateway, COUNT(*)::int AS orders, SUM(net_transfer)::numeric AS revenue
-          FROM amazon_payouts
-          WHERE fund_transfer_date::date BETWEEN $1 AND $2
-          AND net_transfer != 0
-        ) combined GROUP BY gateway ORDER BY revenue DESC
-      `, [dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
-        FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
-        GROUP BY gateway ORDER BY revenue DESC
-      `, [dateFrom, dateTo]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
+  const { data: summary } = useApi('/api/summary', params);
+  const { data: trend, loading: loadingTrend } = useApi('/api/revenue-trend', { ...params, period });
+  const { data: gatewayRaw, loading: loadingGateway } = useApi('/api/gateway-trend', { ...params, period });
+  const { data: gatewaySummary } = useApi('/api/gateway-split', params);
+  const { data: fees } = useApi('/api/fees', range);
+  const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8, channel });
+  const { data: recentRefunds } = useApi('/api/refunds-by-date', { ...params, limit: 8 });
 
-// Gateway trend over time
-app.get('/api/gateway-trend', async (req, res) => {
-  const { from, to, period, channel = 'all' } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
-  try {
-    let result;
-    if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, SUM(net_transfer)::numeric AS revenue
-        FROM amazon_payouts
-        WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
-        GROUP BY 1 ORDER BY 1
-      `, [trunc, dateFrom, dateTo]);
-    } else if (channel === 'all') {
-      result = await pool.query(`
-        SELECT period, gateway, SUM(revenue)::numeric AS revenue FROM (
-          SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue AS revenue FROM shopify_orders
-          WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
-          UNION ALL
-          SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, net_transfer AS revenue
-          FROM amazon_payouts
-          WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
-        ) combined GROUP BY 1, 2 ORDER BY 1, 2
-      `, [trunc, dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, SUM(net_revenue)::numeric AS revenue
-        FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
-        GROUP BY 1, 2 ORDER BY 1, 2
-      `, [trunc, dateFrom, dateTo]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
+  const { data: gatewayData, keys: gatewayKeys } = useMemo(() => pivotGatewayData(gatewayRaw || []), [gatewayRaw]);
+  const revenueDomain = useMemo(() => computeDomain(trend || [], ['gross_revenue', 'net_revenue']), [trend]);
+  const fmtTick = useMemo(() => makeFmtDate(trend), [trend]);
+  const fmtGatewayTick = useMemo(() => makeFmtDate(gatewayData), [gatewayData]);
+  const gatewayLabel = channel === 'amazon' ? 'Payout Method' : 'Payment Gateway';
 
-// Shopify fees
-app.get('/api/fees', async (req, res) => {
-  const { from, to } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  try {
-    const result = await pool.query(`
-      SELECT SUM(fees)::numeric AS total_fees, SUM(charges_gross)::numeric AS gross_sales,
-        SUM(refunds)::numeric AS total_refunds, SUM(amount)::numeric AS net_payouts
-      FROM shopify_payouts WHERE payout_date BETWEEN $1 AND $2 AND status = 'paid'
-    `, [dateFrom, dateTo]);
-    res.json(result.rows[0]);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-// Recent orders
-app.get('/api/recent-orders', async (req, res) => {
-  const { limit, channel = 'all' } = req.query;
-  // Order-level rollup of v_sku_revenue for Amazon, so gross/net reflect
-  // the SKU-level gross-to-net bridge (incl. list-price fallback for Pending orders)
-  const amazonRevenueRollup = `
-    SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue,
-      BOOL_OR(is_estimated_price) AS is_estimated_price
-    FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
-  `;
-  try {
-    let result;
-    if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT o.amazon_order_id AS shopify_order_number, o.order_date, o.status AS financial_status,
-          o.fulfillment_channel AS fulfillment_status, COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-          COALESCE(r.net_revenue, o.net_revenue) AS net_revenue, COALESCE(o.total_refunded, 0) AS total_refunded,
-          'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel, COALESCE(r.is_estimated_price, false) AS is_estimated_price
-        FROM amazon_orders o
-        LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
-        WHERE o.status != 'Canceled' ORDER BY o.order_date DESC LIMIT $1
-      `, [limit || 10]);
-    } else if (channel === 'all') {
-      result = await pool.query(`
-        SELECT * FROM (
-          SELECT shopify_order_number::text AS shopify_order_number, order_date, financial_status, fulfillment_status,
-            gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
-          FROM shopify_orders WHERE financial_status != 'voided'
-          UNION ALL
-          SELECT o.amazon_order_id, o.order_date, o.status AS financial_status, o.fulfillment_channel AS fulfillment_status,
-            COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue, COALESCE(r.net_revenue, o.net_revenue) AS net_revenue,
-            COALESCE(o.total_refunded, 0) AS total_refunded, 'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel,
-            COALESCE(r.is_estimated_price, false) AS is_estimated_price
-          FROM amazon_orders o
-          LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
-          WHERE o.status != 'Canceled'
-        ) combined ORDER BY order_date DESC LIMIT $1
-      `, [limit || 10]);
-    } else {
-      result = await pool.query(`
-        SELECT shopify_order_number, order_date, financial_status, fulfillment_status,
-          gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
-        FROM shopify_orders WHERE financial_status != 'voided' ORDER BY order_date DESC LIMIT $1
-      `, [limit || 10]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-// Refunds attributed by the date the refund was posted (not order date)
-app.get('/api/refunds-by-date', async (req, res) => {
-  const { from, to, channel = 'all', limit } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  try {
-    let result;
-    if (channel === 'amazon' || channel === 'shopify') {
-      result = await pool.query(`
-        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
-        FROM v_refunds_by_date
-        WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
-        ORDER BY refund_date DESC LIMIT $4
-      `, [channel, dateFrom, dateTo, limit || 20]);
-    } else {
-      result = await pool.query(`
-        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
-        FROM v_refunds_by_date
-        WHERE refund_date::date BETWEEN $1 AND $2
-        ORDER BY refund_date DESC LIMIT $3
-      `, [dateFrom, dateTo, limit || 20]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-
-// Product Breakdown — per SKU, both channels, date filtered
-app.get('/api/product-breakdown', async (req, res) => {
-  const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc' } = req.query;
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts'];
-  const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
-  const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
-  try {
-    // Refunds by SKU, attributed by refund_date within selected range
-    const refundCte = `
-      refunds_by_sku AS (
-        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded
-        FROM amazon_order_line_refunds
-        WHERE sku IS NOT NULL AND refund_date::date BETWEEN $1 AND $2
-        GROUP BY sku
-      ),
-      shopify_refunds_by_sku AS (
-        SELECT sol.sku, SUM(st.amount)::numeric AS total_refunded, COUNT(DISTINCT st.shopify_transaction_id)::int AS units_refunded
-        FROM shopify_transactions st
-        JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
-        WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
-        GROUP BY sol.sku
-      ),
-      all_refunds_by_sku AS (
-        SELECT sku,
-          SUM(total_refunded)::numeric AS total_refunded,
-          SUM(units_refunded)::int AS units_refunded
-        FROM (
-          SELECT sku, total_refunded, units_refunded FROM refunds_by_sku
-          UNION ALL
-          SELECT sku, total_refunded, units_refunded FROM shopify_refunds_by_sku
-        ) combined GROUP BY sku
-      )
-    `;
-
-    let result;
-    if (channel === 'shopify') {
-      result = await pool.query(`
-        WITH ${refundCte}
-        SELECT
-          sol.sku,
-          MAX(sol.product_title) AS product_title,
-          NULL AS asin,
-          sp.image_url,
-          'shopify' AS channels,
-          SUM(sol.quantity)::int AS units_sold,
-          COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
-          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          (SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
-          SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
-          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
-        FROM shopify_order_lines sol
-        LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
-        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
-        WHERE sol.order_date::date BETWEEN $1 AND $2
-        GROUP BY sol.sku, sp.image_url
-        ORDER BY ${sortCol} ${sortDir}
-      `, [dateFrom, dateTo]);
-    } else if (channel === 'amazon') {
-      result = await pool.query(`
-        WITH ${refundCte}
-        SELECT
-          aol.sku,
-          MAX(aol.title) AS product_title,
-          MAX(aol.asin) AS asin,
-          sp.image_url,
-          'amazon' AS channels,
-          SUM(aol.quantity)::int AS units_sold,
-          COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          (SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
-          SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
-          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
-        FROM amazon_order_lines aol
-        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
-        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-        LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
-        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
-        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-        GROUP BY aol.sku, sp.image_url
-        ORDER BY ${sortCol} ${sortDir}
-      `, [dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        WITH ${refundCte},
-        shopify_skus AS (
-          SELECT
-            sol.sku,
-            MAX(sol.product_title) AS product_title,
-            NULL AS asin,
-            SUM(sol.quantity)::int AS units_sold,
-            SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-            SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity)::numeric(12,2) AS net_revenue,
-            SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts
-          FROM shopify_order_lines sol
-          WHERE sol.order_date::date BETWEEN $1 AND $2
-          GROUP BY sol.sku
-        ),
-        amazon_skus AS (
-          SELECT
-            aol.sku,
-            MAX(aol.title) AS product_title,
-            MAX(aol.asin) AS asin,
-            SUM(aol.quantity)::int AS units_sold,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
-            SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts
-          FROM amazon_order_lines aol
-          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
-          LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-          WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-          GROUP BY aol.sku
-        )
-        SELECT
-          COALESCE(s.sku, a.sku) AS sku,
-          COALESCE(a.product_title, s.product_title) AS product_title,
-          a.asin,
-          sp.image_url,
-          CASE WHEN s.sku IS NOT NULL AND a.sku IS NOT NULL THEN 'both'
-               WHEN s.sku IS NOT NULL THEN 'shopify'
-               ELSE 'amazon' END AS channels,
-          (COALESCE(s.units_sold, 0) + COALESCE(a.units_sold, 0))::int AS units_sold,
-          COALESCE(r.units_refunded, 0)::int AS units_refunded,
-          (COALESCE(s.gross_sales, 0) + COALESCE(a.gross_sales, 0))::numeric(12,2) AS gross_sales,
-          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
-          (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
-          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded
-        FROM shopify_skus s
-        FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
-        LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
-        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku)
-        ORDER BY ${sortCol} ${sortDir}
-      `, [dateFrom, dateTo]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-// Product Breakdown — country split for a single SKU
-app.get('/api/product-breakdown/countries', async (req, res) => {
-  const { sku, from, to, channel = 'all' } = req.query;
-  if (!sku) return res.status(400).json({ error: 'sku required' });
-  const dateFrom = from || '2020-01-01';
-  const dateTo = to || new Date().toISOString().split('T')[0];
-  try {
-    let result;
-    if (channel === 'shopify') {
-      result = await pool.query(`
-        SELECT COALESCE(so.shipping_country, 'Unknown') AS country, 'shopify' AS channel,
-          SUM(sol.quantity)::int AS units_sold,
-          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales
-        FROM shopify_order_lines sol
-        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
-        WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
-        GROUP BY 1 ORDER BY gross_sales DESC
-      `, [sku, dateFrom, dateTo]);
-    } else if (channel === 'amazon') {
-      result = await pool.query(`
-        SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
-          SUM(aol.quantity)::int AS units_sold,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales
-        FROM amazon_order_lines aol
-        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
-        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-        WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
-        GROUP BY 1 ORDER BY gross_sales DESC
-      `, [sku, dateFrom, dateTo]);
-    } else {
-      result = await pool.query(`
-        SELECT country, channel, SUM(units_sold)::int AS units_sold, SUM(gross_sales)::numeric(12,2) AS gross_sales FROM (
-          SELECT COALESCE(so.shipping_country, 'Unknown') AS country, 'shopify' AS channel,
-            sol.quantity AS units_sold, (sol.unit_price * sol.quantity) AS gross_sales
-          FROM shopify_order_lines sol
-          JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
-          WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
-          UNION ALL
-          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
-            aol.quantity AS units_sold,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales
-          FROM amazon_order_lines aol
-          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
-          LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-          WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
-        ) combined
-        GROUP BY country, channel ORDER BY gross_sales DESC
-      `, [sku, dateFrom, dateTo]);
-    }
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-// Sync status
-app.get('/api/sync-status', async (req, res) => {
-  try {
-    const result = await pool.query('SELECT source, status, last_synced_at, records_synced, last_error FROM sync_state ORDER BY source');
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
-
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+  return (
+    <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+        <div><h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Sales Summary</h1><p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>All channels</p></div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+            {CHANNELS.map(c => (<button key={c.id} onClick={() => handleChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>))}
+          </div>
+          <DateRangePicker value={range} onChange={handleRange} />
+        </div>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
+        <KpiCard label="Gross Revenue" value={summary?.gross_revenue} type="currency" color="#7c6af7" />
+        <KpiCard label="Net Revenue" value={summary?.net_revenue} type="currency" color="#34d399" />
+        <KpiCard label="Orders" value={summary?.total_orders} type="number" color="#fbbf24" />
+        <KpiCard label="Avg Order Value" value={summary?.avg_order_value} type="currency" color="#a78bfa" />
+        <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={String(summary?.refund_count || 0) + ' orders'} />
+        {channel !== 'amazon' && <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" />}
+      </div>
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Revenue Trend</h2>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {PERIODS.map(p => (<button key={p} onClick={() => handlePeriod(p)} style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: '1px solid ' + (period === p ? 'var(--accent)' : 'var(--border)'), background: period === p ? 'var(--accent)' : 'transparent', color: period === p ? '#fff' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', letterSpacing: '0.06em', textTransform: 'uppercase' }}>{p}</button>))}
+          </div>
+        </div>
+        {loadingTrend ? (<div style={{ height: 240, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
+          <ResponsiveContainer width="100%" height={240}>
+            <AreaChart data={trend || []} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+              <defs>
+                <linearGradient id="gradGross" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7c6af7" stopOpacity={0.3} /><stop offset="100%" stopColor="#7c6af7" stopOpacity={0} /></linearGradient>
+                <linearGradient id="gradNet" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#34d399" stopOpacity={0.3} /><stop offset="100%" stopColor="#34d399" stopOpacity={0} /></linearGradient>
+              </defs>
+              <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
+              <XAxis dataKey="period" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+              <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={revenueDomain} />
+              <Tooltip content={<CustomTooltip />} />
+              <Area type="monotone" dataKey="gross_revenue" name="Gross" stroke="#7c6af7" strokeWidth={2} fill="url(#gradGross)" />
+              <Area type="monotone" dataKey="net_revenue" name="Net" stroke="#34d399" strokeWidth={2} fill="url(#gradNet)" />
+            </AreaChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>{gatewayLabel}</h2>
+          {loadingGateway ? (<div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
+            <>
+              <ResponsiveContainer width="100%" height={140}>
+                <BarChart data={gatewayData} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
+                  <XAxis dataKey="period" tickFormatter={fmtGatewayTick} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                  <YAxis tickFormatter={fmt} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={55} />
+                  <Tooltip content={<GatewayTooltip />} />
+                  {gatewayKeys.map((key, i) => (<Bar key={key} dataKey={key} name={key.replace(/_/g, ' ')} stackId="a" fill={gatewayColor(key, i)} radius={i === gatewayKeys.length - 1 ? [3, 3, 0, 0] : [0, 0, 0, 0]} />))}
+                </BarChart>
+              </ResponsiveContainer>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
+                {(gatewaySummary || []).map((g, i) => (<div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: gatewayColor(g.gateway, i), flexShrink: 0 }} /><span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span><span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</span></div>))}
+              </div>
+            </>
+          )}
+        </div>
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>Order Volume</h2>
+          {loadingTrend ? (<div style={{ height: 160, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
+            <ResponsiveContainer width="100%" height={160}>
+              <BarChart data={trend || []} margin={{ top: 0, right: 0, bottom: 0, left: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
+                <XAxis dataKey="period" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                <YAxis tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={30} />
+                <Tooltip contentStyle={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, fontFamily: 'DM Mono', fontSize: 12 }} />
+                <Bar dataKey="orders" name="Orders" fill="#fbbf24" radius={[3, 3, 0, 0]} opacity={0.85} />
+              </BarChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}><h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Recent Orders</h2></div>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Order', 'Date', 'Status', 'Fulfilment', 'Gross', 'Net', 'Gateway', 'Country', 'Channel'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
+          <tbody>
+            {(recentOrders || []).map((o, i) => (
+              <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{o.channel === 'shopify' ? '#' : ''}{o.shopify_order_number}</td>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(o.order_date)}</td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d39915' : '#6b6b8020', color: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>
+                  {fmt(o.gross_revenue)}
+                  {o.is_estimated_price && (
+                    <span title="Estimated from last known price — order pending settlement" style={{ marginLeft: 6, padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600, background: '#fbbf2420', color: '#fbbf24', fontFamily: 'var(--font)', letterSpacing: '0.04em' }}>EST</span>
+                  )}
+                </td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{fmt(o.net_revenue)}</td>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: o.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{o.channel || 'shopify'}</span></td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Refunds Processed</h2>
+          <p style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>By refund date — may relate to orders placed in earlier periods</p>
+        </div>
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Date', 'Channel', 'Order', 'SKU', 'Qty', 'Amount'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
+          <tbody>
+            {(recentRefunds || []).length === 0 && (
+              <tr><td colSpan={6} style={{ padding: '24px 16px', textAlign: 'center', fontSize: 13, color: 'var(--muted)' }}>No refunds in this period</td></tr>
+            )}
+            {(recentRefunds || []).map((r, i) => (
+              <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(r.refund_date)}</td>
+                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: r.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: r.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{r.channel}</span></td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{r.channel === 'shopify' ? '#' : ''}{r.order_id}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.sku || '—'}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.quantity_refunded ?? '—'}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)' }}>{fmt(r.amount_refunded)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
