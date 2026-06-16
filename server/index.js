@@ -350,13 +350,30 @@ app.get('/api/product-breakdown', async (req, res) => {
   const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
   const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
   try {
-    // Refunds by SKU (refund-date attributed, for refund totals per SKU)
+    // Refunds by SKU, attributed by refund_date within selected range
     const refundCte = `
       refunds_by_sku AS (
-        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
+        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded
         FROM amazon_order_line_refunds
-        WHERE sku IS NOT NULL
+        WHERE sku IS NOT NULL AND refund_date::date BETWEEN $1 AND $2
         GROUP BY sku
+      ),
+      shopify_refunds_by_sku AS (
+        SELECT sol.sku, SUM(sol.amount_refunded)::numeric AS total_refunded, SUM(sol.quantity_refunded)::int AS units_refunded
+        FROM shopify_order_lines sol
+        JOIN shopify_transactions st ON st.shopify_order_id = sol.shopify_order_id
+        WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
+        GROUP BY sol.sku
+      ),
+      all_refunds_by_sku AS (
+        SELECT sku,
+          SUM(total_refunded)::numeric AS total_refunded,
+          SUM(units_refunded)::int AS units_refunded
+        FROM (
+          SELECT sku, total_refunded, units_refunded FROM refunds_by_sku
+          UNION ALL
+          SELECT sku, total_refunded, units_refunded FROM shopify_refunds_by_sku
+        ) combined GROUP BY sku
       )
     `;
 
@@ -368,6 +385,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           sol.sku,
           MAX(sol.product_title) AS product_title,
           NULL AS asin,
+          sp.image_url,
           'shopify' AS channels,
           SUM(sol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
@@ -376,9 +394,10 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
         FROM shopify_order_lines sol
-        LEFT JOIN refunds_by_sku r ON r.sku = sol.sku
+        LEFT JOIN all_refunds_by_sku r ON r.sku = sol.sku
+        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         WHERE sol.order_date::date BETWEEN $1 AND $2
-        GROUP BY sol.sku
+        GROUP BY sol.sku, sp.image_url
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else if (channel === 'amazon') {
@@ -388,6 +407,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           aol.sku,
           MAX(aol.title) AS product_title,
           MAX(aol.asin) AS asin,
+          sp.image_url,
           'amazon' AS channels,
           SUM(aol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
@@ -398,13 +418,13 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
-        LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
+        LEFT JOIN all_refunds_by_sku r ON r.sku = aol.sku
+        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-        GROUP BY aol.sku
+        GROUP BY aol.sku, sp.image_url
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else {
-      // Both channels — FULL OUTER JOIN on sku
       result = await pool.query(`
         WITH ${refundCte},
         shopify_skus AS (
@@ -439,6 +459,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(s.sku, a.sku) AS sku,
           COALESCE(a.product_title, s.product_title) AS product_title,
           a.asin,
+          sp.image_url,
           CASE WHEN s.sku IS NOT NULL AND a.sku IS NOT NULL THEN 'both'
                WHEN s.sku IS NOT NULL THEN 'shopify'
                ELSE 'amazon' END AS channels,
@@ -450,7 +471,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded
         FROM shopify_skus s
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
-        LEFT JOIN refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
+        LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku)
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     }
