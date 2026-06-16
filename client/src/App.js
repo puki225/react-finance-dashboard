@@ -25,8 +25,13 @@ function Placeholder({ label }) {
 }
 
 export default function App() {
-  const [active, setActive] = useState('sales');
+  const [active, setActive] = useState(() => localStorage.getItem('gb_active_tab') || 'sales');
   const [collapsed, setCollapsed] = useState(false);
+
+  const handleNav = (id) => {
+    setActive(id);
+    localStorage.setItem('gb_active_tab', id);
+  };
 
   return (
     <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
@@ -63,7 +68,7 @@ export default function App() {
           {NAV.map(item => (
             <button
               key={item.id}
-              onClick={() => item.active && setActive(item.id)}
+              onClick={() => item.active && handleNav(item.id)}
               title={collapsed ? item.label : ''}
               style={{
                 display: 'flex',
