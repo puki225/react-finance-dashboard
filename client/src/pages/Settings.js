@@ -297,8 +297,6 @@ function ReportingSettings() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
-  const [syncing, setSyncing] = useState(false);
-  const [syncResult, setSyncResult] = useState(null);
 
   useEffect(() => {
     if (config?.reporting_currency && currency === null) setCurrency(config.reporting_currency);
@@ -318,19 +316,6 @@ function ReportingSettings() {
     setSaving(false);
   };
 
-  const handleSyncFx = async () => {
-    setSyncing(true); setSyncResult(null);
-    try {
-      const resp = await fetch('/api/sync-fx', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ daysBack: 730 }),
-      });
-      const data = await resp.json();
-      setSyncResult(data.ok ? `✓ Synced ${data.synced} FX rates` : `Error: ${data.error}`);
-    } catch (e) { setSyncResult(`Error: ${e.message}`); }
-    setSyncing(false);
-  };
-
   const dirty = currency !== null && currency !== config?.reporting_currency;
 
   return (
@@ -340,10 +325,10 @@ function ReportingSettings() {
         <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
           All revenue, margin, and cash flow figures will be displayed in this currency.
           COGS entered in other currencies will be converted at the exchange rate on the order date.
+          Revenues are recorded in GBP — conversion uses daily ECB rates synced automatically.
         </p>
       </div>
 
-      {/* Currency selector */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
           <div style={{ flex: 1, minWidth: 200 }}>
@@ -365,22 +350,6 @@ function ReportingSettings() {
               {saving ? 'Saving…' : 'Save'}
             </button>
           </div>
-        </div>
-      </div>
-
-      {/* FX Rates */}
-      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
-        <h3 style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Exchange Rates</h3>
-        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
-          Historical GBP→USD and GBP→EUR rates are sourced from the Frankfurter API (ECB data).
-          Rates are synced daily. Run a manual backfill to populate historical data.
-        </p>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-          <button onClick={handleSyncFx} disabled={syncing}
-            style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid var(--accent)', background: 'var(--accent)20', color: 'var(--accent2)', cursor: syncing ? 'not-allowed' : 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', opacity: syncing ? 0.6 : 1 }}>
-            {syncing ? 'Syncing…' : 'Backfill 2 Years of FX Rates'}
-          </button>
-          {syncResult && <span style={{ fontSize: 12, color: syncResult.startsWith('✓') ? 'var(--green)' : 'var(--red)' }}>{syncResult}</span>}
         </div>
       </div>
     </div>
