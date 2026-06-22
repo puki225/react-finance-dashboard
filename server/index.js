@@ -671,6 +671,54 @@ app.put('/api/settings/cogs/entry/:id', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// FX Rates — sync historical GBP→USD and GBP→EUR from exchangerate.host
+app.post('/api/sync-fx', async (req, res) => {
+  const { daysBack = 365 } = req.body || {};
+  try {
+    const pairs = [['GBP', 'USD'], ['GBP', 'EUR']];
+    let synced = 0;
+    for (const [base, target] of pairs) {
+      const endDate = new Date().toISOString().split('T')[0];
+      const startDate = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
+      const url = `https://api.frankfurter.app/${startDate}..${endDate}?from=${base}&to=${target}`;
+      const resp = await fetch(url);
+      const data = await resp.json();
+      if (!data.rates) continue;
+      for (const [date, rates] of Object.entries(data.rates)) {
+        const rate = rates[target];
+        if (!rate) continue;
+        await pool.query(`
+          INSERT INTO exchange_rates (date, base_currency, target_currency, rate, source, created_at)
+          VALUES ($1, $2, $3, $4, 'frankfurter', NOW())
+          ON CONFLICT (date, base_currency, target_currency) DO UPDATE SET rate = EXCLUDED.rate
+        `, [date, base, target, rate]);
+        synced++;
+      }
+    }
+    res.json({ ok: true, synced });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Client config — get reporting currency
+app.get('/api/settings/config', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT reporting_currency FROM client_config LIMIT 1');
+    res.json(result.rows[0] || { reporting_currency: 'GBP' });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Client config — update reporting currency
+app.put('/api/settings/config', async (req, res) => {
+  const { reporting_currency } = req.body;
+  if (!['GBP', 'USD', 'EUR'].includes(reporting_currency)) return res.status(400).json({ error: 'Invalid currency' });
+  try {
+    await pool.query(`
+      UPDATE client_config SET reporting_currency = $1, updated_at = NOW()
+    `, [reporting_currency]);
+    res.json({ ok: true, reporting_currency });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
