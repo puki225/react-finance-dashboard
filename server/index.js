@@ -20,6 +20,57 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
+// ─── FX HELPERS ───────────────────────────────────────────────
+
+// Get reporting currency from client_config (cached per request)
+async function getReportingCurrency() {
+  try {
+    const result = await pool.query('SELECT reporting_currency FROM client_config LIMIT 1');
+    return result.rows[0]?.reporting_currency || 'GBP';
+  } catch { return 'GBP'; }
+}
+
+// Get FX rate for a specific date, with fallback to nearest available rate
+async function getFxRate(fromCurrency, toCurrency, date) {
+  if (fromCurrency === toCurrency) return 1;
+  try {
+    // Try exact date first, then look backwards up to 7 days (weekends/holidays)
+    const result = await pool.query(`
+      SELECT rate FROM exchange_rates
+      WHERE base_currency = $1 AND target_currency = $2
+        AND date <= $3::date
+      ORDER BY date DESC LIMIT 1
+    `, [fromCurrency, toCurrency, date]);
+    return result.rows[0] ? parseFloat(result.rows[0].rate) : 1;
+  } catch { return 1; }
+}
+
+// Convert an amount from one currency to another on a specific date
+async function convertAmount(amount, fromCurrency, toCurrency, date) {
+  if (!amount || fromCurrency === toCurrency) return parseFloat(amount || 0);
+  const rate = await getFxRate(fromCurrency, toCurrency, date);
+  return parseFloat(amount) * rate;
+}
+
+// For a date range, get a single representative rate (midpoint date)
+// Used for period-level conversions in summary queries
+async function getPeriodRate(fromCurrency, toCurrency, dateFrom, dateTo) {
+  if (fromCurrency === toCurrency) return 1;
+  try {
+    const result = await pool.query(`
+      SELECT AVG(rate)::numeric(12,6) AS avg_rate FROM exchange_rates
+      WHERE base_currency = $1 AND target_currency = $2
+        AND date BETWEEN $3::date AND $4::date
+    `, [fromCurrency, toCurrency, dateFrom, dateTo]);
+    return result.rows[0]?.avg_rate ? parseFloat(result.rows[0].avg_rate) : 1;
+  } catch { return 1; }
+}
+
+// Currency symbol helper
+function currencySymbol(currency) {
+  return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
+}
+
 // ─── API ROUTES ───────────────────────────────────────────────
 
 // KPI Summary
@@ -97,12 +148,24 @@ app.get('/api/summary', async (req, res) => {
     }
     const refundRow = refundResult.rows[0];
 
+    // FX conversion — apply period average rate (GBP → reporting currency)
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fx = (n) => ((parseFloat(n) || 0) * fxRate).toFixed(2);
+
+    const netRevenue = parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0);
+
     res.json({
       ...row,
-      net_revenue: (parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0)).toFixed(2),
-      total_refunded: refundRow.total_refunded,
-      refund_count: refundRow.refund_count,
-      refund_rate: row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
+      gross_revenue:    fx(row.gross_revenue),
+      net_revenue:      fx(netRevenue),
+      total_discounts:  fx(row.total_discounts),
+      avg_order_value:  fx(row.avg_order_value),
+      total_refunded:   fx(refundRow.total_refunded),
+      refund_count:     refundRow.refund_count,
+      refund_rate:      row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
+      reporting_currency: reportingCurrency,
+      currency_symbol:  currencySymbol(reportingCurrency),
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
@@ -175,10 +238,20 @@ app.get('/api/revenue-trend', async (req, res) => {
       refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
     }
 
+    // FX conversion — use period average rate
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+
     const rows = result.rows.map(r => {
       const key = r.period.toISOString().split('T')[0];
       const refunds = refundsByPeriod[key] || 0;
-      return { ...r, net_revenue: (parseFloat(r.net_revenue || 0) - refunds).toFixed(2), refunds: refunds.toFixed(2) };
+      const netRevenue = parseFloat(r.net_revenue || 0) - refunds;
+      return {
+        ...r,
+        gross_revenue: (parseFloat(r.gross_revenue || 0) * fxRate).toFixed(2),
+        net_revenue:   (netRevenue * fxRate).toFixed(2),
+        refunds:       (refunds * fxRate).toFixed(2),
+      };
     });
     res.json(rows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
@@ -497,11 +570,19 @@ app.get('/api/product-breakdown', async (req, res) => {
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     }
-    res.json(result.rows);
+    // FX conversion — apply period average rate to all monetary fields
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fxRows = result.rows.map(r => ({
+      ...r,
+      gross_sales:     (parseFloat(r.gross_sales     || 0) * fxRate).toFixed(2),
+      net_revenue:     (parseFloat(r.net_revenue     || 0) * fxRate).toFixed(2),
+      total_discounts: (parseFloat(r.total_discounts || 0) * fxRate).toFixed(2),
+      total_refunded:  (parseFloat(r.total_refunded  || 0) * fxRate).toFixed(2),
+    }));
+    res.json(fxRows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
-
-// Product Breakdown — country split for a single SKU
 app.get('/api/product-breakdown/countries', async (req, res) => {
   const { sku, from, to, channel = 'all' } = req.query;
   if (!sku) return res.status(400).json({ error: 'sku required' });
