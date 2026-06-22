@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import SalesSummary from './pages/SalesSummary';
 import ProductBreakdown from './pages/ProductBreakdown';
+import Settings from './pages/Settings';
 
 const NAV = [
   { id: 'sales',     label: 'Sales Summary',      icon: '◈', active: true },
@@ -9,7 +10,7 @@ const NAV = [
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: false },
   { id: 'cashflow',  label: 'Cash Flow',            icon: '◒', active: false },
-  { id: 'settings',  label: 'Settings',             icon: '◓', active: false },
+  { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
 
 const SYNC_COLORS = { success: '#34d399', error: '#f87171', idle: '#6b6b80' };
@@ -118,7 +119,7 @@ export default function App() {
         {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
         {active === 'inventory' && <Placeholder label="Inventory" />}
         {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
-        {active === 'settings'  && <Placeholder label="Settings" />}
+        {active === 'settings'  && <Settings />}
       </div>
     </div>
   );
