@@ -14,9 +14,10 @@ const COGS_FIELDS = [
   { key: 'cogs_other',     label: 'Other',                placeholder: 'Any other landed cost' },
 ];
 const SUBTABS = [
-  { id: 'cogs',     label: 'COGS' },
-  { id: 'cashflow', label: 'Cash Flow', soon: true },
-  { id: 'channels', label: 'Channels',  soon: true },
+  { id: 'cogs',      label: 'COGS' },
+  { id: 'reporting', label: 'Reporting' },
+  { id: 'cashflow',  label: 'Cash Flow', soon: true },
+  { id: 'channels',  label: 'Channels',  soon: true },
 ];
 
 const inputStyle = {
@@ -289,7 +290,102 @@ function CogsRow({ row, onRefresh }) {
   );
 }
 
-// ── Settings page ──────────────────────────────────────────────────────────
+// ── Reporting subtab ───────────────────────────────────────────────────────
+function ReportingSettings() {
+  const { data: config } = useApi('/api/settings/config');
+  const [currency, setCurrency] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+  const [syncing, setSyncing] = useState(false);
+  const [syncResult, setSyncResult] = useState(null);
+
+  useEffect(() => {
+    if (config?.reporting_currency && currency === null) setCurrency(config.reporting_currency);
+  }, [config, currency]);
+
+  const handleSave = async () => {
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const resp = await fetch('/api/settings/config', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reporting_currency: currency }),
+      });
+      const data = await resp.json();
+      if (data.ok) setSaved(true);
+      else setError(data.error || 'Save failed');
+    } catch (e) { setError(e.message); }
+    setSaving(false);
+  };
+
+  const handleSyncFx = async () => {
+    setSyncing(true); setSyncResult(null);
+    try {
+      const resp = await fetch('/api/sync-fx', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ daysBack: 730 }),
+      });
+      const data = await resp.json();
+      setSyncResult(data.ok ? `✓ Synced ${data.synced} FX rates` : `Error: ${data.error}`);
+    } catch (e) { setSyncResult(`Error: ${e.message}`); }
+    setSyncing(false);
+  };
+
+  const dirty = currency !== null && currency !== config?.reporting_currency;
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      <div>
+        <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Reporting Currency</h2>
+        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
+          All revenue, margin, and cash flow figures will be displayed in this currency.
+          COGS entered in other currencies will be converted at the exchange rate on the order date.
+        </p>
+      </div>
+
+      {/* Currency selector */}
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <label style={labelStyle}>Reporting Currency</label>
+            <div style={{ display: 'flex', gap: 8, marginTop: 4 }}>
+              {CURRENCIES.map(c => (
+                <button key={c} onClick={() => { setCurrency(c); setSaved(false); }}
+                  style={{ padding: '10px 24px', borderRadius: 8, fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', border: '2px solid ' + (currency === c ? 'var(--accent)' : 'var(--border)'), background: currency === c ? 'var(--accent)20' : 'transparent', color: currency === c ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', transition: 'all 0.15s' }}>
+                  {c === 'GBP' ? '£ GBP' : c === 'USD' ? '$ USD' : '€ EUR'}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+            {saved && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ Saved</span>}
+            {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
+            <button onClick={handleSave} disabled={saving || !dirty}
+              style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid ' + (dirty ? 'var(--accent)' : 'var(--border)'), background: dirty ? 'var(--accent)' : 'transparent', color: dirty ? '#fff' : 'var(--muted)', cursor: dirty ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      {/* FX Rates */}
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
+        <h3 style={{ fontSize: 13, fontWeight: 700, marginBottom: 6 }}>Exchange Rates</h3>
+        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
+          Historical GBP→USD and GBP→EUR rates are sourced from the Frankfurter API (ECB data).
+          Rates are synced daily. Run a manual backfill to populate historical data.
+        </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <button onClick={handleSyncFx} disabled={syncing}
+            style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid var(--accent)', background: 'var(--accent)20', color: 'var(--accent2)', cursor: syncing ? 'not-allowed' : 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', opacity: syncing ? 0.6 : 1 }}>
+            {syncing ? 'Syncing…' : 'Backfill 2 Years of FX Rates'}
+          </button>
+          {syncResult && <span style={{ fontSize: 12, color: syncResult.startsWith('✓') ? 'var(--green)' : 'var(--red)' }}>{syncResult}</span>}
+        </div>
+      </div>
+    </div>
+  );
+}
 export default function Settings() {
   const [subtab, setSubtab] = useState('cogs');
   const { data: skus, loading, error, refetch } = useApi('/api/settings/cogs');
@@ -325,6 +421,7 @@ export default function Settings() {
           {!loading && skus?.map(row => <CogsRow key={row.sku} row={row} onRefresh={refetch} />)}
         </div>
       )}
+      {subtab === 'reporting' && <ReportingSettings />}
     </div>
   );
 }
