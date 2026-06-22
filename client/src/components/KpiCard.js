@@ -1,19 +1,16 @@
 import React from 'react';
-
-const fmt = (val, type) => {
+const fmt = (val, type, symbol = '£') => {
   if (val === null || val === undefined) return '—';
   const n = parseFloat(val);
   if (isNaN(n)) return '—';
-  if (type === 'currency') return '£' + n.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (type === 'currency') return symbol + n.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   if (type === 'percent') return n.toFixed(1) + '%';
   if (type === 'number') return n.toLocaleString('en-GB');
   return val;
 };
-
-export default function KpiCard({ label, value, type = 'currency', sub, trend, color }) {
+export default function KpiCard({ label, value, type = 'currency', sub, trend, color, symbol = '£' }) {
   const trendPositive = trend > 0;
   const trendColor = trendPositive ? 'var(--green)' : 'var(--red)';
-
   return (
     <div style={{
       background: 'var(--bg2)',
@@ -39,7 +36,7 @@ export default function KpiCard({ label, value, type = 'currency', sub, trend, c
         {label}
       </span>
       <span style={{ fontSize: 28, fontWeight: 700, fontFamily: 'var(--mono)', letterSpacing: '-0.02em', color: 'var(--text)' }}>
-        {fmt(value, type)}
+        {fmt(value, type, symbol)}
       </span>
       <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         {trend !== undefined && (
