@@ -3,7 +3,7 @@ import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
 
-const fmt = (n) => '£' + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtN = (n) => parseInt(n || 0).toLocaleString('en-GB');
 const fmtPct = (a, b) => b > 0 ? ((parseFloat(a) / parseFloat(b)) * 100).toFixed(1) + '%' : '—';
 
@@ -69,6 +69,10 @@ export default function ProductBreakdown() {
   const params = { ...range, channel, sort, dir };
 
   const { data: rows, loading } = useApi('/api/product-breakdown', params);
+  const { data: config } = useApi('/api/settings/config');
+  const fmt = useMemo(() => makeFmt(
+    { GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'
+  ), [config?.reporting_currency]);
 
   const totals = useMemo(() => {
     if (!rows?.length) return {};
@@ -123,10 +127,10 @@ export default function ProductBreakdown() {
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(160px, 1fr))', gap: 16 }}>
         <KpiCard label="SKUs" value={totals.skus} type="number" color="#7c6af7" />
         <KpiCard label="Units Sold" value={totals.units_sold} type="number" color="#fbbf24" />
-        <KpiCard label="Gross Revenue" value={totals.gross_sales} type="currency" color="#7c6af7" />
-        <KpiCard label="Discounts" value={totals.total_discounts} type="currency" color="#fbbf24" />
-        <KpiCard label="Refunds" value={totals.total_refunded} type="currency" color="#f87171" />
-        <KpiCard label="Net Revenue" value={totals.net_revenue} type="currency" color="#34d399" />
+        <KpiCard label="Gross Revenue" value={totals.gross_sales} type="currency" color="#7c6af7" symbol={{ GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'} />
+        <KpiCard label="Discounts" value={totals.total_discounts} type="currency" color="#fbbf24" symbol={{ GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'} />
+        <KpiCard label="Refunds" value={totals.total_refunded} type="currency" color="#f87171" symbol={{ GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'} />
+        <KpiCard label="Net Revenue" value={totals.net_revenue} type="currency" color="#34d399" symbol={{ GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'} />
       </div>
 
       {/* Table */}
