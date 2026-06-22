@@ -189,9 +189,9 @@ export default function ProductBreakdown() {
                   </div>
                   {/* SKU + ASIN */}
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 3, minWidth: 0 }}>
-                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{row.sku}</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }} title={row.product_title}>{row.product_title || row.sku}</span>
+                    <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{row.sku}</span>
                     {row.asin && <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{row.asin}</span>}
-                    <span style={{ fontSize: 11, color: 'var(--muted)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', maxWidth: 220 }} title={row.product_title}>{row.product_title}</span>
                   </div>
                 </div>
 
