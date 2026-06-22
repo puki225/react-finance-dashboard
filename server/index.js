@@ -671,22 +671,45 @@ app.put('/api/settings/cogs/entry/:id', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// FX Rates — sync historical GBP→USD and GBP→EUR from exchangerate.host
+// FX Rates — sync all pairs between GBP, USD, EUR from Frankfurter API (ECB data)
 app.post('/api/sync-fx', async (req, res) => {
-  const { daysBack = 365 } = req.body || {};
+  const { daysBack = 3 } = req.body || {};
   try {
-    const pairs = [['GBP', 'USD'], ['GBP', 'EUR']];
-    let synced = 0;
-    for (const [base, target] of pairs) {
-      const endDate = new Date().toISOString().split('T')[0];
-      const startDate = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
+    // Fetch GBP→USD and GBP→EUR from Frankfurter, then derive all 6 pairs
+    const basePairs = [['GBP', 'USD'], ['GBP', 'EUR']];
+    const endDate = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
+
+    // Collect raw rates keyed by date
+    const rawRates = {}; // { '2024-01-15': { 'GBP_USD': 1.27, 'GBP_EUR': 1.17 } }
+    for (const [base, target] of basePairs) {
       const url = `https://api.frankfurter.app/${startDate}..${endDate}?from=${base}&to=${target}`;
       const resp = await fetch(url);
       const data = await resp.json();
       if (!data.rates) continue;
       for (const [date, rates] of Object.entries(data.rates)) {
-        const rate = rates[target];
-        if (!rate) continue;
+        if (!rawRates[date]) rawRates[date] = {};
+        rawRates[date][`${base}_${target}`] = parseFloat(rates[target]);
+      }
+    }
+
+    let synced = 0;
+    for (const [date, rates] of Object.entries(rawRates)) {
+      const gbpUsd = rates['GBP_USD'];
+      const gbpEur = rates['GBP_EUR'];
+      if (!gbpUsd || !gbpEur) continue;
+
+      // Derive all 6 pairs
+      const pairs = [
+        ['GBP', 'USD', gbpUsd],
+        ['GBP', 'EUR', gbpEur],
+        ['USD', 'GBP', 1 / gbpUsd],
+        ['EUR', 'GBP', 1 / gbpEur],
+        ['USD', 'EUR', gbpEur / gbpUsd],
+        ['EUR', 'USD', gbpUsd / gbpEur],
+      ];
+
+      for (const [base, target, rate] of pairs) {
         await pool.query(`
           INSERT INTO exchange_rates (date, base_currency, target_currency, rate, source, created_at)
           VALUES ($1, $2, $3, $4, 'frankfurter', NOW())
@@ -695,7 +718,7 @@ app.post('/api/sync-fx', async (req, res) => {
         synced++;
       }
     }
-    res.json({ ok: true, synced });
+    res.json({ ok: true, synced, days: Object.keys(rawRates).length });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
