@@ -4,7 +4,8 @@ import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
 
-const fmt = (n) => '£' + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+const fmt = makeFmt('£'); // default, overridden once summary loads
 
 function makeFmtDate(data) {
   const years = new Set((data || []).map(d => d.period ? new Date(d.period).getFullYear() : null).filter(Boolean));
@@ -14,16 +15,22 @@ function makeFmtDate(data) {
 const fmtDateFull = (d) => { if (!d) return ''; return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
 const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
 
+// Module-level formatter — updated by SalesSummary when reporting currency changes
+let _fmt = makeFmt('£');
+const getfmt = () => _fmt;
+
 const CustomTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   const refunds = parseFloat(payload[0]?.payload?.refunds || 0);
-  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}{refunds > 0 && (<div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: '#f87171' }}>Refunds: {fmt(refunds)}</div>)}</div>);
+  const f = getfmt();
+  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 13, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {f(p.value)}</div>))}{refunds > 0 && (<div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: '#f87171' }}>Refunds: {f(refunds)}</div>)}</div>);
 };
 
 const GatewayTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
   const total = payload.reduce((s, p) => s + (p.value || 0), 0);
-  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {fmt(p.value)}</div>))}<div style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)', borderTop: '1px solid #ffffff18', marginTop: 6, paddingTop: 6 }}>Total: {fmt(total)}</div></div>);
+  const f = getfmt();
+  return (<div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}><div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>{payload.map((p, i) => (<div key={i} style={{ fontSize: 12, fontFamily: 'var(--mono)', color: p.color }}>{p.name}: {f(p.value)}</div>))}<div style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)', borderTop: '1px solid #ffffff18', marginTop: 6, paddingTop: 6 }}>Total: {f(total)}</div></div>);
 };
 
 function pivotGatewayData(rows) {
@@ -77,6 +84,13 @@ export default function SalesSummary() {
   const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8, channel });
   const { data: recentRefunds } = useApi('/api/refunds-by-date', { ...params, limit: 8 });
 
+  // Dynamic currency formatter — uses reporting currency from summary API
+  const currencyFmt = useMemo(() => {
+    const f = makeFmt(summary?.currency_symbol || '£');
+    _fmt = f; // update module-level formatter for tooltips
+    return f;
+  }, [summary?.currency_symbol]);
+
   const { data: gatewayData, keys: gatewayKeys } = useMemo(() => pivotGatewayData(gatewayRaw || []), [gatewayRaw]);
   const revenueDomain = useMemo(() => computeDomain(trend || [], ['gross_revenue', 'net_revenue']), [trend]);
   const fmtTick = useMemo(() => makeFmtDate(trend), [trend]);
@@ -95,12 +109,12 @@ export default function SalesSummary() {
         </div>
       </div>
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
-        <KpiCard label="Gross Revenue" value={summary?.gross_revenue} type="currency" color="#7c6af7" />
-        <KpiCard label="Net Revenue" value={summary?.net_revenue} type="currency" color="#34d399" />
+        <KpiCard label="Gross Revenue" value={summary?.gross_revenue} type="currency" color="#7c6af7" symbol={summary?.currency_symbol || '£'} />
+        <KpiCard label="Net Revenue" value={summary?.net_revenue} type="currency" color="#34d399" symbol={summary?.currency_symbol || '£'} />
         <KpiCard label="Orders" value={summary?.total_orders} type="number" color="#fbbf24" />
-        <KpiCard label="Avg Order Value" value={summary?.avg_order_value} type="currency" color="#a78bfa" />
+        <KpiCard label="Avg Order Value" value={summary?.avg_order_value} type="currency" color="#a78bfa" symbol={summary?.currency_symbol || '£'} />
         <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={String(summary?.refund_count || 0) + ' orders'} />
-        {channel !== 'amazon' && <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" />}
+        {channel !== 'amazon' && <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" symbol={summary?.currency_symbol || '£'} />}
       </div>
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
@@ -141,7 +155,7 @@ export default function SalesSummary() {
                 </BarChart>
               </ResponsiveContainer>
               <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
-                {(gatewaySummary || []).map((g, i) => (<div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: gatewayColor(g.gateway, i), flexShrink: 0 }} /><span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span><span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(g.revenue)} · {g.orders} orders</span></div>))}
+                {(gatewaySummary || []).map((g, i) => (<div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}><div style={{ width: 8, height: 8, borderRadius: 2, background: gatewayColor(g.gateway, i), flexShrink: 0 }} /><span style={{ fontSize: 12, fontWeight: 600, textTransform: 'capitalize' }}>{g.gateway?.replace(/_/g, ' ')}</span><span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{currencyFmt(g.revenue)} · {g.orders} orders</span></div>))}
               </div>
             </>
           )}
@@ -173,12 +187,12 @@ export default function SalesSummary() {
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d39915' : '#6b6b8020', color: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>
-                  {fmt(o.gross_revenue)}
+                  {currencyFmt(o.gross_revenue)}
                   {o.is_estimated_price && (
                     <span title="Estimated from last known price — order pending settlement" style={{ marginLeft: 6, padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600, background: '#fbbf2420', color: '#fbbf24', fontFamily: 'var(--font)', letterSpacing: '0.04em' }}>EST</span>
                   )}
                 </td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{fmt(o.net_revenue)}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{currencyFmt(o.net_revenue)}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
                 <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
                 <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: o.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{o.channel || 'shopify'}</span></td>
@@ -205,7 +219,7 @@ export default function SalesSummary() {
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{r.channel === 'shopify' ? '#' : ''}{r.order_id}</td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.sku || '—'}</td>
                 <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.quantity_refunded ?? '—'}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)' }}>{fmt(r.amount_refunded)}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)' }}>{currencyFmt(r.amount_refunded)}</td>
               </tr>
             ))}
           </tbody>
