@@ -38,6 +38,17 @@ app.get('/api/summary', async (req, res) => {
       FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
     ) r ON r.order_id = o.amazon_order_id
   `;
+  // Shopify orders enriched with v_sku_revenue rollup (list price gross, post-discount net)
+  const shopifyEnriched = `
+    SELECT o.shopify_order_id, o.order_date, o.financial_status, o.discount_amount,
+      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
+    FROM shopify_orders o
+    LEFT JOIN (
+      SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
+      FROM v_sku_revenue WHERE channel = 'shopify' GROUP BY order_id
+    ) r ON r.order_id = o.shopify_order_id::text
+  `;
   try {
     let result;
     if (channel === 'all') {
@@ -46,7 +57,7 @@ app.get('/api/summary', async (req, res) => {
           SUM(discount_amount)::numeric AS total_discounts,
           AVG(net_revenue)::numeric AS avg_order_value
         FROM (
-          SELECT gross_revenue, net_revenue, discount_amount FROM shopify_orders
+          SELECT gross_revenue, net_revenue, discount_amount FROM (${shopifyEnriched}) s
           WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
           UNION ALL
           SELECT gross_revenue, net_revenue, promotion_discount AS discount_amount
@@ -66,7 +77,7 @@ app.get('/api/summary', async (req, res) => {
         SELECT COUNT(*)::int AS total_orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue,
           SUM(discount_amount)::numeric AS total_discounts,
           AVG(net_revenue)::numeric AS avg_order_value
-        FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
+        FROM (${shopifyEnriched}) s WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
       `, [dateFrom, dateTo]);
     }
     const row = result.rows[0];
@@ -359,9 +370,19 @@ app.get('/api/product-breakdown', async (req, res) => {
         GROUP BY sku
       ),
       shopify_refunds_by_sku AS (
-        SELECT sol.sku, SUM(st.amount)::numeric AS total_refunded, COUNT(DISTINCT st.shopify_transaction_id)::int AS units_refunded
+        SELECT
+          sol.sku,
+          SUM(
+            st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+          )::numeric AS total_refunded,
+          COUNT(DISTINCT st.shopify_transaction_id)::int AS units_refunded
         FROM shopify_transactions st
         JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
+        JOIN (
+          SELECT shopify_order_id, SUM(line_gross) AS order_gross
+          FROM shopify_order_lines
+          GROUP BY shopify_order_id
+        ) order_totals ON order_totals.shopify_order_id = st.shopify_order_id
         WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku
       ),
