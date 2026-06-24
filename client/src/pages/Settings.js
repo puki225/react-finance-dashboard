@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { useApi } from '../hooks/useApi';
 
 const fmtDisplay = (n) => parseFloat(n || 0).toFixed(2);
@@ -357,7 +357,18 @@ function ReportingSettings() {
 }
 export default function Settings() {
   const [subtab, setSubtab] = useState('cogs');
+  const [brandFilter, setBrandFilter] = useState('');
+  const [parentFilter, setParentFilter] = useState('');
   const { data: skus, loading, error, refetch } = useApi('/api/settings/cogs');
+  const { data: brandsData } = useApi('/api/brands');
+
+  const filteredSkus = useMemo(() => {
+    if (!skus) return [];
+    return skus.filter(r =>
+      (!brandFilter || r.brand === brandFilter) &&
+      (!parentFilter || r.parent_asin === parentFilter)
+    );
+  }, [skus, brandFilter, parentFilter]);
 
   return (
     <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 1100 }}>
@@ -378,16 +389,34 @@ export default function Settings() {
 
       {subtab === 'cogs' && (
         <div>
-          <div style={{ marginBottom: 20 }}>
-            <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Cost of Goods Sold</h2>
-            <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
-              Enter landed cost per unit for each SKU. Each entry has an effective date range — COGS for an order is matched to the range covering its order date.
-              Refunds are credited at the COGS of the original order date, not the refund date.
-            </p>
+          <div style={{ marginBottom: 16, display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+            <div>
+              <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Cost of Goods Sold</h2>
+              <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
+                Enter landed cost per unit for each SKU. Each entry has an effective date range — COGS for an order is matched to the range covering its order date.
+                Refunds are credited at the COGS of the original order date, not the refund date.
+              </p>
+            </div>
+            <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+              {brandsData?.brands?.length > 0 && (
+                <select value={brandFilter} onChange={e => setBrandFilter(e.target.value)}
+                  style={{ background: 'var(--bg2)', border: '1px solid ' + (brandFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: brandFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+                  <option value="">All Brands</option>
+                  {brandsData.brands.map(b => <option key={b} value={b}>{b}</option>)}
+                </select>
+              )}
+              {brandsData?.parent_asins?.length > 0 && (
+                <select value={parentFilter} onChange={e => setParentFilter(e.target.value)}
+                  style={{ background: 'var(--bg2)', border: '1px solid ' + (parentFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: parentFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+                  <option value="">All Parent ASINs</option>
+                  {brandsData.parent_asins.map(p => <option key={p} value={p}>{p}</option>)}
+                </select>
+              )}
+            </div>
           </div>
           {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading SKUs…</div>}
           {error && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--red)' }}>{error}</div>}
-          {!loading && skus?.map(row => <CogsRow key={row.sku} row={row} onRefresh={refetch} />)}
+          {!loading && filteredSkus?.map(row => <CogsRow key={row.sku} row={row} onRefresh={refetch} />)}
         </div>
       )}
       {subtab === 'reporting' && <ReportingSettings />}
