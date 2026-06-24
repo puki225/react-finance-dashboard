@@ -63,13 +63,16 @@ export default function ProductBreakdown() {
   const [sort, setSort] = useState(() => localStorage.getItem('gb_prod_sort') || 'gross_sales');
   const [dir, setDir] = useState(() => localStorage.getItem('gb_prod_dir') || 'desc');
   const [expandedSku, setExpandedSku] = useState(null);
+  const [brandFilter, setBrandFilter] = useState('');
+  const [parentFilter, setParentFilter] = useState('');
 
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_prod_range', JSON.stringify(r)); };
   const handleChannel = (c) => { setChannel(c); localStorage.setItem('gb_prod_channel', c); };
-  const params = { ...range, channel, sort, dir };
+  const params = { ...range, channel, sort, dir, ...(brandFilter ? { brand: brandFilter } : {}), ...(parentFilter ? { parent_asin: parentFilter } : {}) };
 
   const { data: rows, loading } = useApi('/api/product-breakdown', params);
   const { data: config } = useApi('/api/settings/config');
+  const { data: brandsData } = useApi('/api/brands');
   const fmt = useMemo(() => makeFmt(
     { GBP: '£', USD: '$', EUR: '€' }[config?.reporting_currency] || '£'
   ), [config?.reporting_currency]);
@@ -119,6 +122,22 @@ export default function ProductBreakdown() {
               <button key={c.id} onClick={() => handleChannel(c.id)} style={channelBtn(channel === c.id)}>{c.label}</button>
             ))}
           </div>
+          {/* Brand filter */}
+          {brandsData?.brands?.length > 0 && (
+            <select value={brandFilter} onChange={e => setBrandFilter(e.target.value)}
+              style={{ background: 'var(--bg2)', border: '1px solid ' + (brandFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '6px 12px', color: brandFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+              <option value="">All Brands</option>
+              {brandsData.brands.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          )}
+          {/* Parent ASIN filter */}
+          {brandsData?.parent_asins?.length > 0 && (
+            <select value={parentFilter} onChange={e => setParentFilter(e.target.value)}
+              style={{ background: 'var(--bg2)', border: '1px solid ' + (parentFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '6px 12px', color: parentFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+              <option value="">All Parent ASINs</option>
+              {brandsData.parent_asins.map(p => <option key={p} value={p}>{p}</option>)}
+            </select>
+          )}
           <DateRangePicker value={range} onChange={handleRange} />
         </div>
       </div>
