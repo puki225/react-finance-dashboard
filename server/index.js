@@ -427,12 +427,16 @@ app.get('/api/refunds-by-date', async (req, res) => {
 
 // Product Breakdown — per SKU, both channels, date filtered
 app.get('/api/product-breakdown', async (req, res) => {
-  const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc' } = req.query;
+  const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc', brand, parent_asin } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
   const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts'];
   const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
   const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
+
+  // Optional brand/parent_asin filter — restricts which SKUs are included
+  const brandFilter = brand ? `AND sp.brand = '${brand.replace(/'/g, "''")}'` : '';
+  const parentFilter = parent_asin ? `AND sp.parent_asin = '${parent_asin.replace(/'/g, "''")}'` : '';
   try {
     // Refunds by SKU, attributed by refund_date within selected range
     const refundCte = `
@@ -480,6 +484,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           MAX(sol.product_title) AS product_title,
           NULL AS asin,
           sp.image_url,
+          sp.brand,
+          sp.parent_asin,
           'shopify' AS channels,
           SUM(sol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
@@ -490,8 +496,8 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM shopify_order_lines sol
         LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
-        WHERE sol.order_date::date BETWEEN $1 AND $2
-        GROUP BY sol.sku, sp.image_url
+        WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+        GROUP BY sol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else if (channel === 'amazon') {
@@ -502,6 +508,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           MAX(aol.title) AS product_title,
           MAX(aol.asin) AS asin,
           sp.image_url,
+          sp.brand,
+          sp.parent_asin,
           'amazon' AS channels,
           SUM(aol.quantity)::int AS units_sold,
           COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
@@ -514,8 +522,8 @@ app.get('/api/product-breakdown', async (req, res) => {
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
-        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-        GROUP BY aol.sku, sp.image_url
+        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
+        GROUP BY aol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else {
@@ -554,6 +562,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(a.product_title, s.product_title) AS product_title,
           a.asin,
           sp.image_url,
+          sp.brand,
+          sp.parent_asin,
           CASE WHEN s.sku IS NOT NULL AND a.sku IS NOT NULL THEN 'both'
                WHEN s.sku IS NOT NULL THEN 'shopify'
                ELSE 'amazon' END AS channels,
@@ -567,6 +577,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
         LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
         LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku)
+        WHERE 1=1 ${brandFilter} ${parentFilter}
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     }
@@ -644,6 +655,8 @@ app.get('/api/settings/cogs', async (req, res) => {
         COALESCE(sp.product_name, aol.title, sol.product_title) AS product_name,
         sp.asin,
         sp.image_url,
+        sp.brand,
+        sp.parent_asin,
         COALESCE(sp.unit_cogs, 0) AS unit_cogs,
         ce.cogs_standard,
         ce.cogs_freight,
@@ -837,6 +850,22 @@ app.put('/api/settings/config', async (req, res) => {
       UPDATE client_config SET reporting_currency = $1, updated_at = NOW()
     `, [reporting_currency]);
     res.json({ ok: true, reporting_currency });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Brands and parent ASINs — for filter dropdowns
+app.get('/api/brands', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT DISTINCT brand FROM sku_parameters WHERE brand IS NOT NULL ORDER BY brand
+    `);
+    const parentResult = await pool.query(`
+      SELECT DISTINCT parent_asin FROM sku_parameters WHERE parent_asin IS NOT NULL ORDER BY parent_asin
+    `);
+    res.json({
+      brands: result.rows.map(r => r.brand),
+      parent_asins: parentResult.rows.map(r => r.parent_asin),
+    });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
