@@ -148,12 +148,41 @@ app.get('/api/summary', async (req, res) => {
     }
     const refundRow = refundResult.rows[0];
 
+    // COGS for the period — sum all orders' COGS using date-matched cogs_entries
+    const cogsResult = await pool.query(`
+      SELECT COALESCE(SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+      LEFT JOIN LATERAL (
+        SELECT unit_cogs FROM cogs_entries
+        WHERE sku = aol.sku AND effective_from <= ao.order_date::date
+          AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+        ORDER BY effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+      UNION ALL
+      SELECT COALESCE(SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs
+      FROM shopify_order_lines sol
+      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+      LEFT JOIN LATERAL (
+        SELECT unit_cogs FROM cogs_entries
+        WHERE sku = sol.sku AND effective_from <= sol.order_date::date
+          AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
+        ORDER BY effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE sol.order_date::date BETWEEN $1 AND $2
+    `, [dateFrom, dateTo]);
+    const totalCogs = cogsResult.rows.reduce((s, r) => s + parseFloat(r.total_cogs || 0), 0);
+
     // FX conversion — apply period average rate (GBP → reporting currency)
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
     const fx = (n) => ((parseFloat(n) || 0) * fxRate).toFixed(2);
 
     const netRevenue = parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0);
+    const grossProfit = netRevenue - totalCogs;
+    const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
 
     res.json({
       ...row,
@@ -162,6 +191,9 @@ app.get('/api/summary', async (req, res) => {
       total_discounts:  fx(row.total_discounts),
       avg_order_value:  fx(row.avg_order_value),
       total_refunded:   fx(refundRow.total_refunded),
+      total_cogs:       fx(totalCogs),
+      gross_profit:     fx(grossProfit),
+      gross_margin_pct: grossMarginPct.toFixed(1),
       refund_count:     refundRow.refund_count,
       refund_rate:      row.total_orders > 0 ? ((refundRow.refund_count / row.total_orders) * 100).toFixed(1) : 0,
       reporting_currency: reportingCurrency,
@@ -430,7 +462,7 @@ app.get('/api/product-breakdown', async (req, res) => {
   const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc', brand, parent_asin } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
-  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts'];
+  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts', 'gross_profit', 'gross_margin_pct'];
   const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
   const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
 
@@ -472,6 +504,51 @@ app.get('/api/product-breakdown', async (req, res) => {
           UNION ALL
           SELECT sku, total_refunded, units_refunded FROM shopify_refunds_by_sku
         ) combined GROUP BY sku
+      ),
+      -- COGS per SKU: weighted by quantity at the COGS rate active on each order date
+      -- For refunded units, COGS is credited back (net units = sold - refunded)
+      amazon_cogs AS (
+        SELECT
+          aol.sku,
+          SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
+          SUM(aol.quantity)::int AS cogs_units
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+        LEFT JOIN LATERAL (
+          SELECT unit_cogs FROM cogs_entries
+          WHERE sku = aol.sku
+            AND effective_from <= ao.order_date::date
+            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+        GROUP BY aol.sku
+      ),
+      shopify_cogs AS (
+        SELECT
+          sol.sku,
+          SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
+          SUM(sol.quantity)::int AS cogs_units
+        FROM shopify_order_lines sol
+        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+        LEFT JOIN LATERAL (
+          SELECT unit_cogs FROM cogs_entries
+          WHERE sku = sol.sku
+            AND effective_from <= sol.order_date::date
+            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE sol.order_date::date BETWEEN $1 AND $2
+        GROUP BY sol.sku
+      ),
+      cogs_by_sku AS (
+        SELECT sku, SUM(total_cogs_sold)::numeric AS total_cogs_sold
+        FROM (
+          SELECT sku, total_cogs_sold FROM amazon_cogs
+          UNION ALL
+          SELECT sku, total_cogs_sold FROM shopify_cogs
+        ) combined GROUP BY sku
       )
     `;
 
@@ -492,10 +569,12 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
           (SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
-          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
+          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
+          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs
         FROM shopify_order_lines sol
         LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+        LEFT JOIN cogs_by_sku cogs ON cogs.sku = sol.sku
         WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
         GROUP BY sol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
@@ -516,12 +595,14 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
           (SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
-          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded
+          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
+          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+        LEFT JOIN cogs_by_sku cogs ON cogs.sku = aol.sku
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
         GROUP BY aol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
@@ -572,11 +653,13 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(s.gross_sales, 0) + COALESCE(a.gross_sales, 0))::numeric(12,2) AS gross_sales,
           (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
-          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded
+          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
+          COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs
         FROM shopify_skus s
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
         LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
         LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku)
+        LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
@@ -584,13 +667,28 @@ app.get('/api/product-breakdown', async (req, res) => {
     // FX conversion — apply period average rate to all monetary fields
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
-    const fxRows = result.rows.map(r => ({
-      ...r,
-      gross_sales:     (parseFloat(r.gross_sales     || 0) * fxRate).toFixed(2),
-      net_revenue:     (parseFloat(r.net_revenue     || 0) * fxRate).toFixed(2),
-      total_discounts: (parseFloat(r.total_discounts || 0) * fxRate).toFixed(2),
-      total_refunded:  (parseFloat(r.total_refunded  || 0) * fxRate).toFixed(2),
-    }));
+    const fxRows = result.rows.map(r => {
+      const netRevenue     = parseFloat(r.net_revenue     || 0) * fxRate;
+      const grossSales     = parseFloat(r.gross_sales     || 0) * fxRate;
+      const totalDiscounts = parseFloat(r.total_discounts || 0) * fxRate;
+      const totalRefunded  = parseFloat(r.total_refunded  || 0) * fxRate;
+      const totalCogs      = parseFloat(r.total_cogs      || 0) * fxRate;
+      const grossProfit    = netRevenue - totalCogs;
+      const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
+      // Profit % = same as gross margin % until PPC/FBA costs are available
+      const profitPct      = grossMarginPct;
+      return {
+        ...r,
+        gross_sales:      grossSales.toFixed(2),
+        net_revenue:      netRevenue.toFixed(2),
+        total_discounts:  totalDiscounts.toFixed(2),
+        total_refunded:   totalRefunded.toFixed(2),
+        total_cogs:       totalCogs.toFixed(2),
+        gross_profit:     grossProfit.toFixed(2),
+        gross_margin_pct: grossMarginPct.toFixed(1),
+        profit_pct:       profitPct.toFixed(1),
+      };
+    });
     res.json(fxRows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
