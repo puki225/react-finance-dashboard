@@ -114,7 +114,7 @@ export default function SalesSummary() {
         <KpiCard label="Orders" value={summary?.total_orders} type="number" color="#fbbf24" />
         <KpiCard label="Avg Order Value" value={summary?.avg_order_value} type="currency" color="#a78bfa" symbol={summary?.currency_symbol || '£'} />
         <KpiCard label="Refund Rate" value={summary?.refund_rate} type="percent" color="#f87171" sub={String(summary?.refund_count || 0) + ' orders'} />
-        {channel !== 'amazon' && <KpiCard label="Shopify Fees" value={fees?.total_fees} type="currency" color="#6b6b80" sub="paid payouts only" symbol={summary?.currency_symbol || '£'} />}
+        <KpiCard label="Gross Margin" value={summary?.gross_margin_pct} type="percent" color={parseFloat(summary?.gross_margin_pct || 0) >= 20 ? '#34d399' : '#f87171'} sub={summary?.gross_profit ? (summary?.currency_symbol || '£') + parseFloat(summary?.gross_profit).toLocaleString('en-GB', {maximumFractionDigits: 0}) + ' profit' : 'no COGS set'} />
       </div>
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
