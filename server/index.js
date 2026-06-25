@@ -150,7 +150,11 @@ app.get('/api/summary', async (req, res) => {
 
     // COGS for the period — sum all orders' COGS using date-matched cogs_entries
     const cogsResult = await pool.query(`
-      SELECT COALESCE(SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs
+      SELECT
+        COALESCE(SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs,
+        COALESCE(SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) +
+          COALESCE(aol.fee_fixed_closing,0) + COALESCE(aol.fee_variable_closing,0) +
+          COALESCE(aol.fee_digital_services,0)), 0)::numeric AS total_fees
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
@@ -162,7 +166,9 @@ app.get('/api/summary', async (req, res) => {
       ) ce ON true
       WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
       UNION ALL
-      SELECT COALESCE(SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs
+      SELECT
+        COALESCE(SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs,
+        0::numeric AS total_fees
       FROM shopify_order_lines sol
       LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
       LEFT JOIN LATERAL (
@@ -174,6 +180,7 @@ app.get('/api/summary', async (req, res) => {
       WHERE sol.order_date::date BETWEEN $1 AND $2
     `, [dateFrom, dateTo]);
     const totalCogs = cogsResult.rows.reduce((s, r) => s + parseFloat(r.total_cogs || 0), 0);
+    const totalFees = cogsResult.rows.reduce((s, r) => s + parseFloat(r.total_fees || 0), 0);
 
     // FX conversion — apply period average rate (GBP → reporting currency)
     const reportingCurrency = await getReportingCurrency();
@@ -181,7 +188,7 @@ app.get('/api/summary', async (req, res) => {
     const fx = (n) => ((parseFloat(n) || 0) * fxRate).toFixed(2);
 
     const netRevenue = parseFloat(row.net_revenue || 0) - parseFloat(refundRow.total_refunded || 0);
-    const grossProfit = netRevenue - totalCogs;
+    const grossProfit = netRevenue - totalCogs - totalFees;
     const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
 
     res.json({
@@ -511,7 +518,10 @@ app.get('/api/product-breakdown', async (req, res) => {
         SELECT
           aol.sku,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
-          SUM(aol.quantity)::int AS cogs_units
+          SUM(aol.quantity)::int AS cogs_units,
+          SUM(COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
+              COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
+              COALESCE(aol.fee_digital_services, 0))::numeric AS total_fees
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
@@ -529,7 +539,8 @@ app.get('/api/product-breakdown', async (req, res) => {
         SELECT
           sol.sku,
           SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
-          SUM(sol.quantity)::int AS cogs_units
+          SUM(sol.quantity)::int AS cogs_units,
+          0::numeric AS total_fees
         FROM shopify_order_lines sol
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
@@ -543,11 +554,13 @@ app.get('/api/product-breakdown', async (req, res) => {
         GROUP BY sol.sku
       ),
       cogs_by_sku AS (
-        SELECT sku, SUM(total_cogs_sold)::numeric AS total_cogs_sold
+        SELECT sku,
+          SUM(total_cogs_sold)::numeric AS total_cogs_sold,
+          SUM(total_fees)::numeric AS total_fees
         FROM (
-          SELECT sku, total_cogs_sold FROM amazon_cogs
+          SELECT sku, total_cogs_sold, total_fees FROM amazon_cogs
           UNION ALL
-          SELECT sku, total_cogs_sold FROM shopify_cogs
+          SELECT sku, total_cogs_sold, total_fees FROM shopify_cogs
         ) combined GROUP BY sku
       )
     `;
@@ -570,7 +583,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           (SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
-          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs
+          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs,
+          COALESCE(MAX(cogs.total_fees), 0)::numeric(12,2) AS total_fees
         FROM shopify_order_lines sol
         LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
@@ -596,7 +610,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           (SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
           SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
-          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs
+          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs,
+          COALESCE(MAX(cogs.total_fees), 0)::numeric(12,2) AS total_fees
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -654,7 +669,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
           COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
-          COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs
+          COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
+          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees
         FROM shopify_skus s
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
         LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
@@ -673,9 +689,11 @@ app.get('/api/product-breakdown', async (req, res) => {
       const totalDiscounts = parseFloat(r.total_discounts || 0) * fxRate;
       const totalRefunded  = parseFloat(r.total_refunded  || 0) * fxRate;
       const totalCogs      = parseFloat(r.total_cogs      || 0) * fxRate;
-      const grossProfit    = netRevenue - totalCogs;
+      const totalFees      = parseFloat(r.total_fees      || 0) * fxRate;
+      // Gross Profit = Net Revenue − COGS − FBA fulfillment − listing fees
+      const grossProfit    = netRevenue - totalCogs - totalFees;
       const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
-      // Profit % = same as gross margin % until PPC/FBA costs are available
+      // Profit % = same as gross margin % until PPC/storage costs are available
       const profitPct      = grossMarginPct;
       return {
         ...r,
@@ -684,6 +702,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         total_discounts:  totalDiscounts.toFixed(2),
         total_refunded:   totalRefunded.toFixed(2),
         total_cogs:       totalCogs.toFixed(2),
+        total_fees:       totalFees.toFixed(2),
         gross_profit:     grossProfit.toFixed(2),
         gross_margin_pct: grossMarginPct.toFixed(1),
         profit_pct:       profitPct.toFixed(1),
