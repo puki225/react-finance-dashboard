@@ -241,7 +241,7 @@ export default function ProductBreakdown() {
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
+              <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s', minWidth: 0 }}
                 onMouseEnter={e => !expanded && (e.currentTarget.style.background = '#ffffff03')}
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}>
 
@@ -252,14 +252,14 @@ export default function ProductBreakdown() {
                     {expanded ? '−' : '+'}
                   </button>
                 </div>
-                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 12 }}>
+                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, overflow: 'hidden' }}>
                   <div style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 16, opacity: 0.2 }}>◉</span>}
                   </div>
-                  <div style={{ minWidth: 0 }}>
+                  <div style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
                     <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.product_title}>{row.product_title || row.sku}</div>
-                    <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>{row.sku}</div>
-                    {row.asin && <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{row.asin}</div>}
+                    <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.sku}</div>
+                    {row.asin && <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.asin}</div>}
                   </div>
                 </div>
 
