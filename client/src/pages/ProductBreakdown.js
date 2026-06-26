@@ -39,17 +39,80 @@ const COLS = [
   { key: 'channels',         label: 'Channel',   sortable: false, width: '7%'   },
 ];
 
-function CountryDropdown({ sku, from, to, channel }) {
-  const { data, loading } = useApi('/api/product-breakdown/countries', { sku, from, to, channel });
-  if (loading) return <span style={{ fontSize: 11, color: 'var(--muted)' }}>Loading…</span>;
-  if (!data?.length) return <span style={{ fontSize: 11, color: 'var(--muted)' }}>No data</span>;
+function PnlPanel({ sku, from, to, sym }) {
+  const { data, loading } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku)}`, { from, to });
+  if (loading) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>;
+  if (!data) return null;
+  const s = data.currency_symbol || sym || '£';
+  const fmtVal = (n) => {
+    const v = parseFloat(n || 0);
+    const color = v < 0 ? 'var(--red)' : v > 0 ? 'var(--text)' : 'var(--muted)';
+    return <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color }}>{v < 0 ? `−${s}${Math.abs(v).toFixed(2)}` : `${s}${v.toFixed(2)}`}</span>;
+  };
+  const Row = ({ label, value, bold, indent }) => (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '5px 0', borderBottom: '1px solid var(--border)', paddingLeft: indent ? 16 : 0 }}>
+      <span style={{ fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400, color: bold ? 'var(--text)' : 'var(--muted)' }}>{label}</span>
+      {fmtVal(value)}
+    </div>
+  );
+  const SectionHeader = ({ label }) => (
+    <div style={{ padding: '10px 0 4px', fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
+  );
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 4, paddingTop: 12, paddingBottom: 4 }}>
+    <div style={{ padding: '16px 20px', maxWidth: 480 }}>
+      <SectionHeader label="Revenue" />
+      <Row label="Gross Revenue" value={data.revenue.gross_sales} bold />
+      {parseFloat(data.revenue.discounts) !== 0 && <Row label="Discounts / Promos" value={data.revenue.discounts} indent />}
+      {parseFloat(data.revenue.refunds) !== 0 && <Row label="Refunds" value={data.revenue.refunds} indent />}
+      <Row label="Net Revenue" value={data.revenue.net_revenue} bold />
+
+      {data.has_fees && <>
+        <SectionHeader label="Commissions & Fees" />
+        {parseFloat(data.fees.commission) !== 0 && <Row label="Commission" value={data.fees.commission} indent />}
+        {parseFloat(data.fees.fba_fulfillment) !== 0 && <Row label="FBA Fulfillment" value={data.fees.fba_fulfillment} indent />}
+        {parseFloat(data.fees.other) !== 0 && <Row label="Other Fees" value={data.fees.other} indent />}
+        <Row label="Total Fees" value={data.fees.total} bold />
+      </>}
+
+      {data.has_cogs && <>
+        <SectionHeader label="Cost of Goods" />
+        {parseFloat(data.cogs.standard) !== 0 && <Row label="Standard COGS" value={data.cogs.standard} indent />}
+        {parseFloat(data.cogs.freight) !== 0 && <Row label="Freight" value={data.cogs.freight} indent />}
+        {parseFloat(data.cogs.demurrage) !== 0 && <Row label="Demurrage / Duties" value={data.cogs.demurrage} indent />}
+        {parseFloat(data.cogs.quality) !== 0 && <Row label="Quality / Inspection" value={data.cogs.quality} indent />}
+        {parseFloat(data.cogs.other) !== 0 && <Row label="Other" value={data.cogs.other} indent />}
+        <Row label="Total COGS" value={data.cogs.total} bold />
+      </>}
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 8, borderRadius: 8, background: parseFloat(data.gross_profit) >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (parseFloat(data.gross_profit) >= 0 ? '#34d39940' : '#f8717140') }}>
+        <span style={{ fontSize: 14, fontWeight: 700, color: parseFloat(data.gross_profit) >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Profit</span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 14, fontWeight: 700, color: parseFloat(data.gross_profit) >= 0 ? 'var(--green)' : 'var(--red)' }}>{sym}{parseFloat(data.gross_profit).toFixed(2)}</span>
+      </div>
+    </div>
+  );
+}
+
+function CountryDropdown({ sku, from, to, channel, fmt, fmtPct }) {
+  const { data, loading } = useApi('/api/product-breakdown/countries', { sku, from, to, channel });
+  if (loading) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>Loading…</div>;
+  if (!data?.length) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
+  return (
+    <div style={{ paddingTop: 8 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: '120px 1fr 11% 8% 8% 9%', gap: 0, borderBottom: '1px solid var(--border)', paddingBottom: 6, marginBottom: 4 }}>
+        {['Country', 'Channel', 'Revenue', 'Margin %', 'Profit %', 'Profit £'].map(h => (
+          <span key={h} style={{ fontSize: 10, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', padding: '0 8px' }}>{h}</span>
+        ))}
+      </div>
       {data.map((c, i) => (
-        <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-          <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)', minWidth: 28, fontFamily: 'var(--mono)' }}>{c.country}</span>
-          <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(c.units_sold)} units</span>
-          {channelBadge(c.channel)}
+        <div key={i} style={{ display: 'grid', gridTemplateColumns: '120px 1fr 11% 8% 8% 9%', padding: '5px 0', borderBottom: i < data.length - 1 ? '1px solid var(--border)' : 'none' }}>
+          <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', padding: '0 8px' }}>{c.country}</span>
+          <span style={{ padding: '0 8px' }}>
+            <span style={{ fontSize: 10, padding: '2px 6px', borderRadius: 4, background: c.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: c.channel === 'amazon' ? '#fbbf24' : '#a78bfa', fontWeight: 700 }}>{c.channel}</span>
+          </span>
+          <span style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--accent2)', padding: '0 8px' }}>{fmt(c.gross_sales)}</span>
+          <span style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--muted)', padding: '0 8px' }}>—</span>
+          <span style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--muted)', padding: '0 8px' }}>—</span>
+          <span style={{ fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--muted)', padding: '0 8px' }}>—</span>
         </div>
       ))}
     </div>
@@ -64,6 +127,7 @@ export default function ProductBreakdown() {
   const [sort, setSort] = useState(() => localStorage.getItem('gb_prod_sort') || 'gross_sales');
   const [dir, setDir] = useState(() => localStorage.getItem('gb_prod_dir') || 'desc');
   const [expandedSku, setExpandedSku] = useState(null);
+  const [expandedPnl, setExpandedPnl] = useState(null);
   const [brandFilter, setBrandFilter] = useState('');
   const [parentFilter, setParentFilter] = useState('');
 
@@ -258,17 +322,29 @@ export default function ProductBreakdown() {
                   <span style={{ fontSize: 10, color: 'var(--muted)' }}>ROAS: —</span>
                 </div>
 
-                {/* Channel */}
-                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+                {/* Channel + Breakdown button */}
+                <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'center' }}>
                   {channelBadge(row.channels)}
+                  <button
+                    onClick={() => { setExpandedPnl(expandedPnl === row.sku ? null : row.sku); setExpandedSku(null); }}
+                    style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, border: '1px solid ' + (expandedPnl === row.sku ? 'var(--accent)' : 'var(--border)'), background: expandedPnl === row.sku ? 'var(--accent)20' : 'var(--bg3)', color: expandedPnl === row.sku ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', whiteSpace: 'nowrap' }}>
+                    Breakdown
+                  </button>
                 </div>
               </div>
 
-              {/* Country expansion — drops below with teal left accent */}
-              {expanded && (
+              {/* Country expansion */}
+              {expandedSku === row.sku && (
                 <div style={{ padding: '12px 16px 16px 52px', borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
                   <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>Country Breakdown</div>
-                  <CountryDropdown sku={row.sku} from={range.from} to={range.to} channel={channel} />
+                  <CountryDropdown sku={row.sku} from={range.from} to={range.to} channel={channel} fmt={fmt} fmtPct={fmtPct} />
+                </div>
+              )}
+
+              {/* P&L breakdown panel */}
+              {expandedPnl === row.sku && (
+                <div style={{ borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
+                  <PnlPanel sku={row.sku} from={range.from} to={range.to} sym={sym} />
                 </div>
               )}
             </div>
