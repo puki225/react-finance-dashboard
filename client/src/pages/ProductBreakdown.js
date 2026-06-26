@@ -27,16 +27,16 @@ const channelBadge = (ch) => {
 };
 
 const COLS = [
-  { key: 'product_title', label: 'Product',        sortable: false, width: '22%' },
-  { key: 'units_sold',    label: 'Units',           sortable: true,  width: '10%' },
-  { key: 'gross_sales',   label: 'Revenue',         sortable: true,  width: '11%' },
-  { key: 'gross_profit',  label: 'Profit £',        sortable: true,  width: '9%'  },
-  { key: 'gross_margin_pct', label: 'Margin %',     sortable: true,  width: '8%'  },
-  { key: 'profit_pct',    label: 'Profit %',        sortable: false, width: '8%'  },
-  { key: 'roi',           label: 'ROI',             sortable: false, width: '7%'  },
-  { key: 'acos',          label: 'ACOS',            sortable: false, width: '11%' },
-  { key: 'channels',      label: 'Channel',         sortable: false, width: '7%'  },
-  { key: 'country',       label: 'Countries',       sortable: false, width: '7%'  },
+  { key: 'expand',           label: '',          sortable: false, width: '36px' },
+  { key: 'product_title',    label: 'Product',   sortable: false, width: '1fr'  },
+  { key: 'units_sold',       label: 'Units',     sortable: true,  width: '10%'  },
+  { key: 'gross_sales',      label: 'Revenue',   sortable: true,  width: '11%'  },
+  { key: 'gross_margin_pct', label: 'Margin %',  sortable: true,  width: '8%'   },
+  { key: 'profit_pct',       label: 'Profit %',  sortable: false, width: '8%'   },
+  { key: 'gross_profit',     label: 'Profit £',  sortable: true,  width: '9%'   },
+  { key: 'roi',              label: 'ROI',       sortable: false, width: '7%'   },
+  { key: 'acos',             label: 'ACOS',      sortable: false, width: '11%'  },
+  { key: 'channels',         label: 'Channel',   sortable: false, width: '7%'   },
 ];
 
 function CountryDropdown({ sku, from, to, channel }) {
@@ -154,8 +154,9 @@ export default function ProductBreakdown() {
       {/* Table */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         {/* Header row */}
-        <div style={{ display: 'grid', gridTemplateColumns: COLS.map(c => c.width).join(' '), borderBottom: '1px solid var(--border)', padding: '0 16px', background: 'var(--bg3)' }}>
-          {COLS.map(col => (
+        <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', borderBottom: '1px solid var(--border)', padding: '0 0 0 0', background: 'var(--bg3)' }}>
+          <div /> {/* expand col */}
+          {COLS.filter(c => c.key !== 'expand').map(col => (
             <div key={col.key} onClick={() => col.sortable && handleSort(col.key)}
               style={{ padding: '11px 8px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: col.sortable ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none', color: sort === col.key ? 'var(--accent2)' : 'var(--muted)' }}>
               {col.label} {col.sortable && <SortIcon col={col.key} />}
@@ -175,12 +176,18 @@ export default function ProductBreakdown() {
           const hasCogs = parseFloat(row.total_cogs || 0) > 0;
 
           return (
-            <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: COLS.map(c => c.width).join(' '), padding: '0 16px', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
+            <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
+              <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
                 onMouseEnter={e => !expanded && (e.currentTarget.style.background = '#ffffff03')}
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}>
 
-                {/* Product */}
+                {/* Expand toggle */}
+                <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                  <button onClick={() => setExpandedSku(expanded ? null : row.sku)}
+                    style={{ width: 20, height: 20, borderRadius: 4, border: '1px solid ' + (expanded ? '#34d399' : 'var(--border)'), background: expanded ? '#34d39920' : 'var(--bg3)', color: expanded ? '#34d399' : 'var(--muted)', cursor: 'pointer', fontSize: 12, fontWeight: 700, display: 'flex', alignItems: 'center', justifyContent: 'center', lineHeight: 1, padding: 0 }}>
+                    {expanded ? '−' : '+'}
+                  </button>
+                </div>
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 12 }}>
                   <div style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
                     {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 16, opacity: 0.2 }}>◉</span>}
@@ -210,15 +217,6 @@ export default function ProductBreakdown() {
                   <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(row.net_revenue)}</span>
                 </div>
 
-                {/* Profit £ */}
-                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
-                  {hasCogs ? (
-                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: grossProfit >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(grossProfit)}</span>
-                  ) : (
-                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>No COGS</span>
-                  )}
-                </div>
-
                 {/* Margin % */}
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
                   {hasCogs ? (
@@ -239,6 +237,15 @@ export default function ProductBreakdown() {
                   ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
                 </div>
 
+                {/* Profit £ */}
+                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+                  {hasCogs ? (
+                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: grossProfit >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(grossProfit)}</span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>No COGS</span>
+                  )}
+                </div>
+
                 {/* ROI */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>
@@ -255,19 +262,12 @@ export default function ProductBreakdown() {
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {channelBadge(row.channels)}
                 </div>
-
-                {/* Countries */}
-                <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
-                  <button onClick={() => setExpandedSku(expanded ? null : row.sku)}
-                    style={{ background: expanded ? 'var(--accent)20' : 'var(--bg3)', border: '1px solid ' + (expanded ? 'var(--accent)' : 'var(--border)'), borderRadius: 6, padding: '4px 10px', fontSize: 11, fontWeight: 600, color: expanded ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
-                    {expanded ? 'Hide ▲' : '▼'}
-                  </button>
-                </div>
               </div>
 
-              {/* Country expansion */}
+              {/* Country expansion — drops below with teal left accent */}
               {expanded && (
-                <div style={{ padding: '0 16px 14px', marginLeft: COLS[0].width, borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
+                <div style={{ padding: '12px 16px 16px 52px', borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
+                  <div style={{ fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 }}>Country Breakdown</div>
                   <CountryDropdown sku={row.sku} from={range.from} to={range.to} channel={channel} />
                 </div>
               )}
