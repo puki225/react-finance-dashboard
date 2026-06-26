@@ -711,6 +711,103 @@ app.get('/api/product-breakdown', async (req, res) => {
     res.json(fxRows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
+// Product Breakdown — P&L breakdown for a single SKU
+app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
+  const { sku } = req.params;
+  const { from, to } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  try {
+    const amzResult = await pool.query(`
+      SELECT
+        SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric AS gross_sales,
+        SUM(COALESCE(aol.promotion_discount, 0))::numeric AS discounts,
+        SUM(COALESCE(aol.fee_commission, 0))::numeric AS fee_commission,
+        SUM(COALESCE(aol.fee_fba_fulfillment, 0))::numeric AS fee_fba_fulfillment,
+        SUM(COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) + COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0))::numeric AS fee_other,
+        SUM(aol.quantity)::int AS units_sold,
+        COALESCE(MAX(sp.cogs_standard), 0)::numeric AS cogs_standard,
+        COALESCE(MAX(sp.cogs_freight), 0)::numeric AS cogs_freight,
+        COALESCE(MAX(sp.cogs_demurrage), 0)::numeric AS cogs_demurrage,
+        COALESCE(MAX(sp.cogs_quality), 0)::numeric AS cogs_quality,
+        COALESCE(MAX(sp.cogs_other), 0)::numeric AS cogs_other
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+      WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
+    `, [sku, dateFrom, dateTo]);
+
+    const shpResult = await pool.query(`
+      SELECT
+        SUM(sol.unit_price * sol.quantity)::numeric AS gross_sales,
+        SUM(sol.discount_per_unit * sol.quantity)::numeric AS discounts,
+        SUM(sol.quantity)::int AS units_sold,
+        COALESCE(MAX(sp.cogs_standard), 0)::numeric AS cogs_standard,
+        COALESCE(MAX(sp.cogs_freight), 0)::numeric AS cogs_freight,
+        COALESCE(MAX(sp.cogs_demurrage), 0)::numeric AS cogs_demurrage,
+        COALESCE(MAX(sp.cogs_quality), 0)::numeric AS cogs_quality,
+        COALESCE(MAX(sp.cogs_other), 0)::numeric AS cogs_other
+      FROM shopify_order_lines sol
+      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+      WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]);
+
+    const refundResult = await pool.query(`
+      SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+      FROM v_refunds_by_date WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]);
+
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+    const fx = (n) => ((parseFloat(n) || 0) * fxRate);
+
+    const amz = amzResult.rows[0] || {};
+    const shp = shpResult.rows[0] || {};
+    const totalRefunded = fx(refundResult.rows[0]?.total_refunded || 0);
+
+    const grossSales  = fx(amz.gross_sales || 0) + fx(shp.gross_sales || 0);
+    const discounts   = fx(amz.discounts || 0) + fx(shp.discounts || 0);
+    const netRevenue  = grossSales - discounts - totalRefunded;
+
+    const feeCommission = fx(amz.fee_commission || 0);
+    const feeFBA        = fx(amz.fee_fba_fulfillment || 0);
+    const feeOther      = fx(amz.fee_other || 0);
+    const totalFees     = feeCommission + feeFBA + feeOther;
+
+    // COGS: use per-unit component rates from sku_parameters × net units sold
+    const netUnits = parseInt(amz.units_sold || 0) + parseInt(shp.units_sold || 0);
+    const cogsPerUnit = {
+      standard:  parseFloat(amz.cogs_standard || shp.cogs_standard || 0),
+      freight:   parseFloat(amz.cogs_freight  || shp.cogs_freight  || 0),
+      demurrage: parseFloat(amz.cogs_demurrage|| shp.cogs_demurrage|| 0),
+      quality:   parseFloat(amz.cogs_quality  || shp.cogs_quality  || 0),
+      other:     parseFloat(amz.cogs_other    || shp.cogs_other    || 0),
+    };
+    const cogs = {
+      standard:  fx(cogsPerUnit.standard  * netUnits),
+      freight:   fx(cogsPerUnit.freight   * netUnits),
+      demurrage: fx(cogsPerUnit.demurrage * netUnits),
+      quality:   fx(cogsPerUnit.quality   * netUnits),
+      other:     fx(cogsPerUnit.other     * netUnits),
+    };
+    const totalCogs = Object.values(cogs).reduce((s, v) => s + v, 0);
+    const grossProfit = netRevenue - totalFees - totalCogs;
+
+    const f = (n) => (n).toFixed(2);
+    res.json({
+      currency_symbol: sym,
+      revenue: { gross_sales: f(grossSales), discounts: f(-discounts), refunds: f(-totalRefunded), net_revenue: f(netRevenue) },
+      fees: { commission: f(-feeCommission), fba_fulfillment: f(-feeFBA), other: f(-feeOther), total: f(-totalFees) },
+      cogs: { standard: f(-cogs.standard), freight: f(-cogs.freight), demurrage: f(-cogs.demurrage), quality: f(-cogs.quality), other: f(-cogs.other), total: f(-totalCogs) },
+      gross_profit: f(grossProfit),
+      has_cogs: totalCogs > 0,
+      has_fees: totalFees > 0,
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/product-breakdown/countries', async (req, res) => {
   const { sku, from, to, channel = 'all' } = req.query;
   if (!sku) return res.status(400).json({ error: 'sku required' });
