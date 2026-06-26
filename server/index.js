@@ -798,6 +798,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const f = (n) => (n).toFixed(2);
     res.json({
       currency_symbol: sym,
+      units: netUnits,
       revenue: { gross_sales: f(grossSales), discounts: f(-discounts), refunds: f(-totalRefunded), net_revenue: f(netRevenue) },
       fees: { commission: f(-feeCommission), fba_fulfillment: f(-feeFBA), other: f(-feeOther), total: f(-totalFees) },
       cogs: { standard: f(-cogs.standard), freight: f(-cogs.freight), demurrage: f(-cogs.demurrage), quality: f(-cogs.quality), other: f(-cogs.other), total: f(-totalCogs) },
