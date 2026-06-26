@@ -41,27 +41,61 @@ const COLS = [
 
 function PnlPanel({ sku, from, to, sym }) {
   const { data, loading } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku)}`, { from, to });
+  const [view, setView] = useState('total'); // 'total' | 'unit'
+
   if (loading) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>;
   if (!data) return null;
+
   const s = data.currency_symbol || sym || '£';
-  const fmtVal = (n) => {
-    const v = parseFloat(n || 0);
-    const color = v < 0 ? 'var(--red)' : v > 0 ? 'var(--text)' : 'var(--muted)';
-    return <span style={{ fontFamily: 'var(--mono)', fontSize: 13, color }}>{v < 0 ? `−${s}${Math.abs(v).toFixed(2)}` : `${s}${v.toFixed(2)}`}</span>;
+  const netRev = parseFloat(data.revenue.net_revenue || 0);
+  const units = data.units || 1;
+
+  const divide = (n) => view === 'unit' ? parseFloat(n || 0) / Math.max(units, 1) : parseFloat(n || 0);
+  const pct = (n) => netRev !== 0 ? (parseFloat(n || 0) / Math.abs(netRev) * 100) : 0;
+
+  const fmtVal = (n, isBase) => {
+    const v = divide(n);
+    const p = pct(n);
+    const color = v < 0 ? 'var(--red)' : isBase ? 'var(--text)' : v === 0 ? 'var(--muted)' : 'var(--text)';
+    const pctColor = Math.abs(p) < 0.01 ? 'var(--muted)' : p < 0 ? '#f8717180' : '#6b6b80';
+    const display = v < 0 ? `−${s}${Math.abs(v).toFixed(2)}` : `${s}${v.toFixed(2)}`;
+    const pctDisplay = `(${p >= 0 ? '' : ''}${p.toFixed(1)}%)`;
+    return (
+      <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color, whiteSpace: 'nowrap' }}>
+        {display} <span style={{ fontSize: 10, color: pctColor }}>{pctDisplay}</span>
+      </span>
+    );
   };
-  const Row = ({ label, value, bold, indent }) => (
-    <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '5px 0', borderBottom: '1px solid var(--border)', paddingLeft: indent ? 16 : 0 }}>
+
+  const Row = ({ label, value, bold, indent, isBase }) => (
+    <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '5px 0', borderBottom: '1px solid var(--border)', paddingLeft: indent ? 16 : 0, alignItems: 'center' }}>
       <span style={{ fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400, color: bold ? 'var(--text)' : 'var(--muted)' }}>{label}</span>
-      {fmtVal(value)}
+      {fmtVal(value, isBase)}
     </div>
   );
+
   const SectionHeader = ({ label }) => (
-    <div style={{ padding: '10px 0 4px', fontSize: 11, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
+    <div style={{ padding: '10px 0 4px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
   );
+
+  const profit = divide(data.gross_profit);
+  const profitPct = pct(data.gross_profit);
+
   return (
-    <div style={{ padding: '16px 20px', maxWidth: 480 }}>
+    <div style={{ padding: '16px 20px', maxWidth: 500 }}>
+      {/* Toggle */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 14 }}>
+        {['total', 'unit'].map(v => (
+          <button key={v} onClick={() => setView(v)}
+            style={{ padding: '4px 14px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: '1px solid ' + (view === v ? 'var(--accent)' : 'var(--border)'), background: view === v ? 'var(--accent)20' : 'transparent', color: view === v ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
+            {v === 'total' ? 'Total' : 'Per Unit'}
+          </button>
+        ))}
+        <span style={{ fontSize: 10, color: 'var(--muted)', alignSelf: 'center', marginLeft: 8 }}>% of net revenue</span>
+      </div>
+
       <SectionHeader label="Revenue" />
-      <Row label="Gross Revenue" value={data.revenue.gross_sales} bold />
+      <Row label="Gross Revenue" value={data.revenue.gross_sales} bold isBase />
       {parseFloat(data.revenue.discounts) !== 0 && <Row label="Discounts / Promos" value={data.revenue.discounts} indent />}
       {parseFloat(data.revenue.refunds) !== 0 && <Row label="Refunds" value={data.revenue.refunds} indent />}
       <Row label="Net Revenue" value={data.revenue.net_revenue} bold />
@@ -80,13 +114,16 @@ function PnlPanel({ sku, from, to, sym }) {
         {parseFloat(data.cogs.freight) !== 0 && <Row label="Freight" value={data.cogs.freight} indent />}
         {parseFloat(data.cogs.demurrage) !== 0 && <Row label="Demurrage / Duties" value={data.cogs.demurrage} indent />}
         {parseFloat(data.cogs.quality) !== 0 && <Row label="Quality / Inspection" value={data.cogs.quality} indent />}
-        {parseFloat(data.cogs.other) !== 0 && <Row label="Other" value={data.cogs.other} indent />}
+        {parseFloat(data.cogs.other) !== 0 && <Row label="Other COGS" value={data.cogs.other} indent />}
         <Row label="Total COGS" value={data.cogs.total} bold />
       </>}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 8, borderRadius: 8, background: parseFloat(data.gross_profit) >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (parseFloat(data.gross_profit) >= 0 ? '#34d39940' : '#f8717140') }}>
-        <span style={{ fontSize: 14, fontWeight: 700, color: parseFloat(data.gross_profit) >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Profit</span>
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 14, fontWeight: 700, color: parseFloat(data.gross_profit) >= 0 ? 'var(--green)' : 'var(--red)' }}>{sym}{parseFloat(data.gross_profit).toFixed(2)}</span>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: profit >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (profit >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Profit</span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
+          {profit < 0 ? `−${s}${Math.abs(profit).toFixed(2)}` : `${s}${profit.toFixed(2)}`}
+          {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({profitPct.toFixed(1)}%)</span>
+        </span>
       </div>
     </div>
   );
@@ -218,8 +255,8 @@ export default function ProductBreakdown() {
       {/* Table */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         {/* Header row */}
-        <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', borderBottom: '1px solid var(--border)', padding: '0 0 0 0', background: 'var(--bg3)' }}>
-          <div /> {/* expand col */}
+        <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 80px 90px 70px 110px 100px', borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
+          <div />
           {COLS.filter(c => c.key !== 'expand').map(col => (
             <div key={col.key} onClick={() => col.sortable && handleSort(col.key)}
               style={{ padding: '11px 8px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: col.sortable ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none', color: sort === col.key ? 'var(--accent2)' : 'var(--muted)' }}>
@@ -241,7 +278,7 @@ export default function ProductBreakdown() {
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '36px 1fr 10% 11% 8% 8% 9% 7% 11% 7%', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s', minWidth: 0 }}
+              <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 80px 90px 70px 110px 100px', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
                 onMouseEnter={e => !expanded && (e.currentTarget.style.background = '#ffffff03')}
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}>
 
