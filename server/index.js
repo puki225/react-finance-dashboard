@@ -1139,4 +1139,78 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
+// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
+// Finds Amazon order lines < 14 days old with no settled fees,
+// calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
+// Real settled fees from Finances API always overwrite estimates.
+// ─────────────────────────────────────────────────────────────────────────────
+const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
+const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
+
+app.post('/api/sync-fee-estimates', async (req, res) => {
+  try {
+    const linesResult = await pool.query(`
+      SELECT aol.order_item_id, aol.amazon_order_id, aol.sku, aol.asin,
+        aol.quantity, aol.unit_price, aol.unit_price_currency
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      WHERE ao.order_date::date >= CURRENT_DATE - 14
+        AND ao.status != 'Canceled'
+        AND (aol.fee_fba_fulfillment IS NULL OR aol.fee_fba_fulfillment = 0)
+        AND (aol.is_estimated_fee IS NULL OR aol.is_estimated_fee = FALSE)
+        AND aol.asin IS NOT NULL AND aol.unit_price > 0
+      ORDER BY ao.order_date DESC
+    `);
+    if (!linesResult.rows.length) {
+      return res.json({ ok: true, message: 'No unsettled lines need fee estimates', estimated: 0 });
+    }
+    // Deduplicate by ASIN+price
+    const asinPriceMap = new Map();
+    for (const line of linesResult.rows) {
+      const key = `${line.asin}::${line.unit_price}`;
+      if (!asinPriceMap.has(key)) {
+        asinPriceMap.set(key, { asin: line.asin, sku: line.sku, price: line.unit_price, currency: line.unit_price_currency || 'GBP' });
+      }
+    }
+    const uniqueItems = [...asinPriceMap.values()];
+    const proxyResp = await fetch(`${SPAPI_PROXY_URL}/estimate-fees`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(SPAPI_PROXY_KEY ? { 'x-api-key': SPAPI_PROXY_KEY } : {}) },
+      body: JSON.stringify(uniqueItems),
+    });
+    if (!proxyResp.ok) {
+      const err = await proxyResp.json().catch(() => ({}));
+      return res.status(502).json({ ok: false, error: 'Proxy error', details: err });
+    }
+    const proxyData = await proxyResp.json();
+    if (!proxyData.ok) return res.status(502).json({ ok: false, error: proxyData.error });
+    const feeMap = new Map();
+    for (const r of proxyData.results || []) {
+      if (r.status === 'Success') feeMap.set(`${r.asin}::${r.price}`, r);
+    }
+    let estimated = 0;
+    for (const line of linesResult.rows) {
+      const key = `${line.asin}::${line.unit_price}`;
+      const fees = feeMap.get(key);
+      if (!fees) continue;
+      const qty = parseInt(line.quantity || 1);
+      await pool.query(`
+        UPDATE amazon_order_lines SET
+          fee_fba_fulfillment  = $1,
+          fee_commission       = $2,
+          fee_digital_services = $3,
+          is_estimated_fee     = TRUE,
+          synced_at            = NOW()
+        WHERE order_item_id = $4
+          AND (fee_fba_fulfillment IS NULL OR fee_fba_fulfillment = 0)
+      `, [(fees.fbaFee * qty).toFixed(2), (fees.referralFee * qty).toFixed(2), (fees.digitalServicesFee * qty).toFixed(2), line.order_item_id]);
+      estimated++;
+    }
+    res.json({ ok: true, estimated, uniqueAsins: uniqueItems.length, total: linesResult.rows.length });
+  } catch (err) {
+    console.error('[fee-estimates]', err.message);
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
