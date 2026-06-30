@@ -689,7 +689,8 @@ app.get('/api/product-breakdown', async (req, res) => {
       const totalDiscounts = parseFloat(r.total_discounts || 0) * fxRate;
       const totalRefunded  = parseFloat(r.total_refunded  || 0) * fxRate;
       const totalCogs      = parseFloat(r.total_cogs      || 0) * fxRate;
-      const totalFees      = parseFloat(r.total_fees      || 0) * fxRate;
+      // Shopify orders have no FBA/Amazon fees — only apply fees for Amazon or both-channel rows
+      const totalFees      = r.channels === 'shopify' ? 0 : parseFloat(r.total_fees || 0) * fxRate;
       // Gross Profit = Net Revenue − COGS − FBA fulfillment − listing fees
       const grossProfit    = netRevenue - totalCogs - totalFees;
       const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
