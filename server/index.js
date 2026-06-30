@@ -758,7 +758,10 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
 
     const refundResult = await pool.query(`
       SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
-      FROM v_refunds_by_date WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
+      FROM v_refunds_by_date
+      WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
+        ${!includeAmazon ? `AND channel != 'amazon'` : ''}
+        ${!includeShopify ? `AND channel != 'shopify'` : ''}
     `, [sku, dateFrom, dateTo]);
 
     // Date-matched COGS: sum per order using cogs_entries active on order date
