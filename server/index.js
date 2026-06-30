@@ -1151,14 +1151,18 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
   try {
     const linesResult = await pool.query(`
       SELECT aol.order_item_id, aol.amazon_order_id, aol.sku, aol.asin,
-        aol.quantity, aol.unit_price, aol.unit_price_currency
+        aol.quantity,
+        COALESCE(NULLIF(aol.unit_price, 0), lp.last_price) AS unit_price,
+        aol.unit_price_currency
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
       WHERE ao.order_date::date >= CURRENT_DATE - 14
         AND ao.status != 'Canceled'
         AND (aol.fee_fba_fulfillment IS NULL OR aol.fee_fba_fulfillment = 0)
         AND (aol.is_estimated_fee IS NULL OR aol.is_estimated_fee = FALSE)
-        AND aol.asin IS NOT NULL AND aol.unit_price > 0
+        AND aol.asin IS NOT NULL
+        AND COALESCE(NULLIF(aol.unit_price, 0), lp.last_price) > 0
       ORDER BY ao.order_date DESC
     `);
     if (!linesResult.rows.length) {
