@@ -762,43 +762,50 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     `, [sku, dateFrom, dateTo]);
 
     // Date-matched COGS: sum per order using cogs_entries active on order date
-    const cogsResult = await pool.query(`
-      ${includeAmazon ? `SELECT
-        SUM(aol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
-        SUM(aol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
-        SUM(aol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
-        SUM(aol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric AS cogs_quality,
-        SUM(aol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric AS cogs_other
-      FROM amazon_order_lines aol
-      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
-      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
-      LEFT JOIN LATERAL (
-        SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
-        FROM cogs_entries
-        WHERE sku = aol.sku AND effective_from <= ao.order_date::date
-          AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-        ORDER BY effective_from DESC LIMIT 1
-      ) ce ON true
-      WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}` : `SELECT 0::numeric AS cogs_standard, 0::numeric AS cogs_freight, 0::numeric AS cogs_demurrage, 0::numeric AS cogs_quality, 0::numeric AS cogs_other WHERE false`}
-      ${includeAmazon && includeShopify ? 'UNION ALL' : ''}
-      ${includeShopify ? `SELECT
-        SUM(sol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric,
-        SUM(sol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric,
-        SUM(sol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric,
-        SUM(sol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric,
-        SUM(sol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric
-      FROM shopify_order_lines sol
-      JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
-      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
-      LEFT JOIN LATERAL (
-        SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
-        FROM cogs_entries
-        WHERE sku = sol.sku AND effective_from <= sol.order_date::date
-          AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-        ORDER BY effective_from DESC LIMIT 1
-      ) ce ON true
-      WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}` : `SELECT 0::numeric, 0::numeric, 0::numeric, 0::numeric, 0::numeric WHERE false`}
-    `, [sku, dateFrom, dateTo]);
+    const cogsRows = [];
+    if (includeAmazon) {
+      const r = await pool.query(`
+        SELECT
+          SUM(aol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
+          SUM(aol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
+          SUM(aol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
+          SUM(aol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric AS cogs_quality,
+          SUM(aol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric AS cogs_other
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+        LEFT JOIN LATERAL (
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
+          FROM cogs_entries WHERE sku = aol.sku AND effective_from <= ao.order_date::date
+            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}
+      `, [sku, dateFrom, dateTo]);
+      if (r.rows[0]) cogsRows.push(r.rows[0]);
+    }
+    if (includeShopify) {
+      const r = await pool.query(`
+        SELECT
+          SUM(sol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
+          SUM(sol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
+          SUM(sol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
+          SUM(sol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric AS cogs_quality,
+          SUM(sol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric AS cogs_other
+        FROM shopify_order_lines sol
+        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+        LEFT JOIN LATERAL (
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
+          FROM cogs_entries WHERE sku = sol.sku AND effective_from <= sol.order_date::date
+            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}
+      `, [sku, dateFrom, dateTo]);
+      if (r.rows[0]) cogsRows.push(r.rows[0]);
+    }
+    const cogsResult = { rows: cogsRows };
 
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
