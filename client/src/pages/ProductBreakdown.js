@@ -40,7 +40,9 @@ const COLS = [
 ];
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
-  const params = { from, to, ...(country ? { country } : {}), ...(channel && channel !== 'both' ? { channel } : {}) };
+  // Normalise channel: 'both' and undefined → 'all'
+  const ch = (!channel || channel === 'both') ? 'all' : channel;
+  const params = { from, to, channel: ch, ...(country ? { country } : {}) };
   const { data, loading } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku)}`, params);
   const [view, setView] = useState('total'); // 'total' | 'unit'
 
@@ -235,7 +237,7 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
           </div>
           {openPnl === i && (
             <div style={{ borderBottom: '1px solid var(--border)', background: '#ffffff02' }}>
-              <PnlPanel sku={sku} from={from} to={to} sym={sym} country={c.country} />
+              <PnlPanel sku={sku} from={from} to={to} sym={sym} country={c.country} channel={channel} />
             </div>
           )}
         </div>
