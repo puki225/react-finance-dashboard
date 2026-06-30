@@ -134,44 +134,67 @@ function PnlPanel({ sku, from, to, sym, country }) {
   );
 }
 
-// Country code → emoji flag
-const countryFlag = (code) => {
-  if (!code || code === 'Unknown') return '🌐';
-  try {
-    return code.toUpperCase().replace(/./g, c => String.fromCodePoint(c.charCodeAt(0) + 127397));
-  } catch { return '🌐'; }
+// Country flag via flagcdn.com (reliable cross-platform rendering)
+const CountryFlag = ({ code }) => {
+  if (!code || code === 'Unknown') return <span style={{ fontSize: 16 }}>🌐</span>;
+  const lower = code.toLowerCase();
+  return <img src={`https://flagcdn.com/20x15/${lower}.png`} alt={code} style={{ width: 20, height: 15, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }} onError={e => { e.target.style.display = 'none'; }} />;
 };
 
 function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
   const { data, loading } = useApi('/api/product-breakdown/countries', { sku, from, to, channel });
   const [openPnl, setOpenPnl] = useState(null);
 
-  if (loading) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>Loading…</div>;
-  if (!data?.length) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
+  // Merge rows by country — blend amazon + shopify into one row per country
+  const blended = useMemo(() => {
+    if (!data?.length) return [];
+    const map = new Map();
+    for (const r of data) {
+      const key = r.country;
+      if (!map.has(key)) {
+        map.set(key, { ...r, channels: new Set([r.channel]) });
+      } else {
+        const existing = map.get(key);
+        existing.channels.add(r.channel);
+        existing.units_sold    = (parseInt(existing.units_sold) + parseInt(r.units_sold));
+        existing.gross_sales   = (parseFloat(existing.gross_sales) + parseFloat(r.gross_sales)).toFixed(2);
+        existing.net_revenue   = (parseFloat(existing.net_revenue) + parseFloat(r.net_revenue)).toFixed(2);
+        existing.gross_profit  = (parseFloat(existing.gross_profit) + parseFloat(r.gross_profit)).toFixed(2);
+        existing.total_fees    = (parseFloat(existing.total_fees) + parseFloat(r.total_fees)).toFixed(2);
+        existing.total_cogs    = (parseFloat(existing.total_cogs) + parseFloat(r.total_cogs)).toFixed(2);
+        existing.has_cogs      = existing.has_cogs || r.has_cogs;
+      }
+    }
+    // Recompute margin on blended figures
+    return [...map.values()].map(r => {
+      const net  = parseFloat(r.net_revenue);
+      const prof = parseFloat(r.gross_profit);
+      const pct  = net > 0 ? (prof / net * 100).toFixed(1) : '0.0';
+      return { ...r, gross_margin_pct: pct, profit_pct: pct, channel: [...r.channels].join('+') };
+    }).sort((a, b) => parseFloat(b.gross_sales) - parseFloat(a.gross_sales));
+  }, [data]);
 
-  // Match parent grid: 36px expand | 1fr product | 90px units | 100px revenue | 80px margin | 80px profit% | 90px profit£ | 70px roi | 110px acos | 100px channel
-  // Country rows skip expand col (36px) — start from product col
+  if (loading) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>Loading…</div>;
+  if (!blended.length) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
+
   const GRID = '1fr 90px 100px 80px 80px 90px 70px 110px 100px';
 
   return (
     <div>
       {/* Sub-header */}
       <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '6px 0 4px', borderBottom: '1px solid var(--border)', marginBottom: 2 }}>
-        {['Country / Channel', 'Units', 'Revenue', 'Margin %', 'Profit %', 'Profit £', 'ROI', 'ACOS', ''].map((h, i) => (
+        {['Country', 'Units', 'Revenue', 'Margin %', 'Profit %', 'Profit £', 'ROI', 'ACOS', ''].map((h, i) => (
           <span key={i} style={{ fontSize: 10, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', padding: '0 8px' }}>{h}</span>
         ))}
       </div>
 
-      {data.map((c, i) => (
+      {blended.map((c, i) => (
         <div key={i}>
-          <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '6px 0', borderBottom: openPnl === i || i < data.length - 1 ? '1px solid var(--border)' : 'none', alignItems: 'center' }}>
-            {/* Country + channel */}
+          <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '7px 0', borderBottom: '1px solid var(--border)', alignItems: 'center' }}>
+            {/* Country */}
             <div style={{ padding: '0 8px', display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 16 }}>{countryFlag(c.country)}</span>
-              <div>
-                <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{c.country}</span>
-                <span style={{ marginLeft: 6, fontSize: 10, padding: '2px 6px', borderRadius: 4, background: c.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: c.channel === 'amazon' ? '#fbbf24' : '#a78bfa', fontWeight: 700 }}>{c.channel}</span>
-              </div>
+              <CountryFlag code={c.country} />
+              <span style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{c.country}</span>
             </div>
             {/* Units */}
             <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)' }}>{fmtN(c.units_sold)}</div>
@@ -202,7 +225,7 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
             <div style={{ padding: '0 8px', fontSize: 11, color: 'var(--muted)' }}>—</div>
             {/* ACOS */}
             <div style={{ padding: '0 8px', fontSize: 11, color: 'var(--muted)' }}>—</div>
-            {/* Breakdown button */}
+            {/* Breakdown */}
             <div style={{ padding: '0 8px' }}>
               <button onClick={() => setOpenPnl(openPnl === i ? null : i)}
                 style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, border: '1px solid ' + (openPnl === i ? 'var(--accent)' : 'var(--border)'), background: openPnl === i ? 'var(--accent)20' : 'var(--bg3)', color: openPnl === i ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', whiteSpace: 'nowrap' }}>
@@ -210,7 +233,6 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
               </button>
             </div>
           </div>
-          {/* Per-country P&L panel */}
           {openPnl === i && (
             <div style={{ borderBottom: '1px solid var(--border)', background: '#ffffff02' }}>
               <PnlPanel sku={sku} from={from} to={to} sym={sym} country={c.country} />
