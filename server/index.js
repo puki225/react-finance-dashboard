@@ -714,7 +714,7 @@ app.get('/api/product-breakdown', async (req, res) => {
 // Product Breakdown — P&L breakdown for a single SKU + country
 app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
   const { sku } = req.params;
-  const { from, to, country } = req.query;
+  const { from, to, country, channel = 'all' } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
   const countryFilter = country && country !== 'all'
@@ -723,8 +723,11 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
   const countryFilterShopify = country && country !== 'all'
     ? (country === 'Unknown' ? `AND COALESCE(so.shipping_country, 'Unknown') = 'Unknown'` : `AND so.shipping_country = '${country.replace(/'/g,"''")}'`)
     : '';
+
+  const includeAmazon  = channel !== 'shopify';
+  const includeShopify = channel !== 'amazon';
   try {
-    const amzResult = await pool.query(`
+    const amzResult = includeAmazon ? await pool.query(`
       SELECT
         SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric AS gross_sales,
         SUM(COALESCE(aol.promotion_discount, 0))::numeric AS discounts,
@@ -740,9 +743,9 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
       WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}
-    `, [sku, dateFrom, dateTo]);
+    `, [sku, dateFrom, dateTo]) : { rows: [{}] };
 
-    const shpResult = await pool.query(`
+    const shpResult = includeShopify ? await pool.query(`
       SELECT
         SUM(sol.unit_price * sol.quantity)::numeric AS gross_sales,
         SUM(sol.discount_per_unit * sol.quantity)::numeric AS discounts,
@@ -750,7 +753,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       FROM shopify_order_lines sol
       JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
       WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}
-    `, [sku, dateFrom, dateTo]);
+    `, [sku, dateFrom, dateTo]) : { rows: [{}] };
 
     const refundResult = await pool.query(`
       SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
@@ -759,7 +762,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
 
     // Date-matched COGS: sum per order using cogs_entries active on order date
     const cogsResult = await pool.query(`
-      SELECT
+      ${includeAmazon ? `SELECT
         SUM(aol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
         SUM(aol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
         SUM(aol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
@@ -775,9 +778,9 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
           AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
         ORDER BY effective_from DESC LIMIT 1
       ) ce ON true
-      WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}
-      UNION ALL
-      SELECT
+      WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}` : `SELECT 0::numeric AS cogs_standard, 0::numeric AS cogs_freight, 0::numeric AS cogs_demurrage, 0::numeric AS cogs_quality, 0::numeric AS cogs_other WHERE false`}
+      ${includeAmazon && includeShopify ? 'UNION ALL' : ''}
+      ${includeShopify ? `SELECT
         SUM(sol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric,
         SUM(sol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric,
         SUM(sol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric,
@@ -793,7 +796,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
           AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
         ORDER BY effective_from DESC LIMIT 1
       ) ce ON true
-      WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}
+      WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}` : `SELECT 0::numeric, 0::numeric, 0::numeric, 0::numeric, 0::numeric WHERE false`}
     `, [sku, dateFrom, dateTo]);
 
     const reportingCurrency = await getReportingCurrency();
