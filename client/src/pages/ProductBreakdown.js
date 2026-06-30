@@ -43,11 +43,12 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
   // Normalise channel: 'both' and undefined → 'all'
   const ch = (!channel || channel === 'both') ? 'all' : channel;
   const params = { from, to, channel: ch, ...(country ? { country } : {}) };
-  const { data, loading } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku)}`, params);
-  const [view, setView] = useState('total'); // 'total' | 'unit'
+  const { data, loading, error } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku || '')}`, params);
+  const [view, setView] = useState('total');
 
   if (loading) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>;
-  if (!data) return null;
+  if (error) return <div style={{ padding: '20px', color: 'var(--red)', fontSize: 12 }}>Error loading breakdown</div>;
+  if (!data || !data.revenue) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
 
   const s = data.currency_symbol || sym || '£';
   const netRev = parseFloat(data.revenue.net_revenue || 0);
