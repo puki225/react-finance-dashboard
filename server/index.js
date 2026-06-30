@@ -1199,11 +1199,18 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
           fee_fba_fulfillment  = $1,
           fee_commission       = $2,
           fee_digital_services = $3,
+          fee_fixed_closing    = $4,
           is_estimated_fee     = TRUE,
           synced_at            = NOW()
-        WHERE order_item_id = $4
+        WHERE order_item_id = $5
           AND (fee_fba_fulfillment IS NULL OR fee_fba_fulfillment = 0)
-      `, [(fees.fbaFee * qty).toFixed(2), (fees.referralFee * qty).toFixed(2), (fees.digitalServicesFee * qty).toFixed(2), line.order_item_id]);
+      `, [
+        (fees.fbaFee * qty).toFixed(2),
+        (fees.referralFee * qty).toFixed(2),
+        (fees.digitalServicesFee * qty).toFixed(2),
+        ((fees.closingFee || 0) * qty).toFixed(2),
+        line.order_item_id,
+      ]);
       estimated++;
     }
     res.json({ ok: true, estimated, uniqueAsins: uniqueItems.length, total: linesResult.rows.length });
