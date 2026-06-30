@@ -39,8 +39,8 @@ const COLS = [
   { key: 'channels',         label: 'Channel',   sortable: false, width: '7%'   },
 ];
 
-function PnlPanel({ sku, from, to, sym, country }) {
-  const params = { from, to, ...(country ? { country } : {}) };
+function PnlPanel({ sku, from, to, sym, country, channel }) {
+  const params = { from, to, ...(country ? { country } : {}), ...(channel && channel !== 'both' ? { channel } : {}) };
   const { data, loading } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku)}`, params);
   const [view, setView] = useState('total'); // 'total' | 'unit'
 
@@ -469,7 +469,7 @@ export default function ProductBreakdown() {
               {/* P&L breakdown panel */}
               {expandedPnl === row.sku && (
                 <div style={{ borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
-                  <PnlPanel sku={row.sku} from={range.from} to={range.to} sym={sym} />
+                  <PnlPanel sku={row.sku} from={range.from} to={range.to} sym={sym} channel={row.channels} />
                 </div>
               )}
             </div>
