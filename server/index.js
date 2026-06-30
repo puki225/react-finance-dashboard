@@ -562,6 +562,12 @@ app.get('/api/product-breakdown', async (req, res) => {
           UNION ALL
           SELECT sku, total_cogs_sold, total_fees FROM shopify_cogs
         ) combined GROUP BY sku
+      ),
+      shopify_cogs_only AS (
+        SELECT sku, total_cogs_sold, total_fees FROM shopify_cogs
+      ),
+      amazon_cogs_only AS (
+        SELECT sku, total_cogs_sold, total_fees FROM amazon_cogs
       )
     `;
 
@@ -588,7 +594,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM shopify_order_lines sol
         LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
-        LEFT JOIN cogs_by_sku cogs ON cogs.sku = sol.sku
+        LEFT JOIN shopify_cogs_only cogs ON cogs.sku = sol.sku
         WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
         GROUP BY sol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
@@ -617,7 +623,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
-        LEFT JOIN cogs_by_sku cogs ON cogs.sku = aol.sku
+        LEFT JOIN amazon_cogs_only cogs ON cogs.sku = aol.sku
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
         GROUP BY aol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
@@ -769,16 +775,20 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     if (includeAmazon) {
       const r = await pool.query(`
         SELECT
-          SUM(aol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
-          SUM(aol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
-          SUM(aol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
-          SUM(aol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric AS cogs_quality,
-          SUM(aol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric AS cogs_other
+          SUM(aol.quantity * COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0))::numeric AS cogs_standard,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric AS cogs_freight,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric AS cogs_demurrage,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric AS cogs_quality,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric AS cogs_other
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs
           FROM cogs_entries WHERE sku = aol.sku AND effective_from <= ao.order_date::date
             AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
           ORDER BY effective_from DESC LIMIT 1
@@ -790,16 +800,20 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     if (includeShopify) {
       const r = await pool.query(`
         SELECT
-          SUM(sol.quantity * COALESCE(ce.cogs_standard, sp.cogs_standard, 0))::numeric AS cogs_standard,
-          SUM(sol.quantity * COALESCE(ce.cogs_freight,  sp.cogs_freight,  0))::numeric AS cogs_freight,
-          SUM(sol.quantity * COALESCE(ce.cogs_demurrage,sp.cogs_demurrage,0))::numeric AS cogs_demurrage,
-          SUM(sol.quantity * COALESCE(ce.cogs_quality,  sp.cogs_quality,  0))::numeric AS cogs_quality,
-          SUM(sol.quantity * COALESCE(ce.cogs_other,    sp.cogs_other,    0))::numeric AS cogs_other
+          SUM(sol.quantity * COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0))::numeric AS cogs_standard,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric AS cogs_freight,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric AS cogs_demurrage,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric AS cogs_quality,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric AS cogs_other
         FROM shopify_order_lines sol
         JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs
           FROM cogs_entries WHERE sku = sol.sku AND effective_from <= sol.order_date::date
             AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
           ORDER BY effective_from DESC LIMIT 1
