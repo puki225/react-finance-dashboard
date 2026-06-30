@@ -540,7 +540,10 @@ app.get('/api/product-breakdown', async (req, res) => {
           sol.sku,
           SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
           SUM(sol.quantity)::int AS cogs_units,
-          0::numeric AS total_fees
+          -- MCF fees allocated proportionally by line revenue share within each order
+          COALESCE(SUM(
+            mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+          ), 0)::numeric AS total_fees
         FROM shopify_order_lines sol
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
@@ -550,6 +553,11 @@ app.get('/api/product-breakdown', async (req, res) => {
             AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
           ORDER BY effective_from DESC LIMIT 1
         ) ce ON true
+        LEFT JOIN shopify_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
+        LEFT JOIN (
+          SELECT shopify_order_id, SUM(line_gross) AS order_gross
+          FROM shopify_order_lines GROUP BY shopify_order_id
+        ) order_totals ON order_totals.shopify_order_id = sol.shopify_order_id
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku
       ),
@@ -756,9 +764,18 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       SELECT
         SUM(sol.unit_price * sol.quantity)::numeric AS gross_sales,
         SUM(sol.discount_per_unit * sol.quantity)::numeric AS discounts,
-        SUM(sol.quantity)::int AS units_sold
+        SUM(sol.quantity)::int AS units_sold,
+        -- MCF fees proportionally allocated by revenue share
+        COALESCE(SUM(
+          mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+        ), 0)::numeric AS mcf_fees
       FROM shopify_order_lines sol
       JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN shopify_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN (
+        SELECT shopify_order_id, SUM(line_gross) AS order_gross
+        FROM shopify_order_lines GROUP BY shopify_order_id
+      ) order_totals ON order_totals.shopify_order_id = sol.shopify_order_id
       WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}
     `, [sku, dateFrom, dateTo]) : { rows: [{}] };
 
@@ -845,7 +862,8 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const feeDigitalServices = fx(amz.fee_digital_services || 0);
     const feeGiftwrap        = fx(amz.fee_giftwrap || 0);
     const feeShipping        = fx(amz.fee_shipping_chargeback || 0);
-    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping;
+    const feeMCF             = fx(shp.mcf_fees || 0);
+    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF;
 
     // Sum COGS components across both channels
     const cogsSt  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_standard  || 0), 0);
@@ -866,14 +884,15 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         refunds: f(-totalRefunded), net_revenue: f(netRevenue),
       },
       fees: {
-        commission:       f(-feeCommission),
-        fba_fulfillment:  f(-feeFBA),
-        fixed_closing:    f(-feeFixedClosing),
-        variable_closing: f(-feeVariableClosing),
-        digital_services: f(-feeDigitalServices),
-        giftwrap:         f(-feeGiftwrap),
+        commission:          f(-feeCommission),
+        fba_fulfillment:     f(-feeFBA),
+        fixed_closing:       f(-feeFixedClosing),
+        variable_closing:    f(-feeVariableClosing),
+        digital_services:    f(-feeDigitalServices),
+        giftwrap:            f(-feeGiftwrap),
         shipping_chargeback: f(-feeShipping),
-        total:            f(-totalFees),
+        mcf_fulfillment:     f(-feeMCF),
+        total:               f(-totalFees),
       },
       cogs: {
         standard:  f(-cogsSt),
