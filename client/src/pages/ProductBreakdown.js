@@ -108,6 +108,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         <SectionHeader label="Commissions & Fees" />
         {parseFloat(data.fees.commission) !== 0 && <Row label="Commission" value={data.fees.commission} indent />}
         {parseFloat(data.fees.fba_fulfillment) !== 0 && <Row label="FBA Fulfillment" value={data.fees.fba_fulfillment} indent />}
+        {parseFloat(data.fees.mcf_fulfillment) !== 0 && <Row label="MCF Fulfillment" value={data.fees.mcf_fulfillment} indent />}
         {parseFloat(data.fees.fixed_closing) !== 0 && <Row label="Fixed Closing Fee" value={data.fees.fixed_closing} indent />}
         {parseFloat(data.fees.variable_closing) !== 0 && <Row label="Variable Closing Fee" value={data.fees.variable_closing} indent />}
         {parseFloat(data.fees.digital_services) !== 0 && <Row label="Digital Services" value={data.fees.digital_services} indent />}
