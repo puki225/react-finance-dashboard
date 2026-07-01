@@ -1,7 +1,8 @@
 import React, { useState } from 'react';
 
 const PRESETS = [
-  { label: '1D',  days: 0,    dtd: true },
+  { label: 'Today',     days: 0,    dtd: true },
+  { label: 'Yesterday', days: null, yesterday: true },
   { label: '7D',  days: 7 },
   { label: '30D', days: 30 },
   { label: '90D', days: 90 },
@@ -17,6 +18,10 @@ function getRange(preset) {
     return { from, to };
   }
   if (preset.dtd) return { from: to, to };
+  if (preset.yesterday) {
+    const yesterday = new Date(Date.now() - 86400000).toISOString().split('T')[0];
+    return { from: yesterday, to: yesterday };
+  }
   const from = new Date(Date.now() - preset.days * 86400000).toISOString().split('T')[0];
   return { from, to };
 }
