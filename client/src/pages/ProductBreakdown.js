@@ -82,6 +82,8 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
     <div style={{ padding: '10px 0 4px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
   );
 
+  const margin = divide(data.gross_margin);
+  const marginPct = pct(data.gross_margin);
   const contribution = divide(data.product_contribution);
   const contributionPct = pct(data.product_contribution);
 
@@ -127,7 +129,13 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         <Row label="Total COGS" value={data.cogs.total} bold />
       </>}
 
-      <Row label="Gross Margin" value={data.gross_margin} bold />
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: margin >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (margin >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Margin</span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
+          {margin < 0 ? `−${s}${Math.abs(margin).toFixed(2)}` : `${s}${margin.toFixed(2)}`}
+          {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({marginPct.toFixed(1)}%)</span>
+        </span>
+      </div>
 
       {data.has_ppc && <>
         <SectionHeader label="PPC (Amazon Ads)" />
