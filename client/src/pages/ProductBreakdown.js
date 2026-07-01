@@ -27,16 +27,15 @@ const channelBadge = (ch) => {
 };
 
 const COLS = [
-  { key: 'expand',           label: '',          sortable: false, width: '36px' },
-  { key: 'product_title',    label: 'Product',   sortable: false, width: '1fr'  },
-  { key: 'units_sold',       label: 'Units',     sortable: true,  width: '10%'  },
-  { key: 'gross_sales',      label: 'Revenue',   sortable: true,  width: '11%'  },
-  { key: 'gross_margin_pct', label: 'Margin %',  sortable: true,  width: '8%'   },
-  { key: 'profit_pct',       label: 'Profit %',  sortable: false, width: '8%'   },
-  { key: 'gross_profit',     label: 'Profit £',  sortable: true,  width: '9%'   },
-  { key: 'roi',              label: 'ROI',       sortable: false, width: '7%'   },
-  { key: 'acos',             label: 'ACOS',      sortable: false, width: '11%'  },
-  { key: 'channels',         label: 'Channel',   sortable: false, width: '7%'   },
+  { key: 'expand',           label: '',                sortable: false, width: '36px' },
+  { key: 'product_title',    label: 'Product',         sortable: false, width: '1fr'  },
+  { key: 'units_sold',       label: 'Units',           sortable: true,  width: '10%'  },
+  { key: 'gross_sales',      label: 'Revenue',         sortable: true,  width: '11%'  },
+  { key: 'gross_margin_pct', label: 'Margin %',        sortable: true,  width: '8%'   },
+  { key: 'gross_profit',     label: 'Contribution £',  sortable: true,  width: '10%'  },
+  { key: 'roi',              label: 'ROI',             sortable: false, width: '7%'   },
+  { key: 'acos',             label: 'ACOS',            sortable: false, width: '11%'  },
+  { key: 'channels',         label: 'Channel',         sortable: false, width: '7%'   },
 ];
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
@@ -362,7 +361,7 @@ export default function ProductBreakdown() {
       {/* Table */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         {/* Header row */}
-        <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 80px 90px 70px 110px 100px', borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 100px 70px 110px 100px', borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
           <div />
           {COLS.filter(c => c.key !== 'expand').map(col => (
             <div key={col.key} onClick={() => col.sortable && handleSort(col.key)}
@@ -378,9 +377,8 @@ export default function ProductBreakdown() {
         {!loading && rows?.map((row, i) => {
           const expanded = expandedSku === row.sku;
           const netRev = parseFloat(row.net_revenue || 0);
-          const grossProfit = parseFloat(row.gross_profit || 0);
           const marginPct = parseFloat(row.gross_margin_pct || 0);
-          const profitPct = parseFloat(row.profit_pct || 0);
+          const productContribution = parseFloat(row.product_contribution ?? row.gross_profit ?? 0);
           const hasCogs = parseFloat(row.total_cogs || 0) > 0;
           const hasPpc = parseFloat(row.ppc_cost || 0) > 0;
           const ppcUnits = parseInt(row.ppc_units || 0, 10);
@@ -388,7 +386,7 @@ export default function ProductBreakdown() {
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 80px 90px 70px 110px 100px', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
+              <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 100px 70px 110px 100px', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
                 onMouseEnter={e => !expanded && (e.currentTarget.style.background = '#ffffff03')}
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}>
 
@@ -438,20 +436,10 @@ export default function ProductBreakdown() {
                   ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
                 </div>
 
-                {/* Profit % */}
-                <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
-                  {hasCogs ? (
-                    <>
-                      <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: profitPct >= 15 ? 'var(--green)' : profitPct >= 5 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(profitPct)}</span>
-                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>net</span>
-                    </>
-                  ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
-                </div>
-
-                {/* Profit £ */}
+                {/* Contribution £ */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {hasCogs ? (
-                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: grossProfit >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(grossProfit)}</span>
+                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: productContribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(productContribution)}</span>
                   ) : (
                     <span style={{ fontSize: 11, color: 'var(--muted)' }}>No COGS</span>
                   )}
