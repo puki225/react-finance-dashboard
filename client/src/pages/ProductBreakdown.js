@@ -27,15 +27,15 @@ const channelBadge = (ch) => {
 };
 
 const COLS = [
-  { key: 'expand',           label: '',                sortable: false, width: '36px' },
-  { key: 'product_title',    label: 'Product',         sortable: false, width: '1fr'  },
-  { key: 'units_sold',       label: 'Units',           sortable: true,  width: '10%'  },
-  { key: 'gross_sales',      label: 'Revenue',         sortable: true,  width: '11%'  },
-  { key: 'gross_margin_pct', label: 'Margin %',        sortable: true,  width: '8%'   },
-  { key: 'gross_profit',     label: 'Contribution £',  sortable: true,  width: '10%'  },
-  { key: 'roi',              label: 'ROI',             sortable: false, width: '7%'   },
-  { key: 'acos',             label: 'ACOS',            sortable: false, width: '11%'  },
-  { key: 'channels',         label: 'Channel',         sortable: false, width: '7%'   },
+  { key: 'expand',               label: '',                sortable: false, width: '36px' },
+  { key: 'product_title',        label: 'Product',         sortable: false, width: '1fr'  },
+  { key: 'units_sold',           label: 'Units',            sortable: true,  width: '10%'  },
+  { key: 'gross_sales',          label: 'Revenue',          sortable: true,  width: '11%'  },
+  { key: 'gross_margin_pct',     label: 'Margin %',         sortable: true,  width: '8%'   },
+  { key: 'product_contribution', label: 'Prod Contrib £',   sortable: true,  width: '10%'  },
+  { key: 'roi',                  label: 'ROI',              sortable: false, width: '7%'   },
+  { key: 'acos',                 label: 'ACOS',             sortable: false, width: '11%'  },
+  { key: 'channels',             label: 'Channel',          sortable: false, width: '7%'   },
 ];
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
@@ -436,7 +436,7 @@ export default function ProductBreakdown() {
                   ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
                 </div>
 
-                {/* Contribution £ */}
+                {/* Prod Contrib £ */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {hasCogs ? (
                     <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: productContribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(productContribution)}</span>
