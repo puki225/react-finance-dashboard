@@ -469,7 +469,11 @@ app.get('/api/product-breakdown', async (req, res) => {
   const { from, to, channel = 'all', sort = 'gross_sales', dir = 'desc', brand, parent_asin } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
-  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts', 'gross_profit', 'gross_margin_pct'];
+  // Sorting happens in JS after fxRows is built (see below) — gross_profit, gross_margin_pct,
+  // and product_contribution are computed post-query and don't exist as raw SQL columns, and
+  // gross_sales/net_revenue/etc. are ambiguous to ORDER BY directly in the 'all' channel query
+  // (both shopify_skus and amazon_skus CTEs expose same-named columns into the FROM scope).
+  const validSorts = ['gross_sales', 'net_revenue', 'units_sold', 'total_refunded', 'units_refunded', 'total_discounts', 'gross_profit', 'gross_margin_pct', 'product_contribution'];
   const sortCol = validSorts.includes(sort) ? sort : 'gross_sales';
   const sortDir = dir === 'asc' ? 'ASC' : 'DESC';
 
@@ -517,16 +521,34 @@ app.get('/api/product-breakdown', async (req, res) => {
       amazon_cogs AS (
         SELECT
           aol.sku,
-          SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
+          -- Itemized per-unit COGS (standard/freight/demurrage/quality/other), each falling back
+          -- cogs_entries -> sku_parameters -> flat unit_cogs. Matches the P&L breakdown panel's
+          -- calculation exactly (previously this used a flat unit_cogs-only shortcut, which caused
+          -- the table row and the P&L panel to disagree on margin whenever itemized components
+          -- were populated but didn't equal the flat unit_cogs value).
+          SUM(aol.quantity * (
+            COALESCE(
+              NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+              CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+                AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+                THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+            + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+            + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+          ))::numeric AS total_cogs_sold,
           SUM(aol.quantity)::int AS cogs_units,
+          -- Includes giftwrap + shipping chargebacks (previously missing here, present in the
+          -- P&L panel) — that gap alone could make the table's margin look better than reality.
           SUM(COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
               COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
-              COALESCE(aol.fee_digital_services, 0))::numeric AS total_fees
+              COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0) +
+              COALESCE(aol.fee_shipping_chargeback, 0))::numeric AS total_fees
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
           WHERE sku = aol.sku
             AND effective_from <= ao.order_date::date
             AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
@@ -538,7 +560,18 @@ app.get('/api/product-breakdown', async (req, res) => {
       shopify_cogs AS (
         SELECT
           sol.sku,
-          SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric AS total_cogs_sold,
+          -- Same itemized COGS calc as amazon_cogs above, for consistency with the P&L panel.
+          SUM(sol.quantity * (
+            COALESCE(
+              NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+              CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+                AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+                THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+            + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+            + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+          ))::numeric AS total_cogs_sold,
           SUM(sol.quantity)::int AS cogs_units,
           -- MCF fees allocated proportionally by line revenue share within each order
           COALESCE(SUM(
@@ -547,7 +580,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM shopify_order_lines sol
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries
+          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
           WHERE sku = sol.sku
             AND effective_from <= sol.order_date::date
             AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
@@ -618,7 +651,6 @@ app.get('/api/product-breakdown', async (req, res) => {
         LEFT JOIN shopify_cogs_only cogs ON cogs.sku = sol.sku
         WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
         GROUP BY sol.sku, sp.image_url, sp.brand, sp.parent_asin
-        ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else if (channel === 'amazon') {
       result = await pool.query(`
@@ -666,7 +698,6 @@ app.get('/api/product-breakdown', async (req, res) => {
         LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, ppc.sku)
         LEFT JOIN amazon_cogs_only cogs ON cogs.sku = COALESCE(o.sku, ppc.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
-        ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     } else {
       result = await pool.query(`
@@ -729,7 +760,6 @@ app.get('/api/product-breakdown', async (req, res) => {
         LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku, ppc.sku)
         LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku, ppc.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
-        ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
     }
     // FX conversion — apply period average rate to all monetary fields
@@ -775,6 +805,11 @@ app.get('/api/product-breakdown', async (req, res) => {
         tacos:                tacos.toFixed(1),
       };
     });
+    // Sort here in JS (not SQL) — gross_profit/gross_margin_pct/product_contribution are
+    // computed above and don't exist as raw columns, and gross_sales etc. are ambiguous to
+    // ORDER BY directly in the 'all' channel query.
+    const sortMult = sortDir === 'ASC' ? 1 : -1;
+    fxRows.sort((a, b) => (parseFloat(a[sortCol] || 0) - parseFloat(b[sortCol] || 0)) * sortMult);
     res.json(fxRows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
