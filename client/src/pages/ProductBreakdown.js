@@ -82,8 +82,8 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
     <div style={{ padding: '10px 0 4px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
   );
 
-  const profit = divide(data.gross_profit);
-  const profitPct = pct(data.gross_profit);
+  const contribution = divide(data.product_contribution);
+  const contributionPct = pct(data.product_contribution);
 
   return (
     <div style={{ padding: '16px 20px', maxWidth: 500 }}>
@@ -99,13 +99,13 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       </div>
 
       <SectionHeader label="Revenue" />
-      <Row label="Gross Revenue" value={data.revenue.gross_sales} bold isBase />
+      <Row label="Gross Sales" value={data.revenue.gross_sales} bold isBase />
       {parseFloat(data.revenue.discounts) !== 0 && <Row label="Discounts / Promos" value={data.revenue.discounts} indent />}
       {parseFloat(data.revenue.refunds) !== 0 && <Row label="Refunds" value={data.revenue.refunds} indent />}
-      <Row label="Net Revenue" value={data.revenue.net_revenue} bold />
+      <Row label="Net Sales" value={data.revenue.net_revenue} bold />
 
       {data.has_fees && <>
-        <SectionHeader label="Commissions & Fees" />
+        <SectionHeader label="Fees" />
         {parseFloat(data.fees.commission) !== 0 && <Row label="Commission" value={data.fees.commission} indent />}
         {parseFloat(data.fees.fba_fulfillment) !== 0 && <Row label="FBA Fulfillment" value={data.fees.fba_fulfillment} indent />}
         {parseFloat(data.fees.mcf_fulfillment) !== 0 && <Row label="MCF Fulfillment" value={data.fees.mcf_fulfillment} indent />}
@@ -127,23 +127,18 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         <Row label="Total COGS" value={data.cogs.total} bold />
       </>}
 
+      <Row label="Gross Margin" value={data.gross_margin} bold />
+
       {data.has_ppc && <>
         <SectionHeader label="PPC (Amazon Ads)" />
-        <Row label="Ad Spend" value={data.ppc.spend} indent />
-        <Row label="Ad Sales (14d)" value={data.ppc.sales} indent />
-        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '4px 0', alignItems: 'center' }}>
-          <span style={{ fontSize: 11, color: 'var(--muted)', paddingLeft: 12 }}>ACOS / TACOS / ROAS</span>
-          <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>
-            {data.ppc.acos}% / {data.ppc.tacos}% / {data.ppc.roas}x
-          </span>
-        </div>
+        <Row label="Ad Spend" value={data.ppc.spend} bold />
       </>}
 
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: profit >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (profit >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Profit</span>
-        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
-          {profit < 0 ? `−${s}${Math.abs(profit).toFixed(2)}` : `${s}${profit.toFixed(2)}`}
-          {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({profitPct.toFixed(1)}%)</span>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: contribution >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (contribution >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
+        <span style={{ fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)' }}>Product Contribution</span>
+        <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
+          {contribution < 0 ? `−${s}${Math.abs(contribution).toFixed(2)}` : `${s}${contribution.toFixed(2)}`}
+          {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({contributionPct.toFixed(1)}%)</span>
         </span>
       </div>
     </div>
@@ -380,6 +375,8 @@ export default function ProductBreakdown() {
           const profitPct = parseFloat(row.profit_pct || 0);
           const hasCogs = parseFloat(row.total_cogs || 0) > 0;
           const hasPpc = parseFloat(row.ppc_cost || 0) > 0;
+          const ppcUnits = parseInt(row.ppc_units || 0, 10);
+          const organicUnits = Math.max(parseInt(row.units_sold || 0, 10) - ppcUnits, 0);
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
@@ -413,8 +410,8 @@ export default function ProductBreakdown() {
                       −{fmtN(row.units_refunded)} ({parseFloat(row.units_refunded / row.units_sold * 100).toFixed(0)}%)
                     </span>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>— organic</span>
-                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>— ppc</span>
+                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
+                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
                 </div>
 
                 {/* Revenue */}
