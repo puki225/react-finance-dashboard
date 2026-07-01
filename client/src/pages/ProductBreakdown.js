@@ -127,6 +127,18 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         <Row label="Total COGS" value={data.cogs.total} bold />
       </>}
 
+      {data.has_ppc && <>
+        <SectionHeader label="PPC (Amazon Ads)" />
+        <Row label="Ad Spend" value={data.ppc.spend} indent />
+        <Row label="Ad Sales (14d)" value={data.ppc.sales} indent />
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '4px 0', alignItems: 'center' }}>
+          <span style={{ fontSize: 11, color: 'var(--muted)', paddingLeft: 12 }}>ACOS / TACOS / ROAS</span>
+          <span style={{ fontFamily: 'var(--mono)', fontSize: 11, color: 'var(--muted)' }}>
+            {data.ppc.acos}% / {data.ppc.tacos}% / {data.ppc.roas}x
+          </span>
+        </div>
+      </>}
+
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: profit >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (profit >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Profit</span>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: profit >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
@@ -367,6 +379,7 @@ export default function ProductBreakdown() {
           const marginPct = parseFloat(row.gross_margin_pct || 0);
           const profitPct = parseFloat(row.profit_pct || 0);
           const hasCogs = parseFloat(row.total_cogs || 0) > 0;
+          const hasPpc = parseFloat(row.ppc_cost || 0) > 0;
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
@@ -446,9 +459,13 @@ export default function ProductBreakdown() {
 
                 {/* ACOS */}
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
-                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>
-                  <span style={{ fontSize: 10, color: 'var(--muted)' }}>TACOS: —</span>
-                  <span style={{ fontSize: 10, color: 'var(--muted)' }}>ROAS: —</span>
+                  {hasPpc ? (
+                    <>
+                      <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.acos) <= 15 ? 'var(--green)' : parseFloat(row.acos) <= 30 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(row.acos)}</span>
+                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>TACOS: {fmtPct(row.tacos)}</span>
+                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>ROAS: {row.roas}x</span>
+                    </>
+                  ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
                 </div>
 
                 {/* Channel + Breakdown button */}

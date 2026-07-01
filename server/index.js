@@ -576,6 +576,18 @@ app.get('/api/product-breakdown', async (req, res) => {
       ),
       amazon_cogs_only AS (
         SELECT sku, total_cogs_sold, total_fees FROM amazon_cogs
+      ),
+      -- PPC spend/sales per SKU (Amazon Ads only) — pre-aggregated so the join below
+      -- can't fan out the surrounding SUMs (see MCF fee bug for why this matters).
+      ppc_by_sku AS (
+        SELECT sku,
+          SUM(cost)::numeric AS ppc_cost,
+          SUM(sales_14d)::numeric AS ppc_sales,
+          SUM(clicks)::int AS ppc_clicks,
+          SUM(impressions)::int AS ppc_impressions
+        FROM amazon_ppc_product_performance
+        WHERE report_date BETWEEN $1 AND $2 AND sku IS NOT NULL
+        GROUP BY sku
       )
     `;
 
@@ -625,13 +637,16 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
           COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
           COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs,
-          COALESCE(MAX(cogs.total_fees), 0)::numeric(12,2) AS total_fees
+          COALESCE(MAX(cogs.total_fees), 0)::numeric(12,2) AS total_fees,
+          COALESCE(MAX(ppc.ppc_cost), 0)::numeric(12,2) AS ppc_cost,
+          COALESCE(MAX(ppc.ppc_sales), 0)::numeric(12,2) AS ppc_sales
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN refunds_by_sku r ON r.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN amazon_cogs_only cogs ON cogs.sku = aol.sku
+        LEFT JOIN ppc_by_sku ppc ON ppc.sku = aol.sku
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
         GROUP BY aol.sku, sp.image_url, sp.brand, sp.parent_asin
         ORDER BY ${sortCol} ${sortDir}
@@ -684,12 +699,15 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
           COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
           COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
-          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees
+          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees,
+          COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
+          COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales
         FROM shopify_skus s
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
         LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku)
         LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku)
         LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku)
+        LEFT JOIN ppc_by_sku ppc ON ppc.sku = COALESCE(s.sku, a.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
         ORDER BY ${sortCol} ${sortDir}
       `, [dateFrom, dateTo]);
@@ -705,11 +723,18 @@ app.get('/api/product-breakdown', async (req, res) => {
       const totalCogs      = parseFloat(r.total_cogs      || 0) * fxRate;
       // Shopify orders have no FBA/Amazon fees — only apply fees for Amazon or both-channel rows
       const totalFees      = r.channels === 'shopify' ? 0 : parseFloat(r.total_fees || 0) * fxRate;
+      // PPC is Amazon Ads only — shopify-only rows never have spend here
+      const ppcCost        = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_cost  || 0) * fxRate;
+      const ppcSales       = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_sales || 0) * fxRate;
       // Gross Profit = Net Revenue − COGS − FBA fulfillment − listing fees
       const grossProfit    = netRevenue - totalCogs - totalFees;
       const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
       // Profit % = same as gross margin % until PPC/storage costs are available
       const profitPct      = grossMarginPct;
+      // ACOS = ad spend / ad-attributed sales. ROAS = the inverse. TACOS = ad spend / total net revenue.
+      const acos = ppcSales > 0 ? (ppcCost / ppcSales * 100) : 0;
+      const roas = ppcCost > 0 ? (ppcSales / ppcCost) : 0;
+      const tacos = netRevenue > 0 ? (ppcCost / netRevenue * 100) : 0;
       return {
         ...r,
         gross_sales:      grossSales.toFixed(2),
@@ -721,6 +746,11 @@ app.get('/api/product-breakdown', async (req, res) => {
         gross_profit:     grossProfit.toFixed(2),
         gross_margin_pct: grossMarginPct.toFixed(1),
         profit_pct:       profitPct.toFixed(1),
+        ppc_cost:         ppcCost.toFixed(2),
+        ppc_sales:        ppcSales.toFixed(2),
+        acos:             acos.toFixed(1),
+        roas:             roas.toFixed(2),
+        tacos:            tacos.toFixed(1),
       };
     });
     res.json(fxRows);
@@ -786,6 +816,13 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         ${!includeAmazon ? `AND channel != 'amazon'` : ''}
         ${!includeShopify ? `AND channel != 'shopify'` : ''}
     `, [sku, dateFrom, dateTo]);
+
+    // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
+    const ppcResult = includeAmazon ? await pool.query(`
+      SELECT COALESCE(SUM(cost), 0)::numeric AS ppc_cost, COALESCE(SUM(sales_14d), 0)::numeric AS ppc_sales
+      FROM amazon_ppc_product_performance
+      WHERE sku = $1 AND report_date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]) : { rows: [{ ppc_cost: 0, ppc_sales: 0 }] };
 
     // Date-matched COGS: sum per order using cogs_entries active on order date
     const cogsRows = [];
@@ -876,6 +913,13 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const grossProfit = netRevenue - totalFees - totalCogs;
     const f = (n) => n.toFixed(2);
 
+    // PPC — ACOS = spend / ad-attributed sales, ROAS = inverse, TACOS = spend / total net revenue
+    const ppcCost  = fx(ppcResult.rows[0]?.ppc_cost  || 0);
+    const ppcSales = fx(ppcResult.rows[0]?.ppc_sales || 0);
+    const acos  = ppcSales > 0 ? (ppcCost / ppcSales * 100) : 0;
+    const roas  = ppcCost > 0 ? (ppcSales / ppcCost) : 0;
+    const tacos = netRevenue > 0 ? (ppcCost / netRevenue * 100) : 0;
+
     res.json({
       currency_symbol: sym,
       units: netUnits,
@@ -902,9 +946,17 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         other:     f(-cogsOth),
         total:     f(-totalCogs),
       },
+      ppc: {
+        spend: f(-ppcCost),
+        sales: f(ppcSales),
+        acos: acos.toFixed(1),
+        roas: roas.toFixed(2),
+        tacos: tacos.toFixed(1),
+      },
       gross_profit: f(grossProfit),
       has_cogs: totalCogs > 0,
       has_fees: totalFees > 0,
+      has_ppc: ppcCost > 0,
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
