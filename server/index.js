@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
-// ─── FX HELPERS ───────────────────────────────────────────────
+// ─── FX HELPERS ──────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
 async function getReportingCurrency() {
@@ -71,7 +71,7 @@ function currencySymbol(currency) {
   return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
 }
 
-// ─── API ROUTES ───────────────────────────────────────────────
+// ─── API ROUTES ──────────────────────────────────
 
 // KPI Summary
 app.get('/api/summary', async (req, res) => {
@@ -747,32 +747,32 @@ app.get('/api/product-breakdown', async (req, res) => {
       const ppcCost        = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_cost  || 0) * fxRate;
       const ppcSales       = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_sales || 0) * fxRate;
       const ppcUnits       = r.channels === 'shopify' ? 0 : parseInt(r.ppc_units || 0, 10);
-      // Gross Profit = Net Revenue − COGS − FBA fulfillment − listing fees
+      // Gross Profit (= Gross Margin) = Net Revenue − COGS − FBA fulfillment − listing fees
       const grossProfit    = netRevenue - totalCogs - totalFees;
       const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
-      // Profit % = same as gross margin % until PPC/storage costs are available
-      const profitPct      = grossMarginPct;
+      // Product Contribution = Gross Margin − PPC spend — the true bottom line once ad cost is included.
+      const productContribution = grossProfit - ppcCost;
       // ACOS = ad spend / ad-attributed sales. ROAS = the inverse. TACOS = ad spend / total net revenue.
       const acos = ppcSales > 0 ? (ppcCost / ppcSales * 100) : 0;
       const roas = ppcCost > 0 ? (ppcSales / ppcCost) : 0;
       const tacos = netRevenue > 0 ? (ppcCost / netRevenue * 100) : 0;
       return {
         ...r,
-        gross_sales:      grossSales.toFixed(2),
-        net_revenue:      netRevenue.toFixed(2),
-        total_discounts:  totalDiscounts.toFixed(2),
-        total_refunded:   totalRefunded.toFixed(2),
-        total_cogs:       totalCogs.toFixed(2),
-        total_fees:       totalFees.toFixed(2),
-        gross_profit:     grossProfit.toFixed(2),
-        gross_margin_pct: grossMarginPct.toFixed(1),
-        profit_pct:       profitPct.toFixed(1),
-        ppc_cost:         ppcCost.toFixed(2),
-        ppc_sales:        ppcSales.toFixed(2),
-        ppc_units:        ppcUnits,
-        acos:             acos.toFixed(1),
-        roas:             roas.toFixed(2),
-        tacos:            tacos.toFixed(1),
+        gross_sales:          grossSales.toFixed(2),
+        net_revenue:          netRevenue.toFixed(2),
+        total_discounts:      totalDiscounts.toFixed(2),
+        total_refunded:       totalRefunded.toFixed(2),
+        total_cogs:           totalCogs.toFixed(2),
+        total_fees:           totalFees.toFixed(2),
+        gross_profit:         grossProfit.toFixed(2),
+        gross_margin_pct:     grossMarginPct.toFixed(1),
+        product_contribution: productContribution.toFixed(2),
+        ppc_cost:             ppcCost.toFixed(2),
+        ppc_sales:            ppcSales.toFixed(2),
+        ppc_units:            ppcUnits,
+        acos:                 acos.toFixed(1),
+        roas:                 roas.toFixed(2),
+        tacos:                tacos.toFixed(1),
       };
     });
     res.json(fxRows);
@@ -1338,11 +1338,11 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
-// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
+// ─── FEE ESTIMATE SYNC ─────────────────────────────────────────────────
 // Finds Amazon order lines < 14 days old with no settled fees,
 // calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
 // Real settled fees from Finances API always overwrite estimates.
-// ─────────────────────────────────────────────────────────────────────────────
+// ────────────────────────────────────────────────────────────────────────
 const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
 const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
 
