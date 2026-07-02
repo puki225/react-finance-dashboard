@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
+import KpiCard from '../components/KpiCard';
 import { useApi } from '../hooks/useApi';
 
 const GROUPS = ['day', 'week', 'month', 'year'];
@@ -288,6 +289,20 @@ export default function PnL() {
           </div>
         </div>
       </div>
+
+      {/* Bottom-line KPI */}
+      {!loading && periods.length > 0 && (
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
+          <KpiCard
+            label="Profit %"
+            value={totals.profit_pct}
+            type="percent"
+            color={parseFloat(totals.profit_pct || 0) >= 0 ? '#34d399' : '#f87171'}
+            sub={fmt(totals.profit) + ' profit'}
+            symbol={sym}
+          />
+        </div>
+      )}
     </div>
   );
 }
