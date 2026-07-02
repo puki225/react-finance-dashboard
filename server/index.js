@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
-// ─── FX HELPERS ───────────────────────────────────────────────
+// ─── FX HELPERS ─────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
 async function getReportingCurrency() {
@@ -71,7 +71,7 @@ function currencySymbol(currency) {
   return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
 }
 
-// ─── API ROUTES ───────────────────────────────────────────────
+// ─── API ROUTES ─────────────────────────────────
 
 // KPI Summary
 app.get('/api/summary', async (req, res) => {
@@ -698,6 +698,247 @@ app.get('/api/order-breakdown', async (req, res) => {
     fulfillment.sort((a, b) => (order[a.label] ?? 9) - (order[b.label] ?? 9));
 
     res.json({ order_type: orderType, fulfillment, currency_symbol: currencySymbol(reportingCurrency) });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// P&L — account-wide monthly/weekly/etc. profit & loss, Amazon only (account-level fees
+// like subscription/storage are Amazon-specific — see amazon_account_fees, populated by
+// the amazon-spapi-proxy finances sync). Mirrors the Product Breakdown P&L panel's own
+// Gross Sales -> Discounts -> Refunds -> Net Sales -> COGS -> Fees -> Gross Margin -> PPC
+// -> Product Contribution structure, but grouped by period across all SKUs instead of one.
+app.get('/api/pnl', async (req, res) => {
+  const { from, to, group = 'month', brand, parent_asin, search, fulfillment, order_type } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  const trunc = ['day', 'week', 'month', 'year'].includes(group) ? group : 'month';
+
+  const esc = (s) => s.replace(/'/g, "''");
+  const brandFilter = brand ? `AND sp.brand = '${esc(brand)}'` : '';
+  const parentFilter = parent_asin ? `AND sp.parent_asin = '${esc(parent_asin)}'` : '';
+  const searchFilter = search ? `AND (aol.sku ILIKE '%${esc(search)}%' OR aol.asin ILIKE '%${esc(search)}%' OR ao.amazon_order_id ILIKE '%${esc(search)}%')` : '';
+  const fulfillmentFilter = fulfillment === 'FBA' ? `AND ao.fulfillment_channel = 'AFN'` : fulfillment === 'FBM' ? `AND ao.fulfillment_channel = 'MFN'` : '';
+  const orderTypeFilter = order_type === 'B2B' ? `AND ao.is_business_order = true` : order_type === 'B2C' ? `AND ao.is_business_order = false` : '';
+
+  try {
+    // Order-line level: units, gross sales, discounts, itemized COGS, order-line fees — grouped by period.
+    // COGS formula matches the P&L breakdown panel exactly (itemized standard/freight/demurrage/quality/other
+    // with cogs_entries -> sku_parameters -> flat unit_cogs fallback), not the flat shortcut used elsewhere.
+    const linesResult = await pool.query(`
+      SELECT
+        DATE_TRUNC('${trunc}', ao.order_date)::date AS period,
+        SUM(aol.quantity)::int AS units_sold,
+        SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
+        SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
+        SUM(aol.quantity * (
+          COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+          + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+          + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+          + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+          + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+        ))::numeric(12,2) AS total_cogs,
+        SUM(COALESCE(aol.fee_commission,0))::numeric(12,2) AS fee_commission,
+        SUM(COALESCE(aol.fee_fba_fulfillment,0))::numeric(12,2) AS fee_fba_fulfillment,
+        SUM(COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS fee_fixed_closing,
+        SUM(COALESCE(aol.fee_variable_closing,0))::numeric(12,2) AS fee_variable_closing,
+        SUM(COALESCE(aol.fee_digital_services,0))::numeric(12,2) AS fee_digital_services,
+        SUM(COALESCE(aol.fee_giftwrap_chargeback,0))::numeric(12,2) AS fee_giftwrap,
+        SUM(COALESCE(aol.fee_shipping_chargeback,0))::numeric(12,2) AS fee_shipping_chargeback
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+      LEFT JOIN LATERAL (
+        SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
+        WHERE sku = aol.sku AND effective_from <= ao.order_date::date
+          AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+        ORDER BY effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+        ${brandFilter} ${parentFilter} ${searchFilter} ${fulfillmentFilter} ${orderTypeFilter}
+      GROUP BY 1 ORDER BY 1
+    `, [dateFrom, dateTo]);
+
+    // Refunds, attributed by refund_date (independent of the order population above)
+    const refundsResult = await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded)::numeric AS total_refunded
+      FROM v_refunds_by_date WHERE channel = 'amazon' AND refund_date::date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]);
+
+    // PPC spend, Amazon Ads only
+    const ppcResult = await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost)::numeric AS ppc_cost
+      FROM amazon_ppc_product_performance WHERE report_date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]);
+
+    // Account-level fees (subscription, storage, coupons, etc.) — itemized by whatever fee_type
+    // Amazon actually reports, rather than a hardcoded row list, since these categories are only
+    // as good as what's been synced via amazon-spapi-proxy's finances job. Adjustment-type events
+    // (inventory reimbursements/disposals) are kept in their own bucket, matching the reference
+    // P&L's separate "Adjustments" line rather than being folded into "Fees".
+    const accountFeesResult = await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type, SUM(amount)::numeric AS amount
+      FROM amazon_account_fees WHERE posted_date::date BETWEEN $1 AND $2
+      GROUP BY 1, 2, 3
+    `, [dateFrom, dateTo]);
+
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fx = (n) => (parseFloat(n || 0) * fxRate);
+
+    // Index refunds/PPC by period key for merging
+    const refundsByPeriod = {};
+    for (const r of refundsResult.rows) refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
+    const ppcByPeriod = {};
+    for (const r of ppcResult.rows) ppcByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.ppc_cost || 0);
+
+    // Account fees: group by period, split into (a) named fee_type rows for display and
+    // (b) an Adjustments total, per period. Also track fee_type totals across the whole
+    // range so the UI can list only the categories that actually have data.
+    const accountFeesByPeriod = {}; // { period: { [feeType]: amount } }
+    const adjustmentsByPeriod = {}; // { period: amount }
+    const feeTypeTotals = {}; // { feeType: totalAbsAmount } — for sorting which rows to show
+    for (const r of accountFeesResult.rows) {
+      const key = r.period.toISOString().split('T')[0];
+      const amt = parseFloat(r.amount || 0);
+      if (r.event_source === 'Adjustment') {
+        adjustmentsByPeriod[key] = (adjustmentsByPeriod[key] || 0) + amt;
+      } else {
+        if (!accountFeesByPeriod[key]) accountFeesByPeriod[key] = {};
+        accountFeesByPeriod[key][r.fee_type] = (accountFeesByPeriod[key][r.fee_type] || 0) + amt;
+        feeTypeTotals[r.fee_type] = (feeTypeTotals[r.fee_type] || 0) + Math.abs(amt);
+      }
+    }
+    const accountFeeTypes = Object.keys(feeTypeTotals).sort((a, b) => feeTypeTotals[b] - feeTypeTotals[a]);
+
+    function buildPeriodRow(periodKey, r) {
+      const unitsSold = parseInt(r?.units_sold || 0, 10);
+      const grossSales = fx(r?.gross_sales || 0);
+      const totalDiscounts = fx(r?.total_discounts || 0);
+      const netRevenue = grossSales - totalDiscounts;
+      const totalRefunded = fx(refundsByPeriod[periodKey] || 0);
+      const netSales = netRevenue - totalRefunded;
+      // Sign convention: every cost/fee value below is stored NEGATIVE (an outflow),
+      // so totals are computed by simple addition. This avoids the double-negation bug
+      // that happens when magnitudes (positive) and pre-signed deltas (negative) are mixed
+      // under a single subtraction.
+      const cogs = {
+        total: -fx(r?.total_cogs || 0),
+      };
+      const lineFees = {
+        commission: -fx(r?.fee_commission || 0),
+        fba_fulfillment: -fx(r?.fee_fba_fulfillment || 0),
+        fixed_closing: -fx(r?.fee_fixed_closing || 0),
+        variable_closing: -fx(r?.fee_variable_closing || 0),
+        digital_services: -fx(r?.fee_digital_services || 0),
+        giftwrap: -fx(r?.fee_giftwrap || 0),
+        shipping_chargeback: -fx(r?.fee_shipping_chargeback || 0),
+      };
+      const lineFeesTotal = Object.values(lineFees).reduce((s, v) => s + v, 0); // negative
+      const accountFeesRaw = accountFeesByPeriod[periodKey] || {};
+      const accountFees = {};
+      let accountFeesTotal = 0;
+      for (const ft of accountFeeTypes) {
+        const v = fx(accountFeesRaw[ft] || 0); // already negative from sync (charges stored as -Math.abs)
+        accountFees[ft] = v;
+        accountFeesTotal += v;
+      }
+      const totalFees = lineFeesTotal + accountFeesTotal; // negative
+      const adjustments = fx(adjustmentsByPeriod[periodKey] || 0); // signed as Amazon reports it (can be +/-)
+      const ppcCost = -fx(ppcByPeriod[periodKey] || 0); // negative (spend)
+      const grossMargin = netSales + cogs.total + totalFees; // netSales minus |cogs| minus |fees|
+      const productContribution = grossMargin + ppcCost + adjustments;
+      const marginPct = netSales > 0 ? (productContribution / netSales * 100) : 0;
+      const cogsMagnitude = Math.abs(cogs.total);
+      const roiPct = cogsMagnitude > 0 ? (productContribution / cogsMagnitude * 100) : 0;
+
+      return {
+        period: periodKey,
+        units_sold: unitsSold,
+        gross_sales: grossSales.toFixed(2),
+        total_discounts: (-totalDiscounts).toFixed(2),
+        net_revenue: netRevenue.toFixed(2),
+        total_refunded: (-totalRefunded).toFixed(2),
+        net_sales: netSales.toFixed(2),
+        cogs: { total: cogs.total.toFixed(2) },
+        fees: {
+          commission: lineFees.commission.toFixed(2),
+          fba_fulfillment: lineFees.fba_fulfillment.toFixed(2),
+          fixed_closing: lineFees.fixed_closing.toFixed(2),
+          variable_closing: lineFees.variable_closing.toFixed(2),
+          digital_services: lineFees.digital_services.toFixed(2),
+          giftwrap: lineFees.giftwrap.toFixed(2),
+          shipping_chargeback: lineFees.shipping_chargeback.toFixed(2),
+          total: lineFeesTotal.toFixed(2),
+        },
+        account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
+        account_fees_total: accountFeesTotal.toFixed(2),
+        total_fees: totalFees.toFixed(2),
+        adjustments: adjustments.toFixed(2),
+        ppc_cost: ppcCost.toFixed(2),
+        gross_margin: grossMargin.toFixed(2),
+        product_contribution: productContribution.toFixed(2),
+        margin_pct: marginPct.toFixed(1),
+        roi_pct: roiPct.toFixed(1),
+      };
+    }
+
+    // Union of all period keys seen across lines/refunds/ppc/account-fees, so a period with
+    // e.g. only a subscription fee and no sales still shows up as its own column.
+    const allPeriodKeys = new Set([
+      ...linesResult.rows.map(r => r.period.toISOString().split('T')[0]),
+      ...Object.keys(refundsByPeriod),
+      ...Object.keys(ppcByPeriod),
+      ...Object.keys(accountFeesByPeriod),
+      ...Object.keys(adjustmentsByPeriod),
+    ]);
+    const linesByPeriod = {};
+    for (const r of linesResult.rows) linesByPeriod[r.period.toISOString().split('T')[0]] = r;
+
+    const periods = [...allPeriodKeys].sort().map(key => buildPeriodRow(key, linesByPeriod[key]));
+
+    // Total row — recompute from summed raw inputs rather than summing already-rounded
+    // period rows, so rounding doesn't drift the total away from period-by-period figures.
+    const totalRaw = linesResult.rows.reduce((acc, r) => {
+      acc.units_sold += parseInt(r.units_sold || 0, 10);
+      acc.gross_sales += parseFloat(r.gross_sales || 0);
+      acc.total_discounts += parseFloat(r.total_discounts || 0);
+      acc.total_cogs += parseFloat(r.total_cogs || 0);
+      acc.fee_commission += parseFloat(r.fee_commission || 0);
+      acc.fee_fba_fulfillment += parseFloat(r.fee_fba_fulfillment || 0);
+      acc.fee_fixed_closing += parseFloat(r.fee_fixed_closing || 0);
+      acc.fee_variable_closing += parseFloat(r.fee_variable_closing || 0);
+      acc.fee_digital_services += parseFloat(r.fee_digital_services || 0);
+      acc.fee_giftwrap += parseFloat(r.fee_giftwrap || 0);
+      acc.fee_shipping_chargeback += parseFloat(r.fee_shipping_chargeback || 0);
+      return acc;
+    }, { units_sold: 0, gross_sales: 0, total_discounts: 0, total_cogs: 0, fee_commission: 0, fee_fba_fulfillment: 0, fee_fixed_closing: 0, fee_variable_closing: 0, fee_digital_services: 0, fee_giftwrap: 0, fee_shipping_chargeback: 0 });
+    totalRaw.period = '__total__';
+    // Total refunds/ppc/account-fees/adjustments are just the sum over all real periods —
+    // captured before adding the '__total__' key itself, so it can't fold into its own sum.
+    const sumMap = (m) => Object.values(m).reduce((s, v) => s + v, 0);
+    const perPeriodAccountFees = Object.values(accountFeesByPeriod);
+    refundsByPeriod['__total__'] = sumMap(refundsByPeriod);
+    ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
+    adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
+    accountFeesByPeriod['__total__'] = {};
+    for (const ft of accountFeeTypes) {
+      accountFeesByPeriod['__total__'][ft] = perPeriodAccountFees.reduce((s, m) => s + (m[ft] || 0), 0);
+    }
+    const totals = buildPeriodRow('__total__', totalRaw);
+
+    res.json({
+      periods,
+      totals,
+      account_fee_types: accountFeeTypes,
+      currency_symbol: currencySymbol(reportingCurrency),
+      group: trunc,
+    });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
@@ -1610,11 +1851,11 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
-// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
+// ─── FEE ESTIMATE SYNC ──────────────────────────────────────────────────────
 // Finds Amazon order lines < 14 days old with no settled fees,
 // calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
 // Real settled fees from Finances API always overwrite estimates.
-// ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────
 const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
 const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
 
