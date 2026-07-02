@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
-// ─── FX HELPERS ─────────────────────────────────
+// ─── FX HELPERS ───────────────────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
 async function getReportingCurrency() {
@@ -71,7 +71,7 @@ function currencySymbol(currency) {
   return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
 }
 
-// ─── API ROUTES ─────────────────────────────────
+// ─── API ROUTES ───────────────────────────────────────────────
 
 // KPI Summary
 app.get('/api/summary', async (req, res) => {
@@ -848,14 +848,24 @@ app.get('/api/pnl', async (req, res) => {
         accountFees[ft] = v;
         accountFeesTotal += v;
       }
-      const totalFees = lineFeesTotal + accountFeesTotal; // negative
       const adjustments = fx(adjustmentsByPeriod[periodKey] || 0); // signed as Amazon reports it (can be +/-)
       const ppcCost = -fx(ppcByPeriod[periodKey] || 0); // negative (spend)
-      const grossMargin = netSales + cogs.total + totalFees; // netSales minus |cogs| minus |fees|
-      const productContribution = grossMargin + ppcCost + adjustments;
+
+      // Gross Margin / Product Contribution only include costs that can be attributed to a
+      // specific product/order line: COGS, per-order-line fees (commission, FBA fulfillment,
+      // closing fees, etc.), and PPC spend. Account-level fees (subscription, storage, coupons)
+      // and Adjustments (inventory reimbursements/disposals) are account-wide, not product-level,
+      // so they're bucketed separately below as "Fixed Fees" — the bridge from Product
+      // Contribution down to the true bottom-line Profit.
+      const grossMargin = netSales + cogs.total + lineFeesTotal; // netSales minus |cogs| minus |product fees|
+      const productContribution = grossMargin + ppcCost;
+      const fixedFeesTotal = accountFeesTotal + adjustments; // negative-leaning, but adjustments can be +
+      const profit = productContribution + fixedFeesTotal;
+
       const marginPct = netSales > 0 ? (productContribution / netSales * 100) : 0;
       const cogsMagnitude = Math.abs(cogs.total);
       const roiPct = cogsMagnitude > 0 ? (productContribution / cogsMagnitude * 100) : 0;
+      const profitPct = netSales > 0 ? (profit / netSales * 100) : 0;
 
       return {
         period: periodKey,
@@ -876,15 +886,21 @@ app.get('/api/pnl', async (req, res) => {
           shipping_chargeback: lineFees.shipping_chargeback.toFixed(2),
           total: lineFeesTotal.toFixed(2),
         },
-        account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
-        account_fees_total: accountFeesTotal.toFixed(2),
-        total_fees: totalFees.toFixed(2),
-        adjustments: adjustments.toFixed(2),
         ppc_cost: ppcCost.toFixed(2),
         gross_margin: grossMargin.toFixed(2),
         product_contribution: productContribution.toFixed(2),
         margin_pct: marginPct.toFixed(1),
         roi_pct: roiPct.toFixed(1),
+        // Fixed Fees — account-wide costs that can't be attributed to a product, bridging
+        // Product Contribution down to Profit.
+        fixed_fees: {
+          account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
+          account_fees_total: accountFeesTotal.toFixed(2),
+          adjustments: adjustments.toFixed(2),
+          total: fixedFeesTotal.toFixed(2),
+        },
+        profit: profit.toFixed(2),
+        profit_pct: profitPct.toFixed(1),
       };
     }
 
@@ -1851,11 +1867,11 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
-// ─── FEE ESTIMATE SYNC ──────────────────────────────────────────────────────
+// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
 // Finds Amazon order lines < 14 days old with no settled fees,
 // calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
 // Real settled fees from Finances API always overwrite estimates.
-// ─────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
 const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
 
@@ -1875,7 +1891,6 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
         AND (aol.is_estimated_fee IS NULL OR aol.is_estimated_fee = FALSE)
         AND aol.asin IS NOT NULL
         AND COALESCE(NULLIF(aol.unit_price, 0), lp.last_price) > 0
-      ORDER BY ao.order_date DESC
     `);
     if (!linesResult.rows.length) {
       return res.json({ ok: true, message: 'No unsettled lines need fee estimates', estimated: 0 });

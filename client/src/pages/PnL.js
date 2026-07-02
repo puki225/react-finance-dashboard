@@ -61,16 +61,21 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   for (const ft of ['commission', 'fba_fulfillment', 'fixed_closing', 'variable_closing', 'digital_services', 'giftwrap', 'shipping_chargeback']) {
     if (parseFloat(getPath(totals, `fees.${ft}`) || 0) !== 0) pushRow('  ' + prettifyFeeType(ft), `fees.${ft}`);
   }
-  for (const ft of accountFeeTypes) {
-    if (parseFloat(getPath(totals, `account_fees.${ft}`) || 0) !== 0) pushRow('  ' + prettifyFeeType(ft), `account_fees.${ft}`);
-  }
-  pushRow('Total Fees', 'total_fees');
-  pushRow('Adjustments', 'adjustments');
+  pushRow('Total Product Fees', 'fees.total');
   pushRow('Gross Margin', 'gross_margin');
   pushRow('PPC Spend', 'ppc_cost');
   pushRow('Product Contribution', 'product_contribution');
   pushRow('Margin %', 'margin_pct');
   pushRow('ROI %', 'roi_pct');
+  // Fixed Fees — account-wide costs not attributable to a product, bridging Product
+  // Contribution down to Profit.
+  for (const ft of accountFeeTypes) {
+    if (parseFloat(getPath(totals, `fixed_fees.account_fees.${ft}`) || 0) !== 0) pushRow('  ' + prettifyFeeType(ft), `fixed_fees.account_fees.${ft}`);
+  }
+  if (parseFloat(getPath(totals, 'fixed_fees.adjustments') || 0) !== 0) pushRow('  Adjustments', 'fixed_fees.adjustments');
+  pushRow('Total Fixed Fees', 'fixed_fees.total');
+  pushRow('Profit', 'profit');
+  pushRow('Net Profit %', 'profit_pct');
 
   const csv = [cols.join(','), ...rows.map(r => r.map(v => `"${v}"`).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -90,6 +95,7 @@ export default function PnL() {
   const [orderType, setOrderType] = useState(() => localStorage.getItem('gb_pnl_order_type') || 'all');
   const [search, setSearch] = useState('');
   const [feesExpanded, setFeesExpanded] = useState(true);
+  const [fixedFeesExpanded, setFixedFeesExpanded] = useState(true);
 
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_pnl_range', JSON.stringify(r)); };
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
@@ -123,9 +129,10 @@ export default function PnL() {
   ), [totals]);
 
   const accountFeeRows = useMemo(() => (
-    accountFeeTypes.filter(ft => parseFloat(getPath(totals, `account_fees.${ft}`) || 0) !== 0)
+    accountFeeTypes.filter(ft => parseFloat(getPath(totals, `fixed_fees.account_fees.${ft}`) || 0) !== 0)
   ), [accountFeeTypes, totals]);
 
+  const hasAdjustments = parseFloat(getPath(totals, 'fixed_fees.adjustments') || 0) !== 0;
   const hasAccountFeeData = accountFeeRows.length > 0;
 
   const colTemplate = `220px repeat(${periods.length}, minmax(100px, 1fr)) 140px`;
@@ -180,7 +187,7 @@ export default function PnL() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>P&L</h1>
-          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Account-wide profit &amp; loss, Amazon only — includes subscription, storage and other account-level fees</p>
+          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Amazon only — Product Contribution reflects per-product economics; Fixed Fees bridge to Profit</p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
@@ -210,7 +217,7 @@ export default function PnL() {
       {!loading && !hasAccountFeeData && (
         <div style={{ background: '#fbbf2412', border: '1px solid #fbbf2440', borderRadius: 10, padding: '12px 16px', fontSize: 12, color: '#fbbf24', display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 15 }}>⚠</span>
-          No account-level fee data yet (subscription, storage, coupons). Run the Amazon Finances sync to backfill this — until then, Fees below only reflect per-order charges.
+          No account-level fee data yet (subscription, storage, coupons). Run the Amazon Finances sync to backfill this — until then, Fixed Fees below will read £0 and Profit will equal Product Contribution.
         </div>
       )}
 
@@ -240,23 +247,42 @@ export default function PnL() {
                 <ValueRow label="Seller COGS" keyPath="cogs.total" bold />
 
                 <ValueRow
-                  label="Fees" keyPath="total_fees" bold
+                  label="Fees" keyPath="fees.total" bold
                   expandable expanded={feesExpanded}
                   onClick={() => setFeesExpanded(s => !s)}
                 />
                 {feesExpanded && lineFeeRows.map(([key, label]) => (
                   <ValueRow key={key} label={label} keyPath={`fees.${key}`} indent />
                 ))}
-                {feesExpanded && accountFeeRows.map(ft => (
-                  <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`account_fees.${ft}`} indent />
-                ))}
 
-                <ValueRow label="Adjustments" keyPath="adjustments" bold />
                 <ValueRow label="Gross Margin" keyPath="gross_margin" bold highlight />
                 <ValueRow label="PPC Spend" keyPath="ppc_cost" indent />
                 <ValueRow label="Product Contribution" keyPath="product_contribution" bold highlight />
                 <ValueRow label="Margin %" keyPath="margin_pct" kind="pct" />
                 <ValueRow label="ROI %" keyPath="roi_pct" kind="pct" />
+
+                {/* Fixed Fees — account-wide costs (subscription, storage, coupons, inventory
+                    adjustments) that can't be attributed to a specific product. This is the
+                    bridge between Product Contribution and the true bottom-line Profit. */}
+                <div style={{ display: 'grid', gridTemplateColumns: colTemplate, background: 'var(--bg3)' }}>
+                  <div style={{ padding: '7px 10px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', position: 'sticky', left: 0, background: 'var(--bg3)', gridColumn: `1 / -1` }}>
+                    Fixed Fees — not attributable to a product
+                  </div>
+                </div>
+                <ValueRow
+                  label="Total Fixed Fees" keyPath="fixed_fees.total" bold
+                  expandable expanded={fixedFeesExpanded}
+                  onClick={() => setFixedFeesExpanded(s => !s)}
+                />
+                {fixedFeesExpanded && accountFeeRows.map(ft => (
+                  <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`fixed_fees.account_fees.${ft}`} indent />
+                ))}
+                {fixedFeesExpanded && hasAdjustments && (
+                  <ValueRow label="Adjustments" keyPath="fixed_fees.adjustments" indent />
+                )}
+
+                <ValueRow label="Profit" keyPath="profit" bold highlight />
+                <ValueRow label="Net Profit %" keyPath="profit_pct" kind="pct" />
               </>
             )}
           </div>
