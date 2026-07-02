@@ -77,10 +77,6 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
     </div>
   );
 
-  const SectionHeader = ({ label }) => (
-    <div style={{ padding: '10px 0 4px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', borderBottom: '1px solid var(--border)' }}>{label}</div>
-  );
-
   const margin = divide(data.gross_margin);
   const marginPct = pct(data.gross_margin);
   const contribution = divide(data.product_contribution);
@@ -99,14 +95,12 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         <span style={{ fontSize: 10, color: 'var(--muted)', alignSelf: 'center', marginLeft: 8 }}>% of net revenue</span>
       </div>
 
-      <SectionHeader label="Revenue" />
       <Row label="Gross Sales" value={data.revenue.gross_sales} bold isBase />
       {parseFloat(data.revenue.discounts) !== 0 && <Row label="Discounts / Promos" value={data.revenue.discounts} indent />}
       {parseFloat(data.revenue.refunds) !== 0 && <Row label="Refunds" value={data.revenue.refunds} indent />}
       <Row label="Net Sales" value={data.revenue.net_revenue} bold />
 
       {data.has_fees && <>
-        <SectionHeader label="Fees" />
         {parseFloat(data.fees.commission) !== 0 && <Row label="Commission" value={data.fees.commission} indent />}
         {parseFloat(data.fees.fba_fulfillment) !== 0 && <Row label="FBA Fulfillment" value={data.fees.fba_fulfillment} indent />}
         {parseFloat(data.fees.mcf_fulfillment) !== 0 && <Row label="MCF Fulfillment" value={data.fees.mcf_fulfillment} indent />}
@@ -119,7 +113,6 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       </>}
 
       {data.has_cogs && <>
-        <SectionHeader label="Cost of Goods" />
         {parseFloat(data.cogs.standard) !== 0 && <Row label="Standard COGS" value={data.cogs.standard} indent />}
         {parseFloat(data.cogs.freight) !== 0 && <Row label="Freight" value={data.cogs.freight} indent />}
         {parseFloat(data.cogs.demurrage) !== 0 && <Row label="Demurrage / Duties" value={data.cogs.demurrage} indent />}
@@ -137,7 +130,6 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       </div>
 
       {data.has_ppc && <>
-        <SectionHeader label="PPC (Amazon Ads)" />
         <Row label="Ad Spend" value={data.ppc.spend} bold />
       </>}
 
