@@ -35,7 +35,7 @@ function CountryPanel({ data, fmt }) {
       <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
         <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Sales by Country</h2>
       </div>
-      <div style={{ display: 'flex', gap: 24, padding: 24, flexWrap: 'wrap' }}>
+      <div style={{ display: 'flex', gap: 24, padding: '0 24px', flexWrap: 'wrap' }}>
         <div style={{ flex: '1 1 420px', minWidth: 280 }}>
           <WorldMap data={sorted} fmt={fmt} />
         </div>

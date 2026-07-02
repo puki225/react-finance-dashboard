@@ -57,6 +57,14 @@ function MapTooltip({ hover, fmt }) {
   );
 }
 
+// Flat, high-contrast palette (no data/no-sale = light gray landmass; any country with
+// sales = a single solid accent colour) — mirrors the reference "Buyers by Country" look
+// rather than the previous low-opacity intensity wash, which read as muddy on a dark page.
+const FILL_NO_DATA = '#d8d8e2';
+const FILL_NO_DATA_HOVER = '#c2c2ce';
+const FILL_SOLD = '#7c6af7';
+const FILL_SOLD_HOVER = '#9b8cfa';
+
 export default function WorldMap({ data = [], fmt = (n) => n }) {
   const [hover, setHover] = useState(null);
 
@@ -68,29 +76,28 @@ export default function WorldMap({ data = [], fmt = (n) => n }) {
     return map;
   }, [data]);
 
-  const maxGross = useMemo(() => Math.max(1, ...data.map(r => parseFloat(r.gross_sales || 0))), [data]);
-
   return (
     <div style={{ position: 'relative' }}>
-      <ComposableMap projectionConfig={{ scale: 148 }} style={{ width: '100%', height: 'auto' }}>
+      {/* Explicit width/height (2:1) crops the default 4:3 canvas so there's no dead space
+          above the Arctic / below Antarctica — a tighter, wider frame like a standard world map. */}
+      <ComposableMap projectionConfig={{ scale: 148 }} width={800} height={400} style={{ width: '100%', height: 'auto', display: 'block' }}>
         <Geographies geography={GEO_URL}>
           {({ geographies }) =>
             geographies.map(geo => {
               const numeric = String(geo.id).padStart(3, '0');
               const alpha2 = NUMERIC_TO_ALPHA2[numeric];
               const row = alpha2 ? byAlpha2[alpha2] : null;
-              const intensity = row ? 0.25 + 0.75 * (parseFloat(row.gross_sales) / maxGross) : 0;
-              const fill = row ? `rgba(124, 106, 247, ${intensity.toFixed(2)})` : '#26263a';
+              const fill = row ? FILL_SOLD : FILL_NO_DATA;
               return (
                 <Geography
                   key={geo.rsmKey}
                   geography={geo}
                   fill={fill}
-                  stroke="#0d0d14"
+                  stroke="#1a1a24"
                   strokeWidth={0.5}
                   style={{
                     default: { outline: 'none' },
-                    hover: { outline: 'none', fill: row ? '#a78bfa' : '#33334a', cursor: row ? 'pointer' : 'default' },
+                    hover: { outline: 'none', fill: row ? FILL_SOLD_HOVER : FILL_NO_DATA_HOVER, cursor: row ? 'pointer' : 'default' },
                     pressed: { outline: 'none' },
                   }}
                   onMouseEnter={(evt) => { if (row) setHover({ row, alpha2, x: evt.clientX, y: evt.clientY }); }}
