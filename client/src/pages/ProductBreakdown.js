@@ -27,15 +27,15 @@ const channelBadge = (ch) => {
 };
 
 const COLS = [
-  { key: 'expand',               label: '',                sortable: false, width: '36px' },
-  { key: 'product_title',        label: 'Product',         sortable: false, width: '1fr'  },
-  { key: 'units_sold',           label: 'Units',            sortable: true,  width: '10%'  },
-  { key: 'gross_sales',          label: 'Revenue',          sortable: true,  width: '11%'  },
-  { key: 'gross_margin_pct',     label: 'Margin %',         sortable: true,  width: '8%'   },
-  { key: 'product_contribution', label: 'Prod Contrib £',   sortable: true,  width: '10%'  },
-  { key: 'roi',                  label: 'ROI',              sortable: false, width: '7%'   },
-  { key: 'acos',                 label: 'ACOS',             sortable: false, width: '11%'  },
-  { key: 'channels',             label: 'Channel',          sortable: false, width: '7%'   },
+  { key: 'expand',           label: '',                sortable: false, width: '36px' },
+  { key: 'product_title',    label: 'Product',         sortable: false, width: '1fr'  },
+  { key: 'units_sold',       label: 'Units',           sortable: true,  width: '10%'  },
+  { key: 'gross_sales',      label: 'Revenue',         sortable: true,  width: '11%'  },
+  { key: 'gross_margin_pct', label: 'Margin %',        sortable: true,  width: '8%'   },
+  { key: 'product_contribution', label: 'Prod Contrib £', sortable: true, width: '10%'  },
+  { key: 'roi',              label: 'ROI',             sortable: false, width: '7%'   },
+  { key: 'acos',             label: 'ACOS',            sortable: false, width: '11%'  },
+  { key: 'channels',         label: 'Channel',         sortable: false, width: '7%'   },
 ];
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
@@ -294,6 +294,7 @@ export default function ProductBreakdown() {
       total_refunded:  rows.reduce((s, r) => s + parseFloat(r.total_refunded || 0), 0),
       net_revenue:     rows.reduce((s, r) => s + parseFloat(r.net_revenue || 0), 0),
       gross_profit:    rows.reduce((s, r) => s + parseFloat(r.gross_profit || 0), 0),
+      product_contribution: rows.reduce((s, r) => s + parseFloat(r.product_contribution ?? r.gross_profit ?? 0), 0),
       skus:            rows.length,
     };
   }, [rows]);
@@ -354,8 +355,8 @@ export default function ProductBreakdown() {
         <KpiCard label="Units Sold" value={totals.units_sold} type="number" color="#fbbf24" />
         <KpiCard label="Gross Revenue" value={totals.gross_sales} type="currency" color="#7c6af7" symbol={sym} />
         <KpiCard label="Net Revenue" value={totals.net_revenue} type="currency" color="#34d399" symbol={sym} />
-        <KpiCard label="Gross Profit" value={totals.gross_profit} type="currency" color="#34d399" symbol={sym} />
         <KpiCard label="Gross Margin" value={totalMargin} type="percent" color={totalMargin > 20 ? '#34d399' : '#f87171'} />
+        <KpiCard label="Prod Contrib £" value={totals.product_contribution} type="currency" color="#34d399" symbol={sym} />
       </div>
 
       {/* Table */}
