@@ -500,7 +500,7 @@ app.get('/api/sales-by-country', async (req, res) => {
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           SUM(aol.quantity)::int AS units_sold,
           SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity)::numeric(12,2) AS net_revenue,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
           SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
@@ -545,7 +545,7 @@ app.get('/api/sales-by-country', async (req, res) => {
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country,
             aol.quantity AS units_sold,
             (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
-            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity) AS net_revenue,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) AS net_revenue,
             (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
@@ -606,7 +606,11 @@ app.get('/api/sales-by-country', async (req, res) => {
       const fees = parseFloat(r.total_fees || 0) * fxRate;
       const cogs = parseFloat(r.total_cogs || 0) * fxRate;
       const grossMargin = netSales - fees - cogs;
-      const marginPct = netSales > 0 ? (grossMargin / netSales * 100) : 0;
+      // Divide by net sales normally, but fall back to gross sales when refunds have driven net
+      // to zero/negative — otherwise a heavily-refunded country would silently show "0%" margin
+      // instead of the real (likely negative) figure.
+      const marginBase = netSales > 0 ? netSales : gross;
+      const marginPct = marginBase > 0 ? (grossMargin / marginBase * 100) : 0;
       const refundPct = gross > 0 ? (refunded / gross * 100) : 0;
       return {
         country: r.country,
@@ -1286,7 +1290,7 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           'amazon' AS channel,
           SUM(aol.quantity)::int AS units_sold,
           SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity)::numeric(12,2) AS net_revenue,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
           SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
@@ -1330,7 +1334,7 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
             aol.quantity AS units_sold,
             (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
-            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity) AS net_revenue,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) AS net_revenue,
             (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
