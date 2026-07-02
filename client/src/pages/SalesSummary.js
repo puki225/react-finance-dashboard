@@ -2,7 +2,52 @@ import React, { useState, useMemo } from 'react';
 import { AreaChart, Area, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
+import WorldMap, { countryName } from '../components/WorldMap';
 import { useApi } from '../hooks/useApi';
+
+// Country flag via flagcdn.com — same pattern as ProductBreakdown's CountryFlag
+const CountryFlag = ({ code }) => {
+  if (!code || code === 'Unknown') return <span style={{ fontSize: 16 }}>🌐</span>;
+  return <img src={`https://flagcdn.com/20x15/${code.toLowerCase()}.png`} alt={code} style={{ width: 20, height: 15, borderRadius: 2, objectFit: 'cover', flexShrink: 0 }} onError={e => { e.target.style.display = 'none'; }} />;
+};
+
+const ORDER_TYPE_COLORS = { 'Business (B2B)': '#7c6af7', 'Consumer (B2C)': '#34d399' };
+const FULFILLMENT_COLORS = { FBA: '#fbbf24', FBM: '#a78bfa', Shopify: '#7c6af7' };
+
+function BreakdownCard({ title, rows, colors, fmt, emptyNote }) {
+  const totalRevenue = rows.reduce((s, r) => s + parseFloat(r.gross_revenue || 0), 0);
+  return (
+    <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+      <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>{title}</h2>
+      {rows.length === 0 ? (
+        <div style={{ fontSize: 13, color: 'var(--muted)', padding: '20px 0' }}>{emptyNote}</div>
+      ) : (
+        <>
+          <div style={{ display: 'flex', height: 10, borderRadius: 5, overflow: 'hidden', marginBottom: 18 }}>
+            {rows.map((r, i) => {
+              const pct = totalRevenue > 0 ? parseFloat(r.gross_revenue) / totalRevenue * 100 : 0;
+              return <div key={i} style={{ width: `${pct}%`, background: colors[r.label] || '#6b6b80' }} />;
+            })}
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {rows.map((r, i) => {
+              const pct = totalRevenue > 0 ? (parseFloat(r.gross_revenue) / totalRevenue * 100) : 0;
+              return (
+                <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                  <div style={{ width: 8, height: 8, borderRadius: 2, background: colors[r.label] || '#6b6b80', flexShrink: 0 }} />
+                  <span style={{ fontSize: 13, fontWeight: 600, flex: 1 }}>{r.label}</span>
+                  <span style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{r.orders} orders</span>
+                  <span style={{ fontSize: 13, fontFamily: 'var(--mono)', minWidth: 70, textAlign: 'right' }}>{fmt(r.gross_revenue)}</span>
+                  <span style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', minWidth: 42, textAlign: 'right' }}>{pct.toFixed(1)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
 
 const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 const fmt = makeFmt('£'); // default, overridden once summary loads
@@ -81,8 +126,8 @@ export default function SalesSummary() {
   const { data: gatewayRaw, loading: loadingGateway } = useApi('/api/gateway-trend', { ...params, period });
   const { data: gatewaySummary } = useApi('/api/gateway-split', params);
   const { data: fees } = useApi('/api/fees', range);
-  const { data: recentOrders } = useApi('/api/recent-orders', { limit: 8, channel });
-  const { data: recentRefunds } = useApi('/api/refunds-by-date', { ...params, limit: 8 });
+  const { data: countryData } = useApi('/api/sales-by-country', params);
+  const { data: orderBreakdown } = useApi('/api/order-breakdown', params);
 
   // Dynamic currency formatter — uses reporting currency from summary API
   const currencyFmt = useMemo(() => {
@@ -176,54 +221,42 @@ export default function SalesSummary() {
         </div>
       </div>
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
-        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}><h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Recent Orders</h2></div>
+        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}><h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Sales by Country</h2></div>
+        <div style={{ padding: 24 }}>
+          <WorldMap data={countryData || []} />
+        </div>
         <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Order', 'Date', 'Status', 'Fulfilment', 'Gross', 'Net', 'Gateway', 'Country', 'Channel'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
+          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Country', 'Units Sold', 'Gross Revenue', '% of Total'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
           <tbody>
-            {(recentOrders || []).map((o, i) => (
+            {(countryData || []).length === 0 && (
+              <tr><td colSpan={4} style={{ padding: '24px 16px', textAlign: 'center', fontSize: 13, color: 'var(--muted)' }}>No sales in this period</td></tr>
+            )}
+            {(countryData || []).map((c, i) => (
               <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{o.channel === 'shopify' ? '#' : ''}{o.shopify_order_number}</td>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(o.order_date)}</td>
-                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d39920' : o.financial_status === 'refunded' ? '#f8717120' : '#fbbf2420', color: (o.financial_status === 'paid' || o.financial_status === 'Shipped') ? '#34d399' : o.financial_status === 'refunded' ? '#f87171' : '#fbbf24' }}>{o.financial_status}</span></td>
-                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d39915' : '#6b6b8020', color: (o.fulfillment_status === 'fulfilled' || o.fulfillment_status === 'AFN') ? '#34d399' : 'var(--muted)' }}>{o.fulfillment_status || 'unfulfilled'}</span></td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>
-                  {currencyFmt(o.gross_revenue)}
-                  {o.is_estimated_price && (
-                    <span title="Estimated from last known price — order pending settlement" style={{ marginLeft: 6, padding: '2px 6px', borderRadius: 4, fontSize: 10, fontWeight: 600, background: '#fbbf2420', color: '#fbbf24', fontFamily: 'var(--font)', letterSpacing: '0.04em' }}>EST</span>
-                  )}
-                </td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--green)' }}>{currencyFmt(o.net_revenue)}</td>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', textTransform: 'capitalize' }}>{o.gateway?.replace(/_/g, ' ')}</td>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)' }}>{o.shipping_country || '—'}</td>
-                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: o.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: o.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{o.channel || 'shopify'}</span></td>
+                <td style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10 }}><CountryFlag code={c.country} /><span style={{ fontSize: 13, fontWeight: 600 }}>{c.country === 'Unknown' ? 'Unknown' : countryName(c.country)}</span></td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{c.units_sold}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{currencyFmt(c.gross_sales)}</td>
+                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{c.pct}%</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
-      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
-        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
-          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Refunds Processed</h2>
-          <p style={{ fontSize: 12, color: 'var(--muted)', marginTop: 4 }}>By refund date — may relate to orders placed in earlier periods</p>
-        </div>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Date', 'Channel', 'Order', 'SKU', 'Qty', 'Amount'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
-          <tbody>
-            {(recentRefunds || []).length === 0 && (
-              <tr><td colSpan={6} style={{ padding: '24px 16px', textAlign: 'center', fontSize: 13, color: 'var(--muted)' }}>No refunds in this period</td></tr>
-            )}
-            {(recentRefunds || []).map((r, i) => (
-              <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                <td style={{ padding: '12px 16px', fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>{fmtDateFull(r.refund_date)}</td>
-                <td style={{ padding: '12px 16px' }}><span style={{ padding: '3px 8px', borderRadius: 4, fontSize: 11, fontWeight: 600, background: r.channel === 'amazon' ? '#fbbf2420' : '#7c6af720', color: r.channel === 'amazon' ? '#fbbf24' : '#a78bfa' }}>{r.channel}</span></td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{r.channel === 'shopify' ? '#' : ''}{r.order_id}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.sku || '—'}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{r.quantity_refunded ?? '—'}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--red)' }}>{currencyFmt(r.amount_refunded)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+        <BreakdownCard
+          title="Order Type (Amazon)"
+          rows={orderBreakdown?.order_type || []}
+          colors={ORDER_TYPE_COLORS}
+          fmt={currencyFmt}
+          emptyNote="No business/consumer split for this selection"
+        />
+        <BreakdownCard
+          title="Fulfillment Channel"
+          rows={orderBreakdown?.fulfillment || []}
+          colors={FULFILLMENT_COLORS}
+          fmt={currencyFmt}
+          emptyNote="No fulfillment data for this selection"
+        />
       </div>
     </div>
   );

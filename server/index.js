@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
-// ─── FX HELPERS ──────────────────────────────────
+// ─── FX HELPERS ───────────────────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
 async function getReportingCurrency() {
@@ -71,7 +71,7 @@ function currencySymbol(currency) {
   return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
 }
 
-// ─── API ROUTES ──────────────────────────────────
+// ─── API ROUTES ───────────────────────────────────────────────
 
 // KPI Summary
 app.get('/api/summary', async (req, res) => {
@@ -463,6 +463,159 @@ app.get('/api/refunds-by-date', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+
+// Sales by country — order-line level aggregation across all SKUs, for the Sales Summary world map
+app.get('/api/sales-by-country', async (req, res) => {
+  const { from, to, channel = 'all' } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  try {
+    let result;
+    if (channel === 'shopify') {
+      result = await pool.query(`
+        SELECT
+          COALESCE(so.shipping_country, 'Unknown') AS country,
+          SUM(sol.quantity)::int AS units_sold,
+          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
+          SUM((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric(12,2) AS net_revenue
+        FROM shopify_order_lines sol
+        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        WHERE sol.order_date::date BETWEEN $1 AND $2
+        GROUP BY 1
+      `, [dateFrom, dateTo]);
+    } else if (channel === 'amazon') {
+      result = await pool.query(`
+        SELECT
+          COALESCE(ao.shipping_country, 'Unknown') AS country,
+          SUM(aol.quantity)::int AS units_sold,
+          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
+          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity)::numeric(12,2) AS net_revenue
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+        GROUP BY 1
+      `, [dateFrom, dateTo]);
+    } else {
+      result = await pool.query(`
+        SELECT country,
+          SUM(units_sold)::int AS units_sold,
+          SUM(gross_sales)::numeric(12,2) AS gross_sales,
+          SUM(net_revenue)::numeric(12,2) AS net_revenue
+        FROM (
+          SELECT COALESCE(so.shipping_country, 'Unknown') AS country,
+            sol.quantity AS units_sold,
+            (sol.unit_price * sol.quantity) AS gross_sales,
+            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) AS net_revenue
+          FROM shopify_order_lines sol
+          JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+          WHERE sol.order_date::date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country,
+            aol.quantity AS units_sold,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity) AS net_revenue
+          FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+          WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+        ) combined
+        GROUP BY country
+      `, [dateFrom, dateTo]);
+    }
+
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const totalGross = result.rows.reduce((s, r) => s + parseFloat(r.gross_sales || 0), 0) * fxRate;
+
+    const rows = result.rows.map(r => {
+      const gross = parseFloat(r.gross_sales || 0) * fxRate;
+      return {
+        country: r.country,
+        units_sold: parseInt(r.units_sold || 0, 10),
+        gross_sales: gross.toFixed(2),
+        net_revenue: (parseFloat(r.net_revenue || 0) * fxRate).toFixed(2),
+        pct: totalGross > 0 ? (gross / totalGross * 100).toFixed(1) : '0.0',
+      };
+    }).sort((a, b) => parseFloat(b.gross_sales) - parseFloat(a.gross_sales));
+
+    res.json(rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Order type (B2B/B2C, Amazon only) and fulfillment channel (FBA/FBM/Shopify) breakdown
+app.get('/api/order-breakdown', async (req, res) => {
+  const { from, to, channel = 'all' } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  // Same order-level revenue rollup pattern used by /api/recent-orders
+  const amazonRevenueRollup = `
+    SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
+    FROM v_sku_revenue WHERE channel = 'amazon' GROUP BY order_id
+  `;
+  const amazonEnriched = `
+    SELECT o.amazon_order_id, o.order_date, o.status, o.is_business_order, o.fulfillment_channel,
+      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
+    FROM amazon_orders o
+    LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
+  `;
+  try {
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fx = (n) => (parseFloat(n || 0) * fxRate);
+
+    let orderType = [];
+    let fulfillment = [];
+
+    if (channel !== 'shopify') {
+      const r = await pool.query(`
+        SELECT is_business_order, COUNT(*)::int AS orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue
+        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
+        GROUP BY is_business_order
+      `, [dateFrom, dateTo]);
+      orderType = r.rows.map(row => ({
+        label: row.is_business_order ? 'Business (B2B)' : 'Consumer (B2C)',
+        orders: row.orders,
+        gross_revenue: fx(row.gross_revenue).toFixed(2),
+        net_revenue: fx(row.net_revenue).toFixed(2),
+      }));
+
+      const f = await pool.query(`
+        SELECT fulfillment_channel, COUNT(*)::int AS orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue
+        FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $1 AND $2 AND status != 'Canceled'
+        GROUP BY fulfillment_channel
+      `, [dateFrom, dateTo]);
+      fulfillment = f.rows.map(row => ({
+        label: row.fulfillment_channel === 'AFN' ? 'FBA' : row.fulfillment_channel === 'MFN' ? 'FBM' : (row.fulfillment_channel || 'Unknown'),
+        orders: row.orders,
+        gross_revenue: fx(row.gross_revenue).toFixed(2),
+        net_revenue: fx(row.net_revenue).toFixed(2),
+      }));
+    }
+
+    if (channel !== 'amazon') {
+      const r = await pool.query(`
+        SELECT COUNT(*)::int AS orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue
+        FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
+      `, [dateFrom, dateTo]);
+      const row = r.rows[0];
+      if (row && row.orders > 0) {
+        fulfillment.push({
+          label: 'Shopify',
+          orders: row.orders,
+          gross_revenue: fx(row.gross_revenue).toFixed(2),
+          net_revenue: fx(row.net_revenue).toFixed(2),
+        });
+      }
+    }
+
+    const order = { FBA: 0, FBM: 1, Shopify: 2 };
+    fulfillment.sort((a, b) => (order[a.label] ?? 9) - (order[b.label] ?? 9));
+
+    res.json({ order_type: orderType, fulfillment, currency_symbol: currencySymbol(reportingCurrency) });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
 
 // Product Breakdown — per SKU, both channels, date filtered
 app.get('/api/product-breakdown', async (req, res) => {
@@ -1373,11 +1526,11 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
-// ─── FEE ESTIMATE SYNC ─────────────────────────────────────────────────
+// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
 // Finds Amazon order lines < 14 days old with no settled fees,
 // calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
 // Real settled fees from Finances API always overwrite estimates.
-// ────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
 const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
 
