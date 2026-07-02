@@ -14,6 +14,65 @@ const CountryFlag = ({ code }) => {
 const ORDER_TYPE_COLORS = { 'Business (B2B)': '#7c6af7', 'Consumer (B2C)': '#34d399' };
 const FULFILLMENT_COLORS = { FBA: '#fbbf24', FBM: '#a78bfa', Shopify: '#7c6af7' };
 
+const COUNTRY_LIST_COLS = '1fr 46px 76px 40px';
+
+function CountryPanel({ data, fmt }) {
+  const [showAll, setShowAll] = useState(false);
+  const sorted = data || [];
+  const top5 = sorted.slice(0, 5);
+  const rest = sorted.slice(5);
+  const otherRow = rest.length > 0 ? {
+    country: 'Other',
+    units_sold: rest.reduce((s, r) => s + (parseInt(r.units_sold, 10) || 0), 0),
+    gross_sales: rest.reduce((s, r) => s + parseFloat(r.gross_sales || 0), 0).toFixed(2),
+    pct: rest.reduce((s, r) => s + parseFloat(r.pct || 0), 0).toFixed(1),
+  } : null;
+  const condensedRows = otherRow ? [...top5, otherRow] : top5;
+  const displayRows = showAll ? sorted : condensedRows;
+
+  return (
+    <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+      <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Sales by Country</h2>
+      </div>
+      <div style={{ display: 'flex', gap: 24, padding: 24, flexWrap: 'wrap' }}>
+        <div style={{ flex: '1 1 420px', minWidth: 280 }}>
+          <WorldMap data={sorted} fmt={fmt} />
+        </div>
+        <div style={{ flex: '1 1 280px', minWidth: 260, maxWidth: 380, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ display: 'grid', gridTemplateColumns: COUNTRY_LIST_COLS, padding: '0 4px 8px', borderBottom: '1px solid var(--border)' }}>
+            {['Country', 'Units', 'Revenue', '%'].map(h => (<span key={h} style={{ fontSize: 10, fontWeight: 600, color: 'var(--muted)', textTransform: 'uppercase', letterSpacing: '0.06em' }}>{h}</span>))}
+          </div>
+          <div style={{ maxHeight: showAll ? 420 : 'none', overflowY: showAll ? 'auto' : 'visible', display: 'flex', flexDirection: 'column' }}>
+            {displayRows.length === 0 && (<div style={{ padding: '16px 4px', fontSize: 13, color: 'var(--muted)' }}>No sales in this period</div>)}
+            {displayRows.map((c, i) => (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: COUNTRY_LIST_COLS, alignItems: 'center', padding: '7px 4px', borderBottom: '1px solid var(--border)' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, overflow: 'hidden' }}>
+                  {c.country === 'Other' ? <span style={{ fontSize: 15 }}>🌍</span> : <CountryFlag code={c.country} />}
+                  <span style={{ fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {c.country === 'Unknown' || c.country === 'Other' ? c.country : countryName(c.country)}
+                  </span>
+                </div>
+                <span style={{ fontSize: 12, fontFamily: 'var(--mono)' }}>{c.units_sold}</span>
+                <span style={{ fontSize: 12, fontFamily: 'var(--mono)' }}>{fmt(c.gross_sales)}</span>
+                <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{c.pct}%</span>
+              </div>
+            ))}
+          </div>
+          {rest.length > 0 && (
+            <button
+              onClick={() => setShowAll(s => !s)}
+              style={{ marginTop: 10, alignSelf: 'flex-start', background: 'none', border: 'none', color: 'var(--accent2)', fontSize: 12, fontWeight: 600, cursor: 'pointer', fontFamily: 'var(--font)', padding: '2px 0' }}
+            >
+              {showAll ? 'Show top 5' : `Show all ${sorted.length} countries`}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function BreakdownCard({ title, rows, colors, fmt, emptyNote }) {
   const totalRevenue = rows.reduce((s, r) => s + parseFloat(r.gross_revenue || 0), 0);
   return (
@@ -220,28 +279,7 @@ export default function SalesSummary() {
           )}
         </div>
       </div>
-      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
-        <div style={{ padding: '18px 24px', borderBottom: '1px solid var(--border)' }}><h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>Sales by Country</h2></div>
-        <div style={{ padding: 24 }}>
-          <WorldMap data={countryData || []} />
-        </div>
-        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
-          <thead><tr style={{ borderBottom: '1px solid var(--border)' }}>{['Country', 'Units Sold', 'Gross Revenue', '% of Total'].map(h => (<th key={h} style={{ padding: '10px 16px', textAlign: 'left', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>))}</tr></thead>
-          <tbody>
-            {(countryData || []).length === 0 && (
-              <tr><td colSpan={4} style={{ padding: '24px 16px', textAlign: 'center', fontSize: 13, color: 'var(--muted)' }}>No sales in this period</td></tr>
-            )}
-            {(countryData || []).map((c, i) => (
-              <tr key={i} style={{ borderBottom: '1px solid var(--border)', transition: 'background 0.1s' }} onMouseEnter={e => e.currentTarget.style.background = '#ffffff05'} onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-                <td style={{ padding: '12px 16px', display: 'flex', alignItems: 'center', gap: 10 }}><CountryFlag code={c.country} /><span style={{ fontSize: 13, fontWeight: 600 }}>{c.country === 'Unknown' ? 'Unknown' : countryName(c.country)}</span></td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{c.units_sold}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13 }}>{currencyFmt(c.gross_sales)}</td>
-                <td style={{ padding: '12px 16px', fontFamily: 'var(--mono)', fontSize: 13, color: 'var(--muted)' }}>{c.pct}%</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <CountryPanel data={countryData || []} fmt={currencyFmt} />
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
         <BreakdownCard
           title="Order Type (Amazon)"

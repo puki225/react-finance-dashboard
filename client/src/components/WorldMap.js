@@ -1,4 +1,4 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useState } from 'react';
 import { ComposableMap, Geographies, Geography } from 'react-simple-maps';
 
 const GEO_URL = 'https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json';
@@ -31,7 +31,35 @@ function countryName(alpha2) {
   } catch { return alpha2; }
 }
 
-export default function WorldMap({ data = [] }) {
+// Floating tooltip that follows the cursor — mirrors the dark card style used by the
+// Revenue Trend / Gateway tooltips elsewhere on Sales Summary.
+function MapTooltip({ hover, fmt }) {
+  if (!hover) return null;
+  const { row, alpha2, x, y } = hover;
+  const marginPct = parseFloat(row.gross_margin_pct || 0);
+  const refundPct = parseFloat(row.refund_pct || 0);
+  return (
+    <div style={{
+      position: 'fixed', left: x + 16, top: y + 16, zIndex: 1000, pointerEvents: 'none',
+      background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px', minWidth: 170,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
+        <img src={`https://flagcdn.com/20x15/${alpha2.toLowerCase()}.png`} alt={alpha2} style={{ width: 16, height: 12, borderRadius: 2, objectFit: 'cover' }} onError={e => { e.target.style.display = 'none'; }} />
+        <span style={{ fontSize: 12, fontWeight: 700, color: '#e8e8f0' }}>{countryName(alpha2)}</span>
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4, fontSize: 12, fontFamily: 'var(--mono)' }}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><span style={{ color: '#8b8ba0' }}>Gross Sales</span><span style={{ color: '#e8e8f0' }}>{fmt(row.gross_sales)}</span></div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><span style={{ color: '#8b8ba0' }}>Net Sales</span><span style={{ color: '#34d399' }}>{fmt(row.net_revenue)}</span></div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><span style={{ color: '#8b8ba0' }}>Refund Rate</span><span style={{ color: refundPct > 0 ? '#f87171' : '#8b8ba0' }}>{row.refund_pct}%</span></div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 16 }}><span style={{ color: '#8b8ba0' }}>Gross Margin</span><span style={{ color: marginPct >= 20 ? '#34d399' : '#f87171' }}>{row.gross_margin_pct}%</span></div>
+      </div>
+    </div>
+  );
+}
+
+export default function WorldMap({ data = [], fmt = (n) => n }) {
+  const [hover, setHover] = useState(null);
+
   const byAlpha2 = useMemo(() => {
     const map = {};
     for (const row of data) {
@@ -43,37 +71,39 @@ export default function WorldMap({ data = [] }) {
   const maxGross = useMemo(() => Math.max(1, ...data.map(r => parseFloat(r.gross_sales || 0))), [data]);
 
   return (
-    <ComposableMap projectionConfig={{ scale: 148 }} style={{ width: '100%', height: 'auto' }}>
-      <Geographies geography={GEO_URL}>
-        {({ geographies }) =>
-          geographies.map(geo => {
-            const numeric = String(geo.id).padStart(3, '0');
-            const alpha2 = NUMERIC_TO_ALPHA2[numeric];
-            const row = alpha2 ? byAlpha2[alpha2] : null;
-            const intensity = row ? 0.25 + 0.75 * (parseFloat(row.gross_sales) / maxGross) : 0;
-            const fill = row ? `rgba(124, 106, 247, ${intensity.toFixed(2)})` : '#26263a';
-            return (
-              <Geography
-                key={geo.rsmKey}
-                geography={geo}
-                fill={fill}
-                stroke="#0d0d14"
-                strokeWidth={0.5}
-                style={{
-                  default: { outline: 'none' },
-                  hover: { outline: 'none', fill: row ? '#a78bfa' : '#33334a', cursor: row ? 'pointer' : 'default' },
-                  pressed: { outline: 'none' },
-                }}
-              >
-                <title>
-                  {row ? `${countryName(alpha2)}: ${row.units_sold} units` : (alpha2 ? countryName(alpha2) : '')}
-                </title>
-              </Geography>
-            );
-          })
-        }
-      </Geographies>
-    </ComposableMap>
+    <div style={{ position: 'relative' }}>
+      <ComposableMap projectionConfig={{ scale: 148 }} style={{ width: '100%', height: 'auto' }}>
+        <Geographies geography={GEO_URL}>
+          {({ geographies }) =>
+            geographies.map(geo => {
+              const numeric = String(geo.id).padStart(3, '0');
+              const alpha2 = NUMERIC_TO_ALPHA2[numeric];
+              const row = alpha2 ? byAlpha2[alpha2] : null;
+              const intensity = row ? 0.25 + 0.75 * (parseFloat(row.gross_sales) / maxGross) : 0;
+              const fill = row ? `rgba(124, 106, 247, ${intensity.toFixed(2)})` : '#26263a';
+              return (
+                <Geography
+                  key={geo.rsmKey}
+                  geography={geo}
+                  fill={fill}
+                  stroke="#0d0d14"
+                  strokeWidth={0.5}
+                  style={{
+                    default: { outline: 'none' },
+                    hover: { outline: 'none', fill: row ? '#a78bfa' : '#33334a', cursor: row ? 'pointer' : 'default' },
+                    pressed: { outline: 'none' },
+                  }}
+                  onMouseEnter={(evt) => { if (row) setHover({ row, alpha2, x: evt.clientX, y: evt.clientY }); }}
+                  onMouseMove={(evt) => { if (row) setHover(h => (h ? { ...h, x: evt.clientX, y: evt.clientY } : h)); }}
+                  onMouseLeave={() => setHover(null)}
+                />
+              );
+            })
+          }
+        </Geographies>
+      </ComposableMap>
+      <MapTooltip hover={hover} fmt={fmt} />
+    </div>
   );
 }
 

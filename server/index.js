@@ -464,7 +464,9 @@ app.get('/api/refunds-by-date', async (req, res) => {
 });
 
 
-// Sales by country — order-line level aggregation across all SKUs, for the Sales Summary world map
+// Sales by country — order-line level aggregation across all SKUs, for the Sales Summary world map.
+// Also pulls fees/COGS (for gross margin %) and refunds (for refund %) per country, for the map's
+// hover tooltip — same flat-COGS approach as /api/product-breakdown/countries, just without a SKU filter.
 app.get('/api/sales-by-country', async (req, res) => {
   const { from, to, channel = 'all' } = req.query;
   const dateFrom = from || '2020-01-01';
@@ -477,9 +479,18 @@ app.get('/api/sales-by-country', async (req, res) => {
           COALESCE(so.shipping_country, 'Unknown') AS country,
           SUM(sol.quantity)::int AS units_sold,
           SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric(12,2) AS net_revenue
+          SUM((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric(12,2) AS net_revenue,
+          0::numeric AS total_fees,
+          SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM shopify_order_lines sol
         JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+        LEFT JOIN LATERAL (
+          SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
+            AND effective_from <= sol.order_date::date
+            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY 1
       `, [dateFrom, dateTo]);
@@ -489,10 +500,19 @@ app.get('/api/sales-by-country', async (req, res) => {
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           SUM(aol.quantity)::int AS units_sold,
           SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity)::numeric(12,2) AS net_revenue
+          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity)::numeric(12,2) AS net_revenue,
+          SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS total_fees,
+          SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+        LEFT JOIN LATERAL (
+          SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
+            AND effective_from <= ao.order_date::date
+            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+          ORDER BY effective_from DESC LIMIT 1
+        ) ce ON true
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         GROUP BY 1
       `, [dateFrom, dateTo]);
@@ -501,28 +521,78 @@ app.get('/api/sales-by-country', async (req, res) => {
         SELECT country,
           SUM(units_sold)::int AS units_sold,
           SUM(gross_sales)::numeric(12,2) AS gross_sales,
-          SUM(net_revenue)::numeric(12,2) AS net_revenue
+          SUM(net_revenue)::numeric(12,2) AS net_revenue,
+          SUM(total_fees)::numeric(12,2) AS total_fees,
+          SUM(total_cogs)::numeric(12,2) AS total_cogs
         FROM (
           SELECT COALESCE(so.shipping_country, 'Unknown') AS country,
             sol.quantity AS units_sold,
             (sol.unit_price * sol.quantity) AS gross_sales,
-            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) AS net_revenue
+            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) AS net_revenue,
+            0 AS total_fees,
+            (sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM shopify_order_lines sol
           JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+          LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+          LEFT JOIN LATERAL (
+            SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
+              AND effective_from <= sol.order_date::date
+              AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
+            ORDER BY effective_from DESC LIMIT 1
+          ) ce ON true
           WHERE sol.order_date::date BETWEEN $1 AND $2
           UNION ALL
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country,
             aol.quantity AS units_sold,
             (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
-            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity) AS net_revenue
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) - COALESCE(aol.promotion_discount,0)/NULLIF(aol.quantity,1)) * aol.quantity) AS net_revenue,
+            (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) AS total_fees,
+            (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
           LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+          LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+          LEFT JOIN LATERAL (
+            SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
+              AND effective_from <= ao.order_date::date
+              AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
+            ORDER BY effective_from DESC LIMIT 1
+          ) ce ON true
           WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         ) combined
         GROUP BY country
       `, [dateFrom, dateTo]);
     }
+
+    // Refunds attributed by refund_date, joined back to the order's shipping_country
+    let refundResult;
+    if (channel === 'amazon' || channel === 'shopify') {
+      refundResult = await pool.query(channel === 'amazon' ? `
+        SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded)::numeric AS total_refunded
+        FROM v_refunds_by_date v JOIN amazon_orders ao ON ao.amazon_order_id = v.order_id
+        WHERE v.channel = 'amazon' AND v.refund_date::date BETWEEN $1 AND $2
+        GROUP BY 1
+      ` : `
+        SELECT COALESCE(so.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded)::numeric AS total_refunded
+        FROM v_refunds_by_date v JOIN shopify_orders so ON so.shopify_order_id::text = v.order_id
+        WHERE v.channel = 'shopify' AND v.refund_date::date BETWEEN $1 AND $2
+        GROUP BY 1
+      `, [dateFrom, dateTo]);
+    } else {
+      refundResult = await pool.query(`
+        SELECT country, SUM(total_refunded)::numeric AS total_refunded FROM (
+          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, v.amount_refunded AS total_refunded
+          FROM v_refunds_by_date v JOIN amazon_orders ao ON ao.amazon_order_id = v.order_id
+          WHERE v.channel = 'amazon' AND v.refund_date::date BETWEEN $1 AND $2
+          UNION ALL
+          SELECT COALESCE(so.shipping_country, 'Unknown') AS country, v.amount_refunded AS total_refunded
+          FROM v_refunds_by_date v JOIN shopify_orders so ON so.shopify_order_id::text = v.order_id
+          WHERE v.channel = 'shopify' AND v.refund_date::date BETWEEN $1 AND $2
+        ) combined GROUP BY country
+      `, [dateFrom, dateTo]);
+    }
+    const refundsByCountry = {};
+    for (const r of refundResult.rows) refundsByCountry[r.country] = parseFloat(r.total_refunded || 0);
 
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
@@ -530,11 +600,21 @@ app.get('/api/sales-by-country', async (req, res) => {
 
     const rows = result.rows.map(r => {
       const gross = parseFloat(r.gross_sales || 0) * fxRate;
+      const netBeforeRefunds = parseFloat(r.net_revenue || 0) * fxRate;
+      const refunded = (refundsByCountry[r.country] || 0) * fxRate;
+      const netSales = netBeforeRefunds - refunded;
+      const fees = parseFloat(r.total_fees || 0) * fxRate;
+      const cogs = parseFloat(r.total_cogs || 0) * fxRate;
+      const grossMargin = netSales - fees - cogs;
+      const marginPct = netSales > 0 ? (grossMargin / netSales * 100) : 0;
+      const refundPct = gross > 0 ? (refunded / gross * 100) : 0;
       return {
         country: r.country,
         units_sold: parseInt(r.units_sold || 0, 10),
         gross_sales: gross.toFixed(2),
-        net_revenue: (parseFloat(r.net_revenue || 0) * fxRate).toFixed(2),
+        net_revenue: netSales.toFixed(2),
+        refund_pct: refundPct.toFixed(1),
+        gross_margin_pct: marginPct.toFixed(1),
         pct: totalGross > 0 ? (gross / totalGross * 100).toFixed(1) : '0.0',
       };
     }).sort((a, b) => parseFloat(b.gross_sales) - parseFloat(a.gross_sales));
