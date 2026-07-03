@@ -729,17 +729,16 @@ app.get('/api/pnl', async (req, res) => {
         SUM(aol.quantity)::int AS units_sold,
         SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
         SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
-        SUM(aol.quantity * (
-          COALESCE(
-            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
-            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
-              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
-              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
-          + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
-          + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
-          + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
-          + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
-        ))::numeric(12,2) AS total_cogs,
+        SUM(aol.quantity * COALESCE(
+          NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+          CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+            AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+            THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+        )::numeric(12,2) AS cogs_standard,
+        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric(12,2) AS cogs_freight,
+        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric(12,2) AS cogs_demurrage,
+        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric(12,2) AS cogs_quality,
+        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric(12,2) AS cogs_other,
         SUM(COALESCE(aol.fee_commission,0))::numeric(12,2) AS fee_commission,
         SUM(COALESCE(aol.fee_fba_fulfillment,0))::numeric(12,2) AS fee_fba_fulfillment,
         SUM(COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS fee_fixed_closing,
@@ -842,8 +841,13 @@ app.get('/api/pnl', async (req, res) => {
       // that happens when magnitudes (positive) and pre-signed deltas (negative) are mixed
       // under a single subtraction.
       const cogs = {
-        total: -fx(r?.total_cogs || 0),
+        standard: -fx(r?.cogs_standard || 0),
+        freight: -fx(r?.cogs_freight || 0),
+        demurrage: -fx(r?.cogs_demurrage || 0),
+        quality: -fx(r?.cogs_quality || 0),
+        other: -fx(r?.cogs_other || 0),
       };
+      cogs.total = cogs.standard + cogs.freight + cogs.demurrage + cogs.quality + cogs.other;
       const lineFees = {
         commission: -fx(r?.fee_commission || 0),
         fba_fulfillment: -fx(r?.fee_fba_fulfillment || 0),
@@ -870,14 +874,18 @@ app.get('/api/pnl', async (req, res) => {
 
       // Gross Margin / Product Contribution only include costs that can be attributed to a
       // specific product/order line: COGS, per-order-line fees (commission, FBA fulfillment,
-      // closing fees, etc.), and PPC spend. Account-level fees (subscription, storage, coupons)
-      // and Adjustments (inventory reimbursements/disposals) are account-wide, not product-level,
-      // so they're bucketed separately below as "Fixed Fees" — the bridge from Product
-      // Contribution down to the true bottom-line Profit.
+      // closing fees, etc.), and PPC spend. Everything account-wide/not product-attributable
+      // (Amazon's account-level fees + adjustments, plus future headcount/fixed-cost entries)
+      // lives under OPEX — the bridge from Product Contribution down to the true bottom-line
+      // Profit. Headcount and Fixed Costs have no data source yet (scaffolded at 0), so OPEX
+      // currently equals Other Fees.
       const grossMargin = netSales + cogs.total + lineFeesTotal; // netSales minus |cogs| minus |product fees|
       const productContribution = grossMargin + ppcCost;
-      const fixedFeesTotal = accountFeesTotal + adjustments; // negative-leaning, but adjustments can be +
-      const profit = productContribution + fixedFeesTotal;
+      const otherFeesTotal = accountFeesTotal + adjustments; // negative-leaning, but adjustments can be +
+      const headcountTotal = 0; // no data source yet
+      const fixedCostsTotal = 0; // no data source yet
+      const opexTotal = headcountTotal + otherFeesTotal + fixedCostsTotal;
+      const profit = productContribution + opexTotal;
 
       const marginPct = netSales > 0 ? (productContribution / netSales * 100) : 0;
       const cogsMagnitude = Math.abs(cogs.total);
@@ -892,7 +900,14 @@ app.get('/api/pnl', async (req, res) => {
         net_revenue: netRevenue.toFixed(2),
         total_refunded: (-totalRefunded).toFixed(2),
         net_sales: netSales.toFixed(2),
-        cogs: { total: cogs.total.toFixed(2) },
+        cogs: {
+          standard: cogs.standard.toFixed(2),
+          freight: cogs.freight.toFixed(2),
+          demurrage: cogs.demurrage.toFixed(2),
+          quality: cogs.quality.toFixed(2),
+          other: cogs.other.toFixed(2),
+          total: cogs.total.toFixed(2),
+        },
         fees: {
           commission: lineFees.commission.toFixed(2),
           fba_fulfillment: lineFees.fba_fulfillment.toFixed(2),
@@ -909,13 +924,21 @@ app.get('/api/pnl', async (req, res) => {
         product_contribution: productContribution.toFixed(2),
         margin_pct: marginPct.toFixed(1),
         roi_pct: roiPct.toFixed(1),
-        // Fixed Fees — account-wide costs that can't be attributed to a product, bridging
-        // Product Contribution down to Profit.
-        fixed_fees: {
-          account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
-          account_fees_total: accountFeesTotal.toFixed(2),
-          adjustments: adjustments.toFixed(2),
-          total: fixedFeesTotal.toFixed(2),
+        // OPEX — account-wide operating expenses that can't be attributed to a specific
+        // product, bridging Product Contribution down to Profit. Headcount and Fixed Costs
+        // are scaffolded categories with no data source yet (always 0); Other Fees holds
+        // everything Amazon charges at the account level (subscription, storage, coupons)
+        // plus inventory Adjustments.
+        opex: {
+          headcount: { total: headcountTotal.toFixed(2) },
+          fixed_costs: { total: fixedCostsTotal.toFixed(2) },
+          other_fees: {
+            account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
+            account_fees_total: accountFeesTotal.toFixed(2),
+            adjustments: adjustments.toFixed(2),
+            total: otherFeesTotal.toFixed(2),
+          },
+          total: opexTotal.toFixed(2),
         },
         profit: profit.toFixed(2),
         profit_pct: profitPct.toFixed(1),
@@ -943,7 +966,11 @@ app.get('/api/pnl', async (req, res) => {
       acc.units_sold += parseInt(r.units_sold || 0, 10);
       acc.gross_sales += parseFloat(r.gross_sales || 0);
       acc.total_discounts += parseFloat(r.total_discounts || 0);
-      acc.total_cogs += parseFloat(r.total_cogs || 0);
+      acc.cogs_standard += parseFloat(r.cogs_standard || 0);
+      acc.cogs_freight += parseFloat(r.cogs_freight || 0);
+      acc.cogs_demurrage += parseFloat(r.cogs_demurrage || 0);
+      acc.cogs_quality += parseFloat(r.cogs_quality || 0);
+      acc.cogs_other += parseFloat(r.cogs_other || 0);
       acc.fee_commission += parseFloat(r.fee_commission || 0);
       acc.fee_fba_fulfillment += parseFloat(r.fee_fba_fulfillment || 0);
       acc.fee_fixed_closing += parseFloat(r.fee_fixed_closing || 0);
@@ -952,7 +979,7 @@ app.get('/api/pnl', async (req, res) => {
       acc.fee_giftwrap += parseFloat(r.fee_giftwrap || 0);
       acc.fee_shipping_chargeback += parseFloat(r.fee_shipping_chargeback || 0);
       return acc;
-    }, { units_sold: 0, gross_sales: 0, total_discounts: 0, total_cogs: 0, fee_commission: 0, fee_fba_fulfillment: 0, fee_fixed_closing: 0, fee_variable_closing: 0, fee_digital_services: 0, fee_giftwrap: 0, fee_shipping_chargeback: 0 });
+    }, { units_sold: 0, gross_sales: 0, total_discounts: 0, cogs_standard: 0, cogs_freight: 0, cogs_demurrage: 0, cogs_quality: 0, cogs_other: 0, fee_commission: 0, fee_fba_fulfillment: 0, fee_fixed_closing: 0, fee_variable_closing: 0, fee_digital_services: 0, fee_giftwrap: 0, fee_shipping_chargeback: 0 });
     totalRaw.period = '__total__';
     // Total refunds/ppc/account-fees/adjustments are just the sum over all real periods —
     // captured before adding the '__total__' key itself, so it can't fold into its own sum.
