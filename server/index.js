@@ -787,15 +787,29 @@ app.get('/api/pnl', async (req, res) => {
       GROUP BY 1, 2, 3
     `, [dateFrom, dateTo]);
 
+    // MCF (Multi-Channel Fulfillment) fees — Amazon charges the account to fulfil a Shopify
+    // order out of FBA inventory. The fee itself comes from Amazon's Financial Events (same
+    // sync as the other account-level fees), so it's a product-attributable Amazon cost even
+    // though the underlying order is a Shopify order — shown as its own line under Fees,
+    // grouped independently of the Amazon order-line filters above (fulfillment/order_type/
+    // search/brand don't apply to a Shopify-side order).
+    const mcfResult = await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', fee_date)::date AS period, SUM(fee_amount)::numeric AS mcf_fees
+      FROM amazon_mcf_fees WHERE fee_date::date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]);
+
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
-    // Index refunds/PPC by period key for merging
+    // Index refunds/PPC/MCF by period key for merging
     const refundsByPeriod = {};
     for (const r of refundsResult.rows) refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
     const ppcByPeriod = {};
     for (const r of ppcResult.rows) ppcByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.ppc_cost || 0);
+    const mcfByPeriod = {};
+    for (const r of mcfResult.rows) mcfByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.mcf_fees || 0);
 
     // Account fees: group by period, split into (a) named fee_type rows for display and
     // (b) an Adjustments total, per period. Also track fee_type totals across the whole
@@ -838,6 +852,9 @@ app.get('/api/pnl', async (req, res) => {
         digital_services: -fx(r?.fee_digital_services || 0),
         giftwrap: -fx(r?.fee_giftwrap || 0),
         shipping_chargeback: -fx(r?.fee_shipping_chargeback || 0),
+        // MCF fee is period-keyed independently (from amazon_mcf_fees), not part of the Amazon
+        // order-line query above, since the underlying order is a Shopify order fulfilled via FBA.
+        mcf: -fx(mcfByPeriod[periodKey] || 0),
       };
       const lineFeesTotal = Object.values(lineFees).reduce((s, v) => s + v, 0); // negative
       const accountFeesRaw = accountFeesByPeriod[periodKey] || {};
@@ -884,6 +901,7 @@ app.get('/api/pnl', async (req, res) => {
           digital_services: lineFees.digital_services.toFixed(2),
           giftwrap: lineFees.giftwrap.toFixed(2),
           shipping_chargeback: lineFees.shipping_chargeback.toFixed(2),
+          mcf: lineFees.mcf.toFixed(2),
           total: lineFeesTotal.toFixed(2),
         },
         ppc_cost: ppcCost.toFixed(2),
@@ -912,6 +930,7 @@ app.get('/api/pnl', async (req, res) => {
       ...Object.keys(ppcByPeriod),
       ...Object.keys(accountFeesByPeriod),
       ...Object.keys(adjustmentsByPeriod),
+      ...Object.keys(mcfByPeriod),
     ]);
     const linesByPeriod = {};
     for (const r of linesResult.rows) linesByPeriod[r.period.toISOString().split('T')[0]] = r;
@@ -942,6 +961,7 @@ app.get('/api/pnl', async (req, res) => {
     refundsByPeriod['__total__'] = sumMap(refundsByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
     adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
+    mcfByPeriod['__total__'] = sumMap(mcfByPeriod);
     accountFeesByPeriod['__total__'] = {};
     for (const ft of accountFeeTypes) {
       accountFeesByPeriod['__total__'][ft] = perPeriodAccountFees.reduce((s, m) => s + (m[ft] || 0), 0);
@@ -1080,7 +1100,7 @@ app.get('/api/product-breakdown', async (req, res) => {
             AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
           ORDER BY effective_from DESC LIMIT 1
         ) ce ON true
-        LEFT JOIN shopify_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
+        LEFT JOIN amazon_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
         LEFT JOIN (
           SELECT shopify_order_id, SUM(line_gross) AS order_gross
           FROM shopify_order_lines GROUP BY shopify_order_id
@@ -1352,7 +1372,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         ), 0)::numeric AS mcf_fees
       FROM shopify_order_lines sol
       JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
-      LEFT JOIN shopify_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN amazon_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
       LEFT JOIN (
         SELECT shopify_order_id, SUM(line_gross) AS order_gross
         FROM shopify_order_lines GROUP BY shopify_order_id
@@ -1891,6 +1911,7 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
         AND (aol.is_estimated_fee IS NULL OR aol.is_estimated_fee = FALSE)
         AND aol.asin IS NOT NULL
         AND COALESCE(NULLIF(aol.unit_price, 0), lp.last_price) > 0
+      ORDER BY ao.order_date DESC
     `);
     if (!linesResult.rows.length) {
       return res.json({ ok: true, message: 'No unsettled lines need fee estimates', estimated: 0 });
