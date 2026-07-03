@@ -231,8 +231,16 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
                 ? <span style={{ fontSize: 12, fontFamily: 'var(--mono)', fontWeight: 700, color: parseFloat(c.gross_profit) >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(c.gross_profit)}</span>
                 : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
             </div>
-            {/* ROI */}
-            <div style={{ padding: '0 8px', fontSize: 11, color: 'var(--muted)' }}>—</div>
+            {/* ROI — Product Contribution / COGS. At country level, gross_profit already is the
+                contribution (no PPC deducted here, since ad spend isn't tracked per-country). */}
+            <div style={{ padding: '0 8px' }}>
+              {c.has_cogs && parseFloat(c.total_cogs) > 0
+                ? (() => {
+                    const roi = parseFloat(c.gross_profit) / parseFloat(c.total_cogs) * 100;
+                    return <span style={{ fontSize: 12, fontFamily: 'var(--mono)', fontWeight: 700, color: roi >= 100 ? 'var(--green)' : roi >= 40 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(roi)}</span>;
+                  })()
+                : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
+            </div>
             {/* ACOS */}
             <div style={{ padding: '0 8px', fontSize: 11, color: 'var(--muted)' }}>—</div>
             {/* Breakdown */}
@@ -372,7 +380,11 @@ export default function ProductBreakdown() {
           const netRev = parseFloat(row.net_revenue || 0);
           const marginPct = parseFloat(row.gross_margin_pct || 0);
           const productContribution = parseFloat(row.product_contribution ?? row.gross_profit ?? 0);
-          const hasCogs = parseFloat(row.total_cogs || 0) > 0;
+          const totalCogs = parseFloat(row.total_cogs || 0);
+          const hasCogs = totalCogs > 0;
+          // Product Breakdown ROI = Product Contribution / COGS (per-SKU, before OPEX is
+          // allocated) — distinct from the P&L page's ROI, which is Profit / COGS.
+          const roiPct = hasCogs ? (productContribution / totalCogs * 100) : 0;
           const hasPpc = parseFloat(row.ppc_cost || 0) > 0;
           const ppcUnits = parseInt(row.ppc_units || 0, 10);
           const organicUnits = Math.max(parseInt(row.units_sold || 0, 10) - ppcUnits, 0);
@@ -429,7 +441,7 @@ export default function ProductBreakdown() {
                   ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
                 </div>
 
-                {/* Prod Contrib £ */}
+                {/* Contribution £ */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {hasCogs ? (
                     <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: productContribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(productContribution)}</span>
@@ -440,7 +452,11 @@ export default function ProductBreakdown() {
 
                 {/* ROI */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
-                  <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>
+                  {hasCogs ? (
+                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: roiPct >= 100 ? 'var(--green)' : roiPct >= 40 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(roiPct)}</span>
+                  ) : (
+                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>
+                  )}
                 </div>
 
                 {/* ACOS */}

@@ -103,8 +103,8 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('  Other Fees', 'opex.other_fees.total');
   pushRow('Total OPEX', 'opex.total');
   pushRow('Profit', 'profit');
-  pushRow('Net Profit %', 'profit_pct');
   pushRow('Margin %', 'margin_pct');
+  pushRow('Net Profit %', 'profit_pct');
   pushRow('ROI %', 'roi_pct');
 
   const csv = [cols.join(','), ...rows.map(r => r.map(v => `"${v}"`).join(','))].join('\n');
@@ -330,8 +330,8 @@ export default function PnL() {
                 )}
 
                 <ValueRow label="Profit" keyPath="profit" bold highlight />
-                <ValueRow label="Net Profit %" keyPath="profit_pct" kind="pct" />
                 <ValueRow label="Margin %" keyPath="margin_pct" kind="pct" />
+                <ValueRow label="Net Profit %" keyPath="profit_pct" kind="pct" />
                 <ValueRow label="ROI %" keyPath="roi_pct" kind="pct" />
               </>
             )}
