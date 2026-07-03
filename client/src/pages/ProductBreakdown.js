@@ -61,7 +61,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
     const p = pct(n);
     const color = v < 0 ? 'var(--red)' : isBase ? 'var(--text)' : v === 0 ? 'var(--muted)' : 'var(--text)';
     const pctColor = Math.abs(p) < 0.01 ? 'var(--muted)' : p < 0 ? '#f8717180' : '#6b6b80';
-    const display = v < 0 ? `−${s}${Math.abs(v).toFixed(2)}` : `${s}${v.toFixed(2)}`;
+    const display = v < 0 ? `−${s}${Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${s}${v.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
     const pctDisplay = `(${p >= 0 ? '' : ''}${p.toFixed(1)}%)`;
     return (
       <span style={{ fontFamily: 'var(--mono)', fontSize: 12, color, whiteSpace: 'nowrap' }}>
@@ -124,7 +124,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: margin >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (margin >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Margin</span>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
-          {margin < 0 ? `−${s}${Math.abs(margin).toFixed(2)}` : `${s}${margin.toFixed(2)}`}
+          {margin < 0 ? `−${s}${Math.abs(margin).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${s}${margin.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({marginPct.toFixed(1)}%)</span>
         </span>
       </div>
@@ -136,7 +136,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: contribution >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (contribution >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
         <span style={{ fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)' }}>Product Contribution</span>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
-          {contribution < 0 ? `−${s}${Math.abs(contribution).toFixed(2)}` : `${s}${contribution.toFixed(2)}`}
+          {contribution < 0 ? `−${s}${Math.abs(contribution).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${s}${contribution.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({contributionPct.toFixed(1)}%)</span>
         </span>
       </div>
