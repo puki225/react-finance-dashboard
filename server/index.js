@@ -889,7 +889,11 @@ app.get('/api/pnl', async (req, res) => {
 
       const marginPct = netSales > 0 ? (productContribution / netSales * 100) : 0;
       const cogsMagnitude = Math.abs(cogs.total);
-      const roiPct = cogsMagnitude > 0 ? (productContribution / cogsMagnitude * 100) : 0;
+      // P&L page ROI = Profit / COGS (account-wide bottom line vs. cost of goods) — distinct
+      // from the Product Breakdown page's ROI, which is Product Contribution / COGS (per-SKU,
+      // before OPEX is allocated). Profit is computed above, so this always reflects the
+      // post-OPEX bottom line.
+      const roiPct = cogsMagnitude > 0 ? (profit / cogsMagnitude * 100) : 0;
       const profitPct = netSales > 0 ? (profit / netSales * 100) : 0;
 
       return {
