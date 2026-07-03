@@ -178,15 +178,19 @@ export default function PnL() {
   // `indent` accepts a nesting level (0, 1, 2, ...) so sub-groups within a sub-group (e.g.
   // OPEX -> Other Fees -> individual fee types) can indent one step further than a top-level
   // sub-row (e.g. OPEX -> Headcount). A plain boolean is still accepted for level 1.
-  const LabelCell = ({ children, bold, indent, onClick, expandable, expanded }) => {
+  const LabelCell = ({ children, bold, indent, onClick, expandable, expanded, bg }) => {
     const level = typeof indent === 'number' ? indent : (indent ? 1 : 0);
+    // Sticky column needs an opaque backdrop (so scrolled-under period cells don't show through),
+    // but should still pick up the row's revenue/cost tint — layer the tint as a flat gradient
+    // over the solid page background rather than using it as a plain (semi-transparent) fill.
+    const background = !bg || bg === 'transparent' ? 'var(--bg2)' : `linear-gradient(${bg}, ${bg}), var(--bg2)`;
     return (
       <div
         onClick={onClick}
         style={{
           padding: '9px 10px', fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400,
           color: bold ? 'var(--text)' : 'var(--muted)', paddingLeft: 10 + level * 18,
-          position: 'sticky', left: 0, background: 'var(--bg2)', display: 'flex', alignItems: 'center', gap: 6,
+          position: 'sticky', left: 0, background, display: 'flex', alignItems: 'center', gap: 6,
           cursor: expandable ? 'pointer' : 'default', userSelect: 'none', whiteSpace: 'nowrap',
         }}
       >
@@ -196,7 +200,12 @@ export default function PnL() {
     );
   };
 
-  function ValueRow({ label, keyPath, kind = 'currency', bold, indent, highlight, onClick, expandable, expanded }) {
+  // `highlight` tints a row's background pale green — used for revenue/margin bottom-line rows
+  // (Net Sales, Gross Margin, Product Contribution, Profit). `cost` tints it pale red — used for
+  // every cost/fee/deduction row (Discounts, Refunds, COGS, Fees, PPC, OPEX). This gives the grid
+  // a quick visual split between money coming in vs. money going out, on top of the existing
+  // per-value red/green text coloring.
+  function ValueRow({ label, keyPath, kind = 'currency', bold, indent, highlight, cost, onClick, expandable, expanded }) {
     const rowTotal = getPath(totals, keyPath);
     const fmtVal = (v) => kind === 'number' ? fmtNum(v) : kind === 'pct' ? fmtPct(v) : fmt(v);
     const colorFor = (v) => {
@@ -205,9 +214,10 @@ export default function PnL() {
       if (kind === 'pct') return n >= 20 ? 'var(--green)' : n >= 0 ? 'var(--amber)' : 'var(--red)';
       return n < 0 ? 'var(--red)' : highlight ? 'var(--green)' : 'var(--text)';
     };
+    const rowBg = highlight ? '#34d3990c' : cost ? '#f8717109' : 'transparent';
     return (
-      <div style={{ display: 'grid', gridTemplateColumns: colTemplate, borderBottom: '1px solid var(--border)', background: highlight ? '#34d39908' : 'transparent' }}>
-        <LabelCell bold={bold} indent={indent} onClick={onClick} expandable={expandable} expanded={expanded}>{label}</LabelCell>
+      <div style={{ display: 'grid', gridTemplateColumns: colTemplate, borderBottom: '1px solid var(--border)', background: rowBg }}>
+        <LabelCell bold={bold} indent={indent} onClick={onClick} expandable={expandable} expanded={expanded} bg={rowBg}>{label}</LabelCell>
         {periods.map((p, i) => (<Cell key={i} bold={bold} color={colorFor(getPath(p, keyPath))}>{fmtVal(getPath(p, keyPath))}</Cell>))}
         <Cell bold color={colorFor(rowTotal)}>{fmtVal(rowTotal)}</Cell>
       </div>
@@ -274,31 +284,31 @@ export default function PnL() {
             {!loading && periods.length > 0 && (
               <>
                 <ValueRow label="Units Sold" keyPath="units_sold" kind="number" />
-                <ValueRow label="Gross Sales" keyPath="gross_sales" bold />
-                <ValueRow label="Discounts / Promos" keyPath="total_discounts" indent />
-                <ValueRow label="Refunds" keyPath="total_refunded" indent />
+                <ValueRow label="Gross Sales" keyPath="gross_sales" bold highlight />
+                <ValueRow label="Discounts / Promos" keyPath="total_discounts" indent cost />
+                <ValueRow label="Refunds" keyPath="total_refunded" indent cost />
                 <ValueRow label="Net Sales" keyPath="net_sales" bold highlight />
 
                 <ValueRow
-                  label="Seller COGS" keyPath="cogs.total" bold
+                  label="Seller COGS" keyPath="cogs.total" bold cost
                   expandable expanded={cogsExpanded}
                   onClick={() => setCogsExpanded(s => !s)}
                 />
                 {cogsExpanded && cogsRows.map(([key, label]) => (
-                  <ValueRow key={key} label={label} keyPath={`cogs.${key}`} indent />
+                  <ValueRow key={key} label={label} keyPath={`cogs.${key}`} indent cost />
                 ))}
 
                 <ValueRow
-                  label="Fees" keyPath="fees.total" bold
+                  label="Fees" keyPath="fees.total" bold cost
                   expandable expanded={feesExpanded}
                   onClick={() => setFeesExpanded(s => !s)}
                 />
                 {feesExpanded && lineFeeRows.map(([key, label]) => (
-                  <ValueRow key={key} label={label} keyPath={`fees.${key}`} indent />
+                  <ValueRow key={key} label={label} keyPath={`fees.${key}`} indent cost />
                 ))}
 
                 <ValueRow label="Gross Margin" keyPath="gross_margin" bold highlight />
-                <ValueRow label="PPC Spend" keyPath="ppc_cost" indent />
+                <ValueRow label="PPC Spend" keyPath="ppc_cost" indent cost />
                 <ValueRow label="Product Contribution" keyPath="product_contribution" bold highlight />
 
                 {/* OPEX — account-wide operating expenses that can't be attributed to a
@@ -307,24 +317,24 @@ export default function PnL() {
                     categories (no data source yet); Other Fees holds everything Amazon
                     charges at the account level plus inventory Adjustments. */}
                 <ValueRow
-                  label="OPEX" keyPath="opex.total" bold
+                  label="OPEX" keyPath="opex.total" bold cost
                   expandable expanded={opexExpanded}
                   onClick={() => setOpexExpanded(s => !s)}
                 />
                 {opexExpanded && (
                   <>
-                    <ValueRow label="Headcount" keyPath="opex.headcount.total" indent={1} />
-                    <ValueRow label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} />
+                    <ValueRow label="Headcount" keyPath="opex.headcount.total" indent={1} cost />
+                    <ValueRow label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} cost />
                     <ValueRow
-                      label="Other Fees" keyPath="opex.other_fees.total" indent={1}
+                      label="Other Fees" keyPath="opex.other_fees.total" indent={1} cost
                       expandable expanded={otherFeesExpanded}
                       onClick={() => setOtherFeesExpanded(s => !s)}
                     />
                     {otherFeesExpanded && accountFeeRows.map(ft => (
-                      <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`opex.other_fees.account_fees.${ft}`} indent={2} />
+                      <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`opex.other_fees.account_fees.${ft}`} indent={2} cost />
                     ))}
                     {otherFeesExpanded && hasAdjustments && (
-                      <ValueRow label="Adjustments" keyPath="opex.other_fees.adjustments" indent={2} />
+                      <ValueRow label="Adjustments" keyPath="opex.other_fees.adjustments" indent={2} cost />
                     )}
                   </>
                 )}
