@@ -3,6 +3,21 @@ import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import KpiCard from '../components/KpiCard';
 import { useApi } from '../hooks/useApi';
 
+// Product-attributable fee line items — shared between the grid and CSV export so labels
+// stay consistent. MCF (Multi-Channel Fulfillment) is an Amazon-charged fee for using FBA to
+// fulfil a Shopify order — it's still a product-level cost, just sourced from amazon_mcf_fees
+// (period-keyed) instead of the per-order-line Amazon fee columns.
+const LINE_FEE_LABELS = [
+  ['commission', 'Commission'],
+  ['fba_fulfillment', 'FBA Fulfillment'],
+  ['fixed_closing', 'Fixed Closing Fee'],
+  ['variable_closing', 'Variable Closing Fee'],
+  ['digital_services', 'Digital Services'],
+  ['giftwrap', 'Giftwrap Chargeback'],
+  ['shipping_chargeback', 'Shipping Chargeback'],
+  ['mcf', 'MCF'],
+];
+
 const GROUPS = ['day', 'week', 'month', 'year'];
 const FULFILLMENT = [{ id: 'all', label: 'All' }, { id: 'FBA', label: 'FBA' }, { id: 'FBM', label: 'FBM' }];
 const ORDER_TYPE = [{ id: 'all', label: 'All' }, { id: 'B2B', label: 'B2B' }, { id: 'B2C', label: 'B2C' }];
@@ -59,8 +74,8 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('Refunds', 'total_refunded');
   pushRow('Net Sales', 'net_sales');
   pushRow('Seller COGS', 'cogs.total');
-  for (const ft of ['commission', 'fba_fulfillment', 'fixed_closing', 'variable_closing', 'digital_services', 'giftwrap', 'shipping_chargeback']) {
-    if (parseFloat(getPath(totals, `fees.${ft}`) || 0) !== 0) pushRow('  ' + prettifyFeeType(ft), `fees.${ft}`);
+  for (const [key, label] of LINE_FEE_LABELS) {
+    if (parseFloat(getPath(totals, `fees.${key}`) || 0) !== 0) pushRow('  ' + label, `fees.${key}`);
   }
   pushRow('Total Product Fees', 'fees.total');
   pushRow('Gross Margin', 'gross_margin');
@@ -118,15 +133,7 @@ export default function PnL() {
   const accountFeeTypes = data?.account_fee_types || [];
 
   const lineFeeRows = useMemo(() => (
-    [
-      ['commission', 'Commission'],
-      ['fba_fulfillment', 'FBA Fulfillment'],
-      ['fixed_closing', 'Fixed Closing Fee'],
-      ['variable_closing', 'Variable Closing Fee'],
-      ['digital_services', 'Digital Services'],
-      ['giftwrap', 'Giftwrap Chargeback'],
-      ['shipping_chargeback', 'Shipping Chargeback'],
-    ].filter(([key]) => parseFloat(getPath(totals, `fees.${key}`) || 0) !== 0)
+    LINE_FEE_LABELS.filter(([key]) => parseFloat(getPath(totals, `fees.${key}`) || 0) !== 0)
   ), [totals]);
 
   const accountFeeRows = useMemo(() => (
