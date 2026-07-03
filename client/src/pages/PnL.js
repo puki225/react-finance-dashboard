@@ -1,6 +1,5 @@
 import React, { useState, useMemo } from 'react';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
-import KpiCard from '../components/KpiCard';
 import { useApi } from '../hooks/useApi';
 
 // Product-attributable fee line items — shared between the grid and CSV export so labels
@@ -93,8 +92,6 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('Gross Margin', 'gross_margin');
   pushRow('PPC Spend', 'ppc_cost');
   pushRow('Product Contribution', 'product_contribution');
-  pushRow('Margin %', 'margin_pct');
-  pushRow('ROI %', 'roi_pct');
   // OPEX — account-wide operating expenses not attributable to a product, bridging Product
   // Contribution down to Profit.
   pushRow('Headcount', 'opex.headcount.total');
@@ -107,6 +104,8 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('Total OPEX', 'opex.total');
   pushRow('Profit', 'profit');
   pushRow('Net Profit %', 'profit_pct');
+  pushRow('Margin %', 'margin_pct');
+  pushRow('ROI %', 'roi_pct');
 
   const csv = [cols.join(','), ...rows.map(r => r.map(v => `"${v}"`).join(','))].join('\n');
   const blob = new Blob([csv], { type: 'text/csv' });
@@ -301,8 +300,6 @@ export default function PnL() {
                 <ValueRow label="Gross Margin" keyPath="gross_margin" bold highlight />
                 <ValueRow label="PPC Spend" keyPath="ppc_cost" indent />
                 <ValueRow label="Product Contribution" keyPath="product_contribution" bold highlight />
-                <ValueRow label="Margin %" keyPath="margin_pct" kind="pct" />
-                <ValueRow label="ROI %" keyPath="roi_pct" kind="pct" />
 
                 {/* OPEX — account-wide operating expenses that can't be attributed to a
                     specific product. This is the bridge between Product Contribution and
@@ -334,25 +331,13 @@ export default function PnL() {
 
                 <ValueRow label="Profit" keyPath="profit" bold highlight />
                 <ValueRow label="Net Profit %" keyPath="profit_pct" kind="pct" />
+                <ValueRow label="Margin %" keyPath="margin_pct" kind="pct" />
+                <ValueRow label="ROI %" keyPath="roi_pct" kind="pct" />
               </>
             )}
           </div>
         </div>
       </div>
-
-      {/* Bottom-line KPI */}
-      {!loading && periods.length > 0 && (
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
-          <KpiCard
-            label="Profit %"
-            value={totals.profit_pct}
-            type="percent"
-            color={parseFloat(totals.profit_pct || 0) >= 0 ? '#34d399' : '#f87171'}
-            sub={fmt(totals.profit) + ' profit'}
-            symbol={sym}
-          />
-        </div>
-      )}
     </div>
   );
 }
