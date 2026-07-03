@@ -77,6 +77,9 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
     rows.push([label, ...periods.map(p => getPath(p, key)), getPath(totals, key)]);
   };
   pushRow('Units Sold', 'units_sold');
+  pushRow('  Refunded Units', 'units_refunded');
+  pushRow('  Organic Units', 'organic_units');
+  pushRow('  PPC Units', 'ppc_units');
   pushRow('Gross Sales', 'gross_sales');
   pushRow('Discounts / Promos', 'total_discounts');
   pushRow('Refunds', 'total_refunded');
@@ -100,7 +103,7 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
     if (parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0) pushRow('    ' + prettifyFeeType(ft), `opex.other_fees.account_fees.${ft}`);
   }
   if (parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0) pushRow('    Adjustments', 'opex.other_fees.adjustments');
-  pushRow('  Other Fees', 'opex.other_fees.total');
+  pushRow('  Other Fees - Non-Product Related', 'opex.other_fees.total');
   pushRow('Total OPEX', 'opex.total');
   pushRow('Profit', 'profit');
   pushRow('Margin %', 'margin_pct');
@@ -124,6 +127,7 @@ export default function PnL() {
   const [fulfillment, setFulfillment] = useState(() => localStorage.getItem('gb_pnl_fulfillment') || 'all');
   const [orderType, setOrderType] = useState(() => localStorage.getItem('gb_pnl_order_type') || 'all');
   const [search, setSearch] = useState('');
+  const [unitsExpanded, setUnitsExpanded] = useState(true);
   const [cogsExpanded, setCogsExpanded] = useState(true);
   const [feesExpanded, setFeesExpanded] = useState(true);
   const [opexExpanded, setOpexExpanded] = useState(true);
@@ -283,7 +287,18 @@ export default function PnL() {
 
             {!loading && periods.length > 0 && (
               <>
-                <ValueRow label="Units Sold" keyPath="units_sold" kind="number" />
+                <ValueRow
+                  label="Units Sold" keyPath="units_sold" kind="number"
+                  expandable expanded={unitsExpanded}
+                  onClick={() => setUnitsExpanded(s => !s)}
+                />
+                {unitsExpanded && (
+                  <>
+                    <ValueRow label="Refunded Units" keyPath="units_refunded" kind="number" indent cost />
+                    <ValueRow label="Organic Units" keyPath="organic_units" kind="number" indent />
+                    <ValueRow label="PPC Units" keyPath="ppc_units" kind="number" indent />
+                  </>
+                )}
                 <ValueRow label="Gross Sales" keyPath="gross_sales" bold highlight />
                 <ValueRow label="Discounts / Promos" keyPath="total_discounts" indent cost />
                 <ValueRow label="Refunds" keyPath="total_refunded" indent cost />
@@ -326,7 +341,7 @@ export default function PnL() {
                     <ValueRow label="Headcount" keyPath="opex.headcount.total" indent={1} cost />
                     <ValueRow label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} cost />
                     <ValueRow
-                      label="Other Fees" keyPath="opex.other_fees.total" indent={1} cost
+                      label="Other Fees - Non-Product Related" keyPath="opex.other_fees.total" indent={1} cost
                       expandable expanded={otherFeesExpanded}
                       onClick={() => setOtherFeesExpanded(s => !s)}
                     />
