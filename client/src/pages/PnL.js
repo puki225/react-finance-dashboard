@@ -18,6 +18,15 @@ const LINE_FEE_LABELS = [
   ['mcf', 'MCF'],
 ];
 
+// COGS component breakdown — same labels used on the Product Breakdown page's per-SKU panel.
+const COGS_LABELS = [
+  ['standard', 'Standard COGS'],
+  ['freight', 'Freight'],
+  ['demurrage', 'Demurrage / Duties'],
+  ['quality', 'Quality / Inspection'],
+  ['other', 'Other COGS'],
+];
+
 const GROUPS = ['day', 'week', 'month', 'year'];
 const FULFILLMENT = [{ id: 'all', label: 'All' }, { id: 'FBA', label: 'FBA' }, { id: 'FBM', label: 'FBM' }];
 const ORDER_TYPE = [{ id: 'all', label: 'All' }, { id: 'B2B', label: 'B2B' }, { id: 'B2C', label: 'B2C' }];
@@ -73,7 +82,10 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('Discounts / Promos', 'total_discounts');
   pushRow('Refunds', 'total_refunded');
   pushRow('Net Sales', 'net_sales');
-  pushRow('Seller COGS', 'cogs.total');
+  for (const [key, label] of COGS_LABELS) {
+    if (parseFloat(getPath(totals, `cogs.${key}`) || 0) !== 0) pushRow('  ' + label, `cogs.${key}`);
+  }
+  pushRow('Total Seller COGS', 'cogs.total');
   for (const [key, label] of LINE_FEE_LABELS) {
     if (parseFloat(getPath(totals, `fees.${key}`) || 0) !== 0) pushRow('  ' + label, `fees.${key}`);
   }
@@ -83,13 +95,16 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   pushRow('Product Contribution', 'product_contribution');
   pushRow('Margin %', 'margin_pct');
   pushRow('ROI %', 'roi_pct');
-  // Fixed Fees — account-wide costs not attributable to a product, bridging Product
+  // OPEX — account-wide operating expenses not attributable to a product, bridging Product
   // Contribution down to Profit.
+  pushRow('Headcount', 'opex.headcount.total');
+  pushRow('Fixed Costs', 'opex.fixed_costs.total');
   for (const ft of accountFeeTypes) {
-    if (parseFloat(getPath(totals, `fixed_fees.account_fees.${ft}`) || 0) !== 0) pushRow('  ' + prettifyFeeType(ft), `fixed_fees.account_fees.${ft}`);
+    if (parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0) pushRow('    ' + prettifyFeeType(ft), `opex.other_fees.account_fees.${ft}`);
   }
-  if (parseFloat(getPath(totals, 'fixed_fees.adjustments') || 0) !== 0) pushRow('  Adjustments', 'fixed_fees.adjustments');
-  pushRow('Total Fixed Fees', 'fixed_fees.total');
+  if (parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0) pushRow('    Adjustments', 'opex.other_fees.adjustments');
+  pushRow('  Other Fees', 'opex.other_fees.total');
+  pushRow('Total OPEX', 'opex.total');
   pushRow('Profit', 'profit');
   pushRow('Net Profit %', 'profit_pct');
 
@@ -110,8 +125,10 @@ export default function PnL() {
   const [fulfillment, setFulfillment] = useState(() => localStorage.getItem('gb_pnl_fulfillment') || 'all');
   const [orderType, setOrderType] = useState(() => localStorage.getItem('gb_pnl_order_type') || 'all');
   const [search, setSearch] = useState('');
+  const [cogsExpanded, setCogsExpanded] = useState(true);
   const [feesExpanded, setFeesExpanded] = useState(true);
-  const [fixedFeesExpanded, setFixedFeesExpanded] = useState(true);
+  const [opexExpanded, setOpexExpanded] = useState(true);
+  const [otherFeesExpanded, setOtherFeesExpanded] = useState(true);
 
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_pnl_range', JSON.stringify(r)); };
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
@@ -132,15 +149,19 @@ export default function PnL() {
   const totals = data?.totals || {};
   const accountFeeTypes = data?.account_fee_types || [];
 
+  const cogsRows = useMemo(() => (
+    COGS_LABELS.filter(([key]) => parseFloat(getPath(totals, `cogs.${key}`) || 0) !== 0)
+  ), [totals]);
+
   const lineFeeRows = useMemo(() => (
     LINE_FEE_LABELS.filter(([key]) => parseFloat(getPath(totals, `fees.${key}`) || 0) !== 0)
   ), [totals]);
 
   const accountFeeRows = useMemo(() => (
-    accountFeeTypes.filter(ft => parseFloat(getPath(totals, `fixed_fees.account_fees.${ft}`) || 0) !== 0)
+    accountFeeTypes.filter(ft => parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0)
   ), [accountFeeTypes, totals]);
 
-  const hasAdjustments = parseFloat(getPath(totals, 'fixed_fees.adjustments') || 0) !== 0;
+  const hasAdjustments = parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0;
   const hasAccountFeeData = accountFeeRows.length > 0;
 
   const colTemplate = `220px repeat(${periods.length}, minmax(100px, 1fr)) 140px`;
@@ -155,20 +176,26 @@ export default function PnL() {
     </div>
   );
 
-  const LabelCell = ({ children, bold, indent, onClick, expandable, expanded }) => (
-    <div
-      onClick={onClick}
-      style={{
-        padding: '9px 10px', fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400,
-        color: bold ? 'var(--text)' : 'var(--muted)', paddingLeft: indent ? 28 : 10,
-        position: 'sticky', left: 0, background: 'var(--bg2)', display: 'flex', alignItems: 'center', gap: 6,
-        cursor: expandable ? 'pointer' : 'default', userSelect: 'none', whiteSpace: 'nowrap',
-      }}
-    >
-      {expandable && <span style={{ fontSize: 10, color: 'var(--accent2)', width: 10, display: 'inline-block' }}>{expanded ? '▾' : '▸'}</span>}
-      {children}
-    </div>
-  );
+  // `indent` accepts a nesting level (0, 1, 2, ...) so sub-groups within a sub-group (e.g.
+  // OPEX -> Other Fees -> individual fee types) can indent one step further than a top-level
+  // sub-row (e.g. OPEX -> Headcount). A plain boolean is still accepted for level 1.
+  const LabelCell = ({ children, bold, indent, onClick, expandable, expanded }) => {
+    const level = typeof indent === 'number' ? indent : (indent ? 1 : 0);
+    return (
+      <div
+        onClick={onClick}
+        style={{
+          padding: '9px 10px', fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400,
+          color: bold ? 'var(--text)' : 'var(--muted)', paddingLeft: 10 + level * 18,
+          position: 'sticky', left: 0, background: 'var(--bg2)', display: 'flex', alignItems: 'center', gap: 6,
+          cursor: expandable ? 'pointer' : 'default', userSelect: 'none', whiteSpace: 'nowrap',
+        }}
+      >
+        {expandable && <span style={{ fontSize: 10, color: 'var(--accent2)', width: 10, display: 'inline-block' }}>{expanded ? '▾' : '▸'}</span>}
+        {children}
+      </div>
+    );
+  };
 
   function ValueRow({ label, keyPath, kind = 'currency', bold, indent, highlight, onClick, expandable, expanded }) {
     const rowTotal = getPath(totals, keyPath);
@@ -195,7 +222,7 @@ export default function PnL() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>P&L</h1>
-          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Amazon only — Product Contribution reflects per-product economics; Fixed Fees bridge to Profit</p>
+          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Amazon only — Product Contribution reflects per-product economics; OPEX bridges to Profit</p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
@@ -225,7 +252,7 @@ export default function PnL() {
       {!loading && !hasAccountFeeData && (
         <div style={{ background: '#fbbf2412', border: '1px solid #fbbf2440', borderRadius: 10, padding: '12px 16px', fontSize: 12, color: '#fbbf24', display: 'flex', alignItems: 'center', gap: 8 }}>
           <span style={{ fontSize: 15 }}>⚠</span>
-          No account-level fee data yet (subscription, storage, coupons). Run the Amazon Finances sync to backfill this — until then, Fixed Fees below will read £0 and Profit will equal Product Contribution.
+          No account-level fee data yet (subscription, storage, coupons). Run the Amazon Finances sync to backfill this — until then, OPEX's Other Fees will read £0 and Profit will equal Product Contribution.
         </div>
       )}
 
@@ -252,7 +279,15 @@ export default function PnL() {
                 <ValueRow label="Discounts / Promos" keyPath="total_discounts" indent />
                 <ValueRow label="Refunds" keyPath="total_refunded" indent />
                 <ValueRow label="Net Sales" keyPath="net_sales" bold highlight />
-                <ValueRow label="Seller COGS" keyPath="cogs.total" bold />
+
+                <ValueRow
+                  label="Seller COGS" keyPath="cogs.total" bold
+                  expandable expanded={cogsExpanded}
+                  onClick={() => setCogsExpanded(s => !s)}
+                />
+                {cogsExpanded && cogsRows.map(([key, label]) => (
+                  <ValueRow key={key} label={label} keyPath={`cogs.${key}`} indent />
+                ))}
 
                 <ValueRow
                   label="Fees" keyPath="fees.total" bold
@@ -269,24 +304,32 @@ export default function PnL() {
                 <ValueRow label="Margin %" keyPath="margin_pct" kind="pct" />
                 <ValueRow label="ROI %" keyPath="roi_pct" kind="pct" />
 
-                {/* Fixed Fees — account-wide costs (subscription, storage, coupons, inventory
-                    adjustments) that can't be attributed to a specific product. This is the
-                    bridge between Product Contribution and the true bottom-line Profit. */}
-                <div style={{ display: 'grid', gridTemplateColumns: colTemplate, background: 'var(--bg3)' }}>
-                  <div style={{ padding: '7px 10px', fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', textTransform: 'uppercase', color: 'var(--muted)', position: 'sticky', left: 0, background: 'var(--bg3)', gridColumn: `1 / -1` }}>
-                    Fixed Fees — not attributable to a product
-                  </div>
-                </div>
+                {/* OPEX — account-wide operating expenses that can't be attributed to a
+                    specific product. This is the bridge between Product Contribution and
+                    the true bottom-line Profit. Headcount and Fixed Costs are placeholder
+                    categories (no data source yet); Other Fees holds everything Amazon
+                    charges at the account level plus inventory Adjustments. */}
                 <ValueRow
-                  label="Total Fixed Fees" keyPath="fixed_fees.total" bold
-                  expandable expanded={fixedFeesExpanded}
-                  onClick={() => setFixedFeesExpanded(s => !s)}
+                  label="OPEX" keyPath="opex.total" bold
+                  expandable expanded={opexExpanded}
+                  onClick={() => setOpexExpanded(s => !s)}
                 />
-                {fixedFeesExpanded && accountFeeRows.map(ft => (
-                  <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`fixed_fees.account_fees.${ft}`} indent />
-                ))}
-                {fixedFeesExpanded && hasAdjustments && (
-                  <ValueRow label="Adjustments" keyPath="fixed_fees.adjustments" indent />
+                {opexExpanded && (
+                  <>
+                    <ValueRow label="Headcount" keyPath="opex.headcount.total" indent={1} />
+                    <ValueRow label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} />
+                    <ValueRow
+                      label="Other Fees" keyPath="opex.other_fees.total" indent={1}
+                      expandable expanded={otherFeesExpanded}
+                      onClick={() => setOtherFeesExpanded(s => !s)}
+                    />
+                    {otherFeesExpanded && accountFeeRows.map(ft => (
+                      <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`opex.other_fees.account_fees.${ft}`} indent={2} />
+                    ))}
+                    {otherFeesExpanded && hasAdjustments && (
+                      <ValueRow label="Adjustments" keyPath="opex.other_fees.adjustments" indent={2} />
+                    )}
+                  </>
                 )}
 
                 <ValueRow label="Profit" keyPath="profit" bold highlight />
