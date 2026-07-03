@@ -20,7 +20,7 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
-// ─── FX HELPERS ───────────────────────────────────────────────
+// ─── FX HELPERS ──────────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
 async function getReportingCurrency() {
@@ -71,7 +71,7 @@ function currencySymbol(currency) {
   return { GBP: '£', USD: '$', EUR: '€' }[currency] || currency;
 }
 
-// ─── API ROUTES ───────────────────────────────────────────────
+// ─── API ROUTES ──────────────────────────────────────
 
 // KPI Summary
 app.get('/api/summary', async (req, res) => {
@@ -763,14 +763,14 @@ app.get('/api/pnl', async (req, res) => {
 
     // Refunds, attributed by refund_date (independent of the order population above)
     const refundsResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded)::numeric AS total_refunded
+      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded)::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
       FROM v_refunds_by_date WHERE channel = 'amazon' AND refund_date::date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
 
     // PPC spend, Amazon Ads only
     const ppcResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost)::numeric AS ppc_cost
+      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost)::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
       FROM amazon_ppc_product_performance WHERE report_date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -804,9 +804,19 @@ app.get('/api/pnl', async (req, res) => {
 
     // Index refunds/PPC/MCF by period key for merging
     const refundsByPeriod = {};
-    for (const r of refundsResult.rows) refundsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_refunded || 0);
+    const unitsRefundedByPeriod = {};
+    for (const r of refundsResult.rows) {
+      const key = r.period.toISOString().split('T')[0];
+      refundsByPeriod[key] = parseFloat(r.total_refunded || 0);
+      unitsRefundedByPeriod[key] = parseInt(r.units_refunded || 0, 10);
+    }
     const ppcByPeriod = {};
-    for (const r of ppcResult.rows) ppcByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.ppc_cost || 0);
+    const ppcUnitsByPeriod = {};
+    for (const r of ppcResult.rows) {
+      const key = r.period.toISOString().split('T')[0];
+      ppcByPeriod[key] = parseFloat(r.ppc_cost || 0);
+      ppcUnitsByPeriod[key] = parseInt(r.ppc_units || 0, 10);
+    }
     const mcfByPeriod = {};
     for (const r of mcfResult.rows) mcfByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.mcf_fees || 0);
 
@@ -831,6 +841,9 @@ app.get('/api/pnl', async (req, res) => {
 
     function buildPeriodRow(periodKey, r) {
       const unitsSold = parseInt(r?.units_sold || 0, 10);
+      const unitsRefunded = unitsRefundedByPeriod[periodKey] || 0;
+      const ppcUnits = ppcUnitsByPeriod[periodKey] || 0;
+      const organicUnits = Math.max(unitsSold - ppcUnits, 0);
       const grossSales = fx(r?.gross_sales || 0);
       const totalDiscounts = fx(r?.total_discounts || 0);
       const netRevenue = grossSales - totalDiscounts;
@@ -899,6 +912,9 @@ app.get('/api/pnl', async (req, res) => {
       return {
         period: periodKey,
         units_sold: unitsSold,
+        units_refunded: unitsRefunded,
+        organic_units: organicUnits,
+        ppc_units: ppcUnits,
         gross_sales: grossSales.toFixed(2),
         total_discounts: (-totalDiscounts).toFixed(2),
         net_revenue: netRevenue.toFixed(2),
@@ -990,7 +1006,9 @@ app.get('/api/pnl', async (req, res) => {
     const sumMap = (m) => Object.values(m).reduce((s, v) => s + v, 0);
     const perPeriodAccountFees = Object.values(accountFeesByPeriod);
     refundsByPeriod['__total__'] = sumMap(refundsByPeriod);
+    unitsRefundedByPeriod['__total__'] = sumMap(unitsRefundedByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
+    ppcUnitsByPeriod['__total__'] = sumMap(ppcUnitsByPeriod);
     adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
     mcfByPeriod['__total__'] = sumMap(mcfByPeriod);
     accountFeesByPeriod['__total__'] = {};
@@ -1918,11 +1936,11 @@ app.get('/api/sync-status', async (req, res) => {
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
-// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────────────────
+// ─── FEE ESTIMATE SYNC ────────────────────────────────────────────
 // Finds Amazon order lines < 14 days old with no settled fees,
 // calls SP-API proxy /estimate-fees, writes estimates with is_estimated_fee=TRUE.
 // Real settled fees from Finances API always overwrite estimates.
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────
 const SPAPI_PROXY_URL = process.env.SPAPI_PROXY_URL || 'https://amazon-spapi-proxy-production.up.railway.app';
 const SPAPI_PROXY_KEY = process.env.SPAPI_PROXY_KEY;
 
