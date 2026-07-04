@@ -183,6 +183,7 @@ function CogsRow({ row, onRefresh }) {
 
   const total = COGS_FIELDS.reduce((s, f) => s + parseFloat(form[f.key] || 0), 0);
   const sym = SYMBOL[form.cogs_currency] || '£';
+  const currentSym = SYMBOL[row.cogs_currency] || '£';
   const hasExistingCogs = parseFloat(row.unit_cogs) > 0;
 
   const handleChange = (key, val) => { setForm(v => ({ ...v, [key]: val })); setSaved(false); };
@@ -222,7 +223,7 @@ function CogsRow({ row, onRefresh }) {
             {hasExistingCogs && (
               <div style={{ textAlign: 'right' }}>
                 <div style={{ fontSize: 10, color: 'var(--muted)', marginBottom: 2 }}>CURRENT COGS</div>
-                <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>£{fmtDisplay(row.unit_cogs)}</div>
+                <div style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{currentSym}{fmtDisplay(row.unit_cogs)}</div>
               </div>
             )}
             <button
@@ -416,6 +417,11 @@ export default function Settings() {
           </div>
           {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading SKUs…</div>}
           {error && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--red)' }}>{error}</div>}
+          {!loading && !error && filteredSkus?.length === 0 && (
+            <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>
+              {brandFilter || parentFilter ? 'No SKUs match this filter' : 'No SKUs found'}
+            </div>
+          )}
           {!loading && filteredSkus?.map(row => <CogsRow key={row.sku} row={row} onRefresh={refetch} />)}
         </div>
       )}

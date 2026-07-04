@@ -180,20 +180,24 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
       const net  = parseFloat(r.net_revenue);
       const prof = parseFloat(r.gross_profit);
       const pct  = net > 0 ? (prof / net * 100).toFixed(1) : '0.0';
-      return { ...r, gross_margin_pct: pct, profit_pct: pct, channel: [...r.channels].join('+') };
+      // Normalise to channelBadge's expected keys ('both' | 'shopify' | 'amazon') — a plain
+      // '+'-joined string (e.g. "amazon+shopify") wouldn't match any of them and would
+      // silently render as a mislabelled "Shopify" badge.
+      const channel = r.channels.size > 1 ? 'both' : [...r.channels][0];
+      return { ...r, gross_margin_pct: pct, profit_pct: pct, channel };
     }).sort((a, b) => parseFloat(b.gross_sales) - parseFloat(a.gross_sales));
   }, [data]);
 
   if (loading) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>Loading…</div>;
   if (!blended.length) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
 
-  const GRID = '1fr 90px 100px 80px 80px 90px 70px 110px 100px';
+  const GRID = '1fr 90px 100px 80px 80px 90px 70px 110px 90px 100px';
 
   return (
     <div>
       {/* Sub-header */}
       <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '6px 0 4px', borderBottom: '1px solid var(--border)', marginBottom: 2 }}>
-        {['Country', 'Units', 'Revenue', 'Margin %', 'Profit %', 'Profit £', 'ROI', 'ACOS', ''].map((h, i) => (
+        {['Country', 'Units', 'Revenue', 'Margin %', 'Profit %', 'Profit £', 'ROI', 'ACOS', 'Channel', ''].map((h, i) => (
           <span key={i} style={{ fontSize: 10, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', padding: '0 8px' }}>{h}</span>
         ))}
       </div>
@@ -243,6 +247,8 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
             </div>
             {/* ACOS */}
             <div style={{ padding: '0 8px', fontSize: 11, color: 'var(--muted)' }}>—</div>
+            {/* Channel */}
+            <div style={{ padding: '0 8px' }}>{channelBadge(c.channel)}</div>
             {/* Breakdown */}
             <div style={{ padding: '0 8px' }}>
               <button onClick={() => setOpenPnl(openPnl === i ? null : i)}
@@ -355,7 +361,7 @@ export default function ProductBreakdown() {
         <KpiCard label="Units Sold" value={totals.units_sold} type="number" color="#fbbf24" />
         <KpiCard label="Gross Revenue" value={totals.gross_sales} type="currency" color="#7c6af7" symbol={sym} />
         <KpiCard label="Net Revenue" value={totals.net_revenue} type="currency" color="#34d399" symbol={sym} />
-        <KpiCard label="Gross Margin" value={totalMargin} type="percent" color={totalMargin > 20 ? '#34d399' : '#f87171'} />
+        <KpiCard label="Gross Margin" value={totalMargin} type="percent" color={totalMargin >= 20 ? '#34d399' : '#f87171'} />
         <KpiCard label="Prod Contrib £" value={totals.product_contribution} type="currency" color="#34d399" symbol={sym} />
       </div>
 

@@ -14,8 +14,6 @@ const NAV = [
   { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
 
-const SYNC_COLORS = { success: '#34d399', error: '#f87171', idle: '#6b6b80' };
-
 function Placeholder({ label }) {
   return (
     <div style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', flexDirection: 'column', gap: 12, color: 'var(--muted)' }}>

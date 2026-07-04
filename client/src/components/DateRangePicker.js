@@ -45,8 +45,20 @@ const btn = (active) => ({
   letterSpacing: '0.04em',
 });
 
+// Reverse-match the incoming value against the presets so the highlighted button reflects
+// the range actually in effect on mount — rather than always defaulting to '30D' regardless
+// of what the parent page passed in (e.g. PnL defaults to a 90-day range, and a saved custom
+// range should show neither button highlighted).
+function matchPreset(value) {
+  for (const p of PRESETS) {
+    const r = getRange(p);
+    if (r.from === value.from && r.to === value.to) return p.label;
+  }
+  return 'custom';
+}
+
 export default function DateRangePicker({ value, onChange }) {
-  const [active, setActive] = useState('30D');
+  const [active, setActive] = useState(() => matchPreset(value));
 
   const handlePreset = (preset) => {
     setActive(preset.label);
