@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from 'react';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 // Product-attributable fee line items — shared between the grid and CSV export so labels
 // stay consistent. MCF (Multi-Channel Fulfillment) is an Amazon-charged fee for using FBA to
@@ -129,6 +130,7 @@ function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, s
 }
 
 export default function PnL() {
+  const isMobile = useIsMobile();
   const [range, setRange] = useState(() => {
     try { const s = localStorage.getItem('gb_pnl_range'); return s ? JSON.parse(s) : getRange({ days: 90 }); } catch { return getRange({ days: 90 }); }
   });
@@ -244,7 +246,7 @@ export default function PnL() {
   }
 
   return (
-    <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 24 }}>
+    <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 18 : 24 }}>
 
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>

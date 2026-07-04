@@ -66,7 +66,7 @@ export default function DateRangePicker({ value, onChange }) {
   };
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', rowGap: 8 }}>
       {PRESETS.map(p => (
         <button key={p.label} style={btn(active === p.label)} onClick={() => handlePreset(p)}>
           {p.label}

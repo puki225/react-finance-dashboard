@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useMemo } from 'react';
 import { useApi } from '../hooks/useApi';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 const fmtDisplay = (n) => parseFloat(n || 0).toFixed(2);
 const today = () => new Date().toISOString().split('T')[0];
@@ -100,7 +101,7 @@ function HistoryPopup({ sku, productName, onClose, onRefresh }) {
                 {isEditing ? (
                   // Edit mode
                   <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 12 }}>
                       <div>
                         <label style={labelStyle}>Effective From</label>
                         <input type="date" value={editValues.effective_from} onChange={e => setEditValues(v => ({ ...v, effective_from: e.target.value }))} style={inputStyle} />
@@ -116,7 +117,7 @@ function HistoryPopup({ sku, productName, onClose, onRefresh }) {
                         </select>
                       </div>
                     </div>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 12 }}>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(110px, 1fr))', gap: 12 }}>
                       {COGS_FIELDS.map(f => (
                         <div key={f.key}>
                           <label style={labelStyle}>{f.label}</label>
@@ -357,6 +358,7 @@ function ReportingSettings() {
   );
 }
 export default function Settings() {
+  const isMobile = useIsMobile();
   const [subtab, setSubtab] = useState('cogs');
   const [brandFilter, setBrandFilter] = useState('');
   const [parentFilter, setParentFilter] = useState('');
@@ -372,14 +374,14 @@ export default function Settings() {
   }, [skus, brandFilter, parentFilter]);
 
   return (
-    <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 24, maxWidth: 1100 }}>
+    <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 18 : 24, maxWidth: 1100 }}>
       <div>
         <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Settings</h1>
         <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Configure costs, channels, and cash flow assumptions</p>
       </div>
 
       {/* Subtabs */}
-      <div style={{ display: 'flex', gap: 6, borderBottom: '1px solid var(--border)', paddingBottom: 16 }}>
+      <div style={{ display: 'flex', gap: 6, borderBottom: '1px solid var(--border)', paddingBottom: 16, flexWrap: 'wrap' }}>
         {SUBTABS.map(tab => (
           <button key={tab.id} onClick={() => !tab.soon && setSubtab(tab.id)}
             style={{ padding: '7px 18px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid ' + (subtab === tab.id ? 'var(--accent2)' : 'var(--border)'), background: subtab === tab.id ? 'var(--accent2)20' : 'transparent', color: subtab === tab.id ? 'var(--accent2)' : 'var(--muted)', cursor: tab.soon ? 'not-allowed' : 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', opacity: tab.soon ? 0.4 : 1 }}>

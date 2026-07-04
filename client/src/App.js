@@ -3,6 +3,7 @@ import SalesSummary from './pages/SalesSummary';
 import ProductBreakdown from './pages/ProductBreakdown';
 import PnL from './pages/PnL';
 import Settings from './pages/Settings';
+import { useIsMobile } from './hooks/useIsMobile';
 
 const NAV = [
   { id: 'sales',     label: 'Sales Summary',      icon: '◈', active: true },
@@ -27,39 +28,68 @@ function Placeholder({ label }) {
 export default function App() {
   const [active, setActive] = useState(() => localStorage.getItem('gb_active_tab') || 'sales');
   const [collapsed, setCollapsed] = useState(false);
+  const [mobileOpen, setMobileOpen] = useState(false);
+  const isMobile = useIsMobile();
+  // On mobile the sidebar is a full-width overlay drawer, not an icon rail — the desktop
+  // collapse toggle doesn't apply there.
+  const sidebarCollapsed = isMobile ? false : collapsed;
+  const activeLabel = NAV.find(n => n.id === active)?.label || '';
 
   const handleNav = (id) => {
     setActive(id);
     localStorage.setItem('gb_active_tab', id);
+    if (isMobile) setMobileOpen(false);
   };
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden' }}>
+    <div style={{ display: 'flex', flexDirection: isMobile ? 'column' : 'row', height: '100vh', overflow: 'hidden' }}>
+
+      {/* Mobile top bar */}
+      {isMobile && (
+        <div style={{
+          height: 52, flexShrink: 0, display: 'flex', alignItems: 'center', gap: 12,
+          padding: '0 16px', background: 'var(--bg2)', borderBottom: '1px solid var(--border)',
+        }}>
+          <button onClick={() => setMobileOpen(true)} style={{ background: 'none', border: 'none', color: 'var(--text)', fontSize: 20, cursor: 'pointer', padding: 4, lineHeight: 1 }}>
+            ☰
+          </button>
+          <span style={{ fontSize: 14, fontWeight: 700 }}>{activeLabel}</span>
+        </div>
+      )}
+
+      {/* Mobile backdrop — closes the drawer on tap-outside */}
+      {isMobile && mobileOpen && (
+        <div onClick={() => setMobileOpen(false)} style={{ position: 'fixed', inset: 0, background: '#00000080', zIndex: 999 }} />
+      )}
 
       {/* Sidebar */}
       <div style={{
-        width: collapsed ? 64 : 220,
+        width: sidebarCollapsed ? 64 : 220,
         background: 'var(--bg2)',
         borderRight: '1px solid var(--border)',
         display: 'flex',
         flexDirection: 'column',
-        transition: 'width 0.2s ease',
+        transition: isMobile ? 'transform 0.2s ease' : 'width 0.2s ease',
         flexShrink: 0,
         overflow: 'hidden',
+        ...(isMobile ? {
+          position: 'fixed', top: 0, left: 0, height: '100vh', zIndex: 1000,
+          transform: mobileOpen ? 'translateX(0)' : 'translateX(-100%)',
+        } : {}),
       }}>
         {/* Logo */}
-        <div style={{ padding: collapsed ? '20px 16px' : '20px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', minHeight: 64 }}>
-          {!collapsed && (
+        <div style={{ padding: sidebarCollapsed ? '20px 16px' : '20px 20px', borderBottom: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'space-between', minHeight: 64 }}>
+          {!sidebarCollapsed && (
             <div>
               <div style={{ fontSize: 13, fontWeight: 800, letterSpacing: '0.08em', textTransform: 'uppercase' }}>Finance</div>
               <div style={{ fontSize: 10, color: 'var(--accent)', fontWeight: 600, letterSpacing: '0.12em', textTransform: 'uppercase' }}>Dashboard</div>
             </div>
           )}
-          <button onClick={() => setCollapsed(!collapsed)} style={{
+          <button onClick={() => (isMobile ? setMobileOpen(false) : setCollapsed(!collapsed))} style={{
             background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer', fontSize: 14, padding: 4, borderRadius: 4,
-            marginLeft: collapsed ? 'auto' : 0,
+            marginLeft: sidebarCollapsed ? 'auto' : 0,
           }}>
-            {collapsed ? '▶' : '◀'}
+            {isMobile ? '×' : (collapsed ? '▶' : '◀')}
           </button>
         </div>
 
@@ -69,13 +99,13 @@ export default function App() {
             <button
               key={item.id}
               onClick={() => item.active && handleNav(item.id)}
-              title={collapsed ? item.label : ''}
+              title={sidebarCollapsed ? item.label : ''}
               style={{
                 display: 'flex',
                 alignItems: 'center',
                 gap: 12,
-                padding: collapsed ? '10px 0' : '10px 12px',
-                justifyContent: collapsed ? 'center' : 'flex-start',
+                padding: sidebarCollapsed ? '10px 0' : '10px 12px',
+                justifyContent: sidebarCollapsed ? 'center' : 'flex-start',
                 borderRadius: 8,
                 border: 'none',
                 background: active === item.id ? 'var(--accent)20' : 'none',
@@ -92,14 +122,14 @@ export default function App() {
               }}
             >
               <span style={{ fontSize: 16, flexShrink: 0 }}>{item.icon}</span>
-              {!collapsed && <span>{item.label}</span>}
-              {!collapsed && !item.active && <span style={{ marginLeft: 'auto', fontSize: 9, letterSpacing: '0.08em', color: 'var(--muted)' }}>SOON</span>}
+              {!sidebarCollapsed && <span>{item.label}</span>}
+              {!sidebarCollapsed && !item.active && <span style={{ marginLeft: 'auto', fontSize: 9, letterSpacing: '0.08em', color: 'var(--muted)' }}>SOON</span>}
             </button>
           ))}
         </nav>
 
         {/* Bottom: channel indicator */}
-        {!collapsed && (
+        {!sidebarCollapsed && (
           <div style={{ padding: '12px 16px', borderTop: '1px solid var(--border)' }}>
             <div style={{ fontSize: 10, color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 8 }}>Channels</div>
             <div style={{ display: 'flex', gap: 6 }}>

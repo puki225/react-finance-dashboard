@@ -4,6 +4,7 @@ import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import WorldMap, { countryName } from '../components/WorldMap';
 import { useApi } from '../hooks/useApi';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 // Country flag via flagcdn.com — same pattern as ProductBreakdown's CountryFlag
 const CountryFlag = ({ code }) => {
@@ -172,6 +173,7 @@ function gatewayColor(name, index) {
 }
 
 export default function SalesSummary() {
+  const isMobile = useIsMobile();
   const [range, setRange] = useState(() => {
     try { const s = localStorage.getItem('gb_sales_range'); return s ? JSON.parse(s) : getRange({ days: 30 }); } catch { return getRange({ days: 30 }); }
   });
@@ -205,7 +207,7 @@ export default function SalesSummary() {
   const gatewayLabel = channel === 'amazon' ? 'Payout Method' : 'Payment Gateway';
 
   return (
-    <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 28 }}>
+    <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 20 : 28 }}>
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div><h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Sales Summary</h1><p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>All channels</p></div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
@@ -247,7 +249,7 @@ export default function SalesSummary() {
           </ResponsiveContainer>
         )}
       </div>
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 16 }}>
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>{gatewayLabel}</h2>
           {loadingGateway ? (<div style={{ height: 180, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
@@ -283,7 +285,7 @@ export default function SalesSummary() {
         </div>
       </div>
       <CountryPanel data={countryData || []} fmt={currencyFmt} />
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 16 }}>
         <BreakdownCard
           title="Order Type (Amazon)"
           rows={orderBreakdown?.order_type || []}

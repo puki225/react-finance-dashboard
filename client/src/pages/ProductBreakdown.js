@@ -2,6 +2,7 @@ import React, { useState, useMemo } from 'react';
 import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
+import { useIsMobile } from '../hooks/useIsMobile';
 
 const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtN = (n) => parseInt(n || 0).toLocaleString('en-GB');
@@ -37,6 +38,11 @@ const COLS = [
   { key: 'acos',             label: 'ACOS',            sortable: false, width: '11%'  },
   { key: 'channels',         label: 'Channel',         sortable: false, width: '7%'   },
 ];
+// Shared column template for the header + every row — a floor of 160px on the product column
+// (rather than minmax(0,1fr)) keeps titles readable once the table scrolls horizontally on
+// narrow screens, instead of squishing to unreadable width.
+const TABLE_GRID = '36px minmax(160px,1fr) 90px 100px 80px 100px 70px 110px 100px';
+const TABLE_MIN_WIDTH = 36 + 160 + 90 + 100 + 80 + 100 + 70 + 110 + 100;
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
   // Normalise channel: 'both' and undefined → 'all'
@@ -191,10 +197,12 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
   if (loading) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>Loading…</div>;
   if (!blended.length) return <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No data</div>;
 
-  const GRID = '1fr 90px 100px 80px 80px 90px 70px 110px 90px 100px';
+  const GRID = 'minmax(140px,1fr) 90px 100px 80px 80px 90px 70px 110px 90px 100px';
+  const GRID_MIN_WIDTH = 140 + 90 + 100 + 80 + 80 + 90 + 70 + 110 + 90 + 100;
 
   return (
-    <div>
+    <div style={{ overflowX: 'auto' }}>
+     <div style={{ minWidth: GRID_MIN_WIDTH }}>
       {/* Sub-header */}
       <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '6px 0 4px', borderBottom: '1px solid var(--border)', marginBottom: 2 }}>
         {['Country', 'Units', 'Revenue', 'Margin %', 'Profit %', 'Profit £', 'ROI', 'ACOS', 'Channel', ''].map((h, i) => (
@@ -264,11 +272,13 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
           )}
         </div>
       ))}
+     </div>
     </div>
   );
 }
 
 export default function ProductBreakdown() {
+  const isMobile = useIsMobile();
   const [range, setRange] = useState(() => {
     try { const s = localStorage.getItem('gb_prod_range'); return s ? JSON.parse(s) : getRange({ days: 30 }); } catch { return getRange({ days: 30 }); }
   });
@@ -323,7 +333,7 @@ export default function ProductBreakdown() {
   };
 
   return (
-    <div style={{ padding: '28px 32px', display: 'flex', flexDirection: 'column', gap: 24 }}>
+    <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 18 : 24 }}>
 
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
@@ -367,8 +377,10 @@ export default function ProductBreakdown() {
 
       {/* Table */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
+       <div style={{ overflowX: 'auto' }}>
+        <div style={{ minWidth: TABLE_MIN_WIDTH }}>
         {/* Header row */}
-        <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 100px 70px 110px 100px', borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: TABLE_GRID, borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
           <div />
           {COLS.filter(c => c.key !== 'expand').map(col => (
             <div key={col.key} onClick={() => col.sortable && handleSort(col.key)}
@@ -397,7 +409,7 @@ export default function ProductBreakdown() {
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
-              <div style={{ display: 'grid', gridTemplateColumns: '36px minmax(0,1fr) 90px 100px 80px 100px 70px 110px 100px', background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
+              <div style={{ display: 'grid', gridTemplateColumns: TABLE_GRID, background: expanded ? '#ffffff05' : 'transparent', transition: 'background 0.1s' }}
                 onMouseEnter={e => !expanded && (e.currentTarget.style.background = '#ffffff03')}
                 onMouseLeave={e => !expanded && (e.currentTarget.style.background = 'transparent')}>
 
@@ -504,6 +516,8 @@ export default function ProductBreakdown() {
             </div>
           );
         })}
+        </div>
+       </div>
       </div>
     </div>
   );
