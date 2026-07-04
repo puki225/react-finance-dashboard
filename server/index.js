@@ -783,12 +783,27 @@ app.get('/api/pnl', async (req, res) => {
     // ReserveCredit are excluded entirely here (at the SQL level) — they're a rolling cash-flow
     // timing mechanism (Amazon holding back and releasing settlement funds against future
     // returns/risk), not a real gain or loss, so they don't belong on an accrual P&L. They'll
-    // surface on the Cash Flow page once that's built out.
+    // surface on the Cash Flow page once that's built out. FBALongTermStorageFee is also
+    // excluded here — Amazon's Financial Events only carry a settlement (posted_date) for this
+    // fee, not the inventory-age snapshot date it was actually calculated from, so it's sourced
+    // instead from amazon_ltsf_charges (keyed by snapshot_date) below and merged back in.
     const accountFeesResult = await pool.query(`
       SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type, SUM(amount)::numeric AS amount
       FROM amazon_account_fees WHERE posted_date::date BETWEEN $1 AND $2
-        AND fee_type NOT IN ('ReserveDebit', 'ReserveCredit')
+        AND fee_type NOT IN ('ReserveDebit', 'ReserveCredit', 'FBALongTermStorageFee')
       GROUP BY 1, 2, 3
+    `, [dateFrom, dateTo]);
+
+    // FBA Long-Term Storage Fee, sourced by snapshot_date (when the fee was actually accrued,
+    // per the monthly inventory-age snapshot) rather than posted_date (when Amazon settled it —
+    // sometimes a full month or more later). Synced separately via amazon-spapi-proxy's
+    // /sync-ltsf endpoint, which pulls Amazon's Reports API "FBA Long-Term Storage Fee Charges"
+    // report into amazon_ltsf_charges. Merged into accountFeesByPeriod/feeTypeTotals below so it
+    // flows through the same itemized-fees display and total logic as every other fee type.
+    const ltsfResult = await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', snapshot_date)::date AS period, SUM(amount)::numeric AS amount
+      FROM amazon_ltsf_charges WHERE snapshot_date BETWEEN $1 AND $2
+      GROUP BY 1
     `, [dateFrom, dateTo]);
 
     // MCF (Multi-Channel Fulfillment) fees — Amazon charges the account to fulfil a Shopify
@@ -847,6 +862,17 @@ app.get('/api/pnl', async (req, res) => {
         accountFeesByPeriod[key][r.fee_type] = (accountFeesByPeriod[key][r.fee_type] || 0) + amt;
         feeTypeTotals[r.fee_type] = (feeTypeTotals[r.fee_type] || 0) + Math.abs(amt);
       }
+    }
+    // Merge in the accrual-dated LTSF rows (see comment above ltsfResult) under the same
+    // 'FBALongTermStorageFee' key the old settlement-dated query used to populate, so the P&L
+    // display, sort-by-magnitude, and __total__ aggregation logic below don't need to know this
+    // fee type now comes from a different table.
+    for (const r of ltsfResult.rows) {
+      const key = r.period.toISOString().split('T')[0];
+      const amt = parseFloat(r.amount || 0);
+      if (!accountFeesByPeriod[key]) accountFeesByPeriod[key] = {};
+      accountFeesByPeriod[key]['FBALongTermStorageFee'] = (accountFeesByPeriod[key]['FBALongTermStorageFee'] || 0) + amt;
+      feeTypeTotals['FBALongTermStorageFee'] = (feeTypeTotals['FBALongTermStorageFee'] || 0) + Math.abs(amt);
     }
     const accountFeeTypes = Object.keys(feeTypeTotals).sort((a, b) => feeTypeTotals[b] - feeTypeTotals[a]);
     const adjustmentTypes = Object.keys(adjustmentTypeTotals).sort((a, b) => adjustmentTypeTotals[b] - adjustmentTypeTotals[a]);
