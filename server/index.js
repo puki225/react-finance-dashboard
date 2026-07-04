@@ -159,10 +159,20 @@ app.get('/api/summary', async (req, res) => {
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
       LEFT JOIN LATERAL (
-        SELECT unit_cogs FROM cogs_entries
-        WHERE sku = aol.sku AND effective_from <= ao.order_date::date
-          AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-        ORDER BY effective_from DESC LIMIT 1
+        -- unit_cogs is entered in cogs_entries.cogs_currency (GBP/USD/EUR); revenue figures
+        -- are all GBP, so convert here at the exchange rate on the order date before this
+        -- value is combined with anything GBP-denominated. No-op when currency is already GBP.
+        SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
       WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
       UNION ALL
@@ -172,10 +182,17 @@ app.get('/api/summary', async (req, res) => {
       FROM shopify_order_lines sol
       LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
       LEFT JOIN LATERAL (
-        SELECT unit_cogs FROM cogs_entries
-        WHERE sku = sol.sku AND effective_from <= sol.order_date::date
-          AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-        ORDER BY effective_from DESC LIMIT 1
+        SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= sol.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
       WHERE sol.order_date::date BETWEEN $1 AND $2
     `, [dateFrom, dateTo]);
@@ -486,10 +503,17 @@ app.get('/api/sales-by-country', async (req, res) => {
         JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
-            AND effective_from <= sol.order_date::date
-            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= sol.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY 1
@@ -508,10 +532,17 @@ app.get('/api/sales-by-country', async (req, res) => {
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
-            AND effective_from <= ao.order_date::date
-            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         GROUP BY 1
@@ -535,10 +566,17 @@ app.get('/api/sales-by-country', async (req, res) => {
           JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
           LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
           LEFT JOIN LATERAL (
-            SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
-              AND effective_from <= sol.order_date::date
-              AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-            ORDER BY effective_from DESC LIMIT 1
+            SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+            FROM cogs_entries ce0
+            LEFT JOIN LATERAL (
+              SELECT rate FROM exchange_rates
+              WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+                AND date <= sol.order_date::date
+              ORDER BY date DESC LIMIT 1
+            ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+            WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+              AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+            ORDER BY ce0.effective_from DESC LIMIT 1
           ) ce ON true
           WHERE sol.order_date::date BETWEEN $1 AND $2
           UNION ALL
@@ -553,10 +591,17 @@ app.get('/api/sales-by-country', async (req, res) => {
           LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
           LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
           LEFT JOIN LATERAL (
-            SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
-              AND effective_from <= ao.order_date::date
-              AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-            ORDER BY effective_from DESC LIMIT 1
+            SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+            FROM cogs_entries ce0
+            LEFT JOIN LATERAL (
+              SELECT rate FROM exchange_rates
+              WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+                AND date <= ao.order_date::date
+              ORDER BY date DESC LIMIT 1
+            ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+            WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+              AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+            ORDER BY ce0.effective_from DESC LIMIT 1
           ) ce ON true
           WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         ) combined
@@ -751,10 +796,26 @@ app.get('/api/pnl', async (req, res) => {
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
       LEFT JOIN LATERAL (
-        SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
-        WHERE sku = aol.sku AND effective_from <= ao.order_date::date
-          AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-        ORDER BY effective_from DESC LIMIT 1
+        -- Itemized COGS fields are entered in cogs_entries.cogs_currency (GBP/USD/EUR); revenue
+        -- figures are all GBP, so convert here at the exchange rate on the order date before
+        -- these are combined with anything GBP-denominated. No-op when currency is already GBP.
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
       WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         ${brandFilter} ${parentFilter} ${searchFilter} ${fulfillmentFilter} ${orderTypeFilter}
@@ -1163,11 +1224,26 @@ app.get('/api/product-breakdown', async (req, res) => {
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
-          WHERE sku = aol.sku
-            AND effective_from <= ao.order_date::date
-            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          -- Convert itemized COGS from cogs_entries.cogs_currency to GBP at the exchange rate
+          -- on the order date, so it lines up with GBP-denominated revenue below. No-op for GBP.
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = aol.sku
+            AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
         GROUP BY aol.sku
@@ -1195,11 +1271,24 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM shopify_order_lines sol
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs FROM cogs_entries
-          WHERE sku = sol.sku
-            AND effective_from <= sol.order_date::date
-            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= sol.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sol.sku
+            AND ce0.effective_from <= sol.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         LEFT JOIN amazon_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
         LEFT JOIN (
@@ -1514,10 +1603,25 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs
-          FROM cogs_entries WHERE sku = aol.sku AND effective_from <= ao.order_date::date
-            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          -- Convert itemized COGS from cogs_entries.cogs_currency to GBP at the exchange rate
+          -- on the order date, so it lines up with GBP-denominated revenue below. No-op for GBP.
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled' ${countryFilter}
       `, [sku, dateFrom, dateTo]);
@@ -1539,10 +1643,23 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, unit_cogs
-          FROM cogs_entries WHERE sku = sol.sku AND effective_from <= sol.order_date::date
-            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= sol.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 ${countryFilterShopify}
       `, [sku, dateFrom, dateTo]);
@@ -1653,10 +1770,17 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
         JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
-            AND effective_from <= sol.order_date::date
-            AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= sol.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
         GROUP BY 1 ORDER BY gross_sales DESC
@@ -1676,10 +1800,17 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
         LEFT JOIN LATERAL (
-          SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
-            AND effective_from <= ao.order_date::date
-            AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-          ORDER BY effective_from DESC LIMIT 1
+          SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
         WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
         GROUP BY 1 ORDER BY gross_sales DESC
@@ -1702,10 +1833,17 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
           LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
           LEFT JOIN LATERAL (
-            SELECT unit_cogs FROM cogs_entries WHERE sku = sol.sku
-              AND effective_from <= sol.order_date::date
-              AND (effective_to IS NULL OR effective_to >= sol.order_date::date)
-            ORDER BY effective_from DESC LIMIT 1
+            SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+            FROM cogs_entries ce0
+            LEFT JOIN LATERAL (
+              SELECT rate FROM exchange_rates
+              WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+                AND date <= sol.order_date::date
+              ORDER BY date DESC LIMIT 1
+            ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+            WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+              AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+            ORDER BY ce0.effective_from DESC LIMIT 1
           ) ce ON true
           WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3
           UNION ALL
@@ -1720,10 +1858,17 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
           LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
           LEFT JOIN LATERAL (
-            SELECT unit_cogs FROM cogs_entries WHERE sku = aol.sku
-              AND effective_from <= ao.order_date::date
-              AND (effective_to IS NULL OR effective_to >= ao.order_date::date)
-            ORDER BY effective_from DESC LIMIT 1
+            SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+            FROM cogs_entries ce0
+            LEFT JOIN LATERAL (
+              SELECT rate FROM exchange_rates
+              WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+                AND date <= ao.order_date::date
+              ORDER BY date DESC LIMIT 1
+            ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+            WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+              AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+            ORDER BY ce0.effective_from DESC LIMIT 1
           ) ce ON true
           WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
         ) combined
