@@ -779,10 +779,15 @@ app.get('/api/pnl', async (req, res) => {
     // Amazon actually reports, rather than a hardcoded row list, since these categories are only
     // as good as what's been synced via amazon-spapi-proxy's finances job. Adjustment-type events
     // (inventory reimbursements/disposals) are kept in their own bucket, matching the reference
-    // P&L's separate "Adjustments" line rather than being folded into "Fees".
+    // P&L's separate "Adjustments" line rather than being folded into "Fees". ReserveDebit and
+    // ReserveCredit are excluded entirely here (at the SQL level) — they're a rolling cash-flow
+    // timing mechanism (Amazon holding back and releasing settlement funds against future
+    // returns/risk), not a real gain or loss, so they don't belong on an accrual P&L. They'll
+    // surface on the Cash Flow page once that's built out.
     const accountFeesResult = await pool.query(`
       SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type, SUM(amount)::numeric AS amount
       FROM amazon_account_fees WHERE posted_date::date BETWEEN $1 AND $2
+        AND fee_type NOT IN ('ReserveDebit', 'ReserveCredit')
       GROUP BY 1, 2, 3
     `, [dateFrom, dateTo]);
 
@@ -960,7 +965,8 @@ app.get('/api/pnl', async (req, res) => {
         // product, bridging Product Contribution down to Profit. Headcount and Fixed Costs
         // are scaffolded categories with no data source yet (always 0); Other Fees holds
         // everything Amazon charges at the account level (subscription, storage, coupons)
-        // plus inventory Adjustments.
+        // plus inventory Adjustments (excluding Reserve Debit/Credit, which are cash-flow
+        // timing rather than P&L items — see comment above accountFeesResult).
         opex: {
           headcount: { total: headcountTotal.toFixed(2) },
           fixed_costs: { total: fixedCostsTotal.toFixed(2) },
