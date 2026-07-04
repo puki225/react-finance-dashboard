@@ -752,45 +752,56 @@ app.get('/api/order-breakdown', async (req, res) => {
 // Gross Sales -> Discounts -> Refunds -> Net Sales -> COGS -> Fees -> Gross Margin -> PPC
 // -> Product Contribution structure, but grouped by period across all SKUs instead of one.
 app.get('/api/pnl', async (req, res) => {
-  const { from, to, group = 'month', brand, parent_asin, search, fulfillment, order_type } = req.query;
+  const { from, to, group = 'month', channel = 'all', brand, parent_asin, search, fulfillment, order_type } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
   const trunc = ['day', 'week', 'month', 'year'].includes(group) ? group : 'month';
+  // Fulfillment (FBA/FBM) and order type (B2B/B2C) are Amazon-only concepts with no Shopify
+  // equivalent — the client only shows these toggles when channel === 'amazon', but guard here
+  // too so a stray query param can't silently apply an Amazon-only filter to Shopify order lines.
+  const includeAmazon = channel !== 'shopify';
+  const includeShopify = channel !== 'amazon';
 
   const esc = (s) => s.replace(/'/g, "''");
   const brandFilter = brand ? `AND sp.brand = '${esc(brand)}'` : '';
   const parentFilter = parent_asin ? `AND sp.parent_asin = '${esc(parent_asin)}'` : '';
-  const searchFilter = search ? `AND (aol.sku ILIKE '%${esc(search)}%' OR aol.asin ILIKE '%${esc(search)}%' OR ao.amazon_order_id ILIKE '%${esc(search)}%')` : '';
-  const fulfillmentFilter = fulfillment === 'FBA' ? `AND ao.fulfillment_channel = 'AFN'` : fulfillment === 'FBM' ? `AND ao.fulfillment_channel = 'MFN'` : '';
-  const orderTypeFilter = order_type === 'B2B' ? `AND ao.is_business_order = true` : order_type === 'B2C' ? `AND ao.is_business_order = false` : '';
+  const searchFilterAmazon = search ? `AND (aol.sku ILIKE '%${esc(search)}%' OR aol.asin ILIKE '%${esc(search)}%' OR ao.amazon_order_id ILIKE '%${esc(search)}%')` : '';
+  const searchFilterShopify = search ? `AND (sol.sku ILIKE '%${esc(search)}%' OR so.shopify_order_number::text ILIKE '%${esc(search)}%')` : '';
+  const fulfillmentFilter = includeAmazon && fulfillment === 'FBA' ? `AND ao.fulfillment_channel = 'AFN'` : includeAmazon && fulfillment === 'FBM' ? `AND ao.fulfillment_channel = 'MFN'` : '';
+  const orderTypeFilter = includeAmazon && order_type === 'B2B' ? `AND ao.is_business_order = true` : includeAmazon && order_type === 'B2C' ? `AND ao.is_business_order = false` : '';
 
   try {
     // Order-line level: units, gross sales, discounts, itemized COGS, order-line fees — grouped by period.
     // COGS formula matches the P&L breakdown panel exactly (itemized standard/freight/demurrage/quality/other
     // with cogs_entries -> sku_parameters -> flat unit_cogs fallback), not the flat shortcut used elsewhere.
-    const linesResult = await pool.query(`
+    //
+    // Amazon and Shopify order lines are unioned at per-line granularity (not pre-aggregated per
+    // branch) so a single outer GROUP BY produces correct period totals across both channels.
+    // Shopify order lines have no Amazon-style per-line fees (commission, FBA fulfillment, etc.) —
+    // those come through separately for Shopify via the MCF fee line below — so they're 0 here.
+    const amazonLinesBranch = `
       SELECT
-        DATE_TRUNC('${trunc}', ao.order_date)::date AS period,
-        SUM(aol.quantity)::int AS units_sold,
-        SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-        SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts,
-        SUM(aol.quantity * COALESCE(
+        aol.quantity AS units_sold,
+        (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
+        COALESCE(aol.promotion_discount,0)::numeric(12,2) AS total_discounts,
+        (aol.quantity * COALESCE(
           NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
           CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
             AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
             THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
         )::numeric(12,2) AS cogs_standard,
-        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric(12,2) AS cogs_freight,
-        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric(12,2) AS cogs_demurrage,
-        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric(12,2) AS cogs_quality,
-        SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric(12,2) AS cogs_other,
-        SUM(COALESCE(aol.fee_commission,0))::numeric(12,2) AS fee_commission,
-        SUM(COALESCE(aol.fee_fba_fulfillment,0))::numeric(12,2) AS fee_fba_fulfillment,
-        SUM(COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS fee_fixed_closing,
-        SUM(COALESCE(aol.fee_variable_closing,0))::numeric(12,2) AS fee_variable_closing,
-        SUM(COALESCE(aol.fee_digital_services,0))::numeric(12,2) AS fee_digital_services,
-        SUM(COALESCE(aol.fee_giftwrap_chargeback,0))::numeric(12,2) AS fee_giftwrap,
-        SUM(COALESCE(aol.fee_shipping_chargeback,0))::numeric(12,2) AS fee_shipping_chargeback
+        (aol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric(12,2) AS cogs_freight,
+        (aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric(12,2) AS cogs_demurrage,
+        (aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric(12,2) AS cogs_quality,
+        (aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric(12,2) AS cogs_other,
+        COALESCE(aol.fee_commission,0)::numeric(12,2) AS fee_commission,
+        COALESCE(aol.fee_fba_fulfillment,0)::numeric(12,2) AS fee_fba_fulfillment,
+        COALESCE(aol.fee_fixed_closing,0)::numeric(12,2) AS fee_fixed_closing,
+        COALESCE(aol.fee_variable_closing,0)::numeric(12,2) AS fee_variable_closing,
+        COALESCE(aol.fee_digital_services,0)::numeric(12,2) AS fee_digital_services,
+        COALESCE(aol.fee_giftwrap_chargeback,0)::numeric(12,2) AS fee_giftwrap,
+        COALESCE(aol.fee_shipping_chargeback,0)::numeric(12,2) AS fee_shipping_chargeback,
+        DATE_TRUNC('${trunc}', ao.order_date)::date AS period
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -818,14 +829,91 @@ app.get('/api/pnl', async (req, res) => {
         ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
       WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-        ${brandFilter} ${parentFilter} ${searchFilter} ${fulfillmentFilter} ${orderTypeFilter}
+        ${brandFilter} ${parentFilter} ${searchFilterAmazon} ${fulfillmentFilter} ${orderTypeFilter}
+    `;
+
+    const shopifyLinesBranch = `
+      SELECT
+        sol.quantity AS units_sold,
+        (sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
+        (sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
+        (sol.quantity * COALESCE(
+          NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+          CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+            AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+            THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+        )::numeric(12,2) AS cogs_standard,
+        (sol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric(12,2) AS cogs_freight,
+        (sol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric(12,2) AS cogs_demurrage,
+        (sol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric(12,2) AS cogs_quality,
+        (sol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric(12,2) AS cogs_other,
+        0::numeric(12,2) AS fee_commission,
+        0::numeric(12,2) AS fee_fba_fulfillment,
+        0::numeric(12,2) AS fee_fixed_closing,
+        0::numeric(12,2) AS fee_variable_closing,
+        0::numeric(12,2) AS fee_digital_services,
+        0::numeric(12,2) AS fee_giftwrap,
+        0::numeric(12,2) AS fee_shipping_chargeback,
+        DATE_TRUNC('${trunc}', sol.order_date)::date AS period
+      FROM shopify_order_lines sol
+      JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+      LEFT JOIN LATERAL (
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= sol.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE sol.order_date::date BETWEEN $1 AND $2
+        ${brandFilter} ${parentFilter} ${searchFilterShopify}
+    `;
+
+    const combinedBranches = [
+      includeAmazon ? amazonLinesBranch : null,
+      includeShopify ? shopifyLinesBranch : null,
+    ].filter(Boolean).join(' UNION ALL ');
+
+    const linesResult = await pool.query(`
+      WITH combined_lines AS (${combinedBranches})
+      SELECT
+        period,
+        SUM(units_sold)::int AS units_sold,
+        SUM(gross_sales)::numeric(12,2) AS gross_sales,
+        SUM(total_discounts)::numeric(12,2) AS total_discounts,
+        SUM(cogs_standard)::numeric(12,2) AS cogs_standard,
+        SUM(cogs_freight)::numeric(12,2) AS cogs_freight,
+        SUM(cogs_demurrage)::numeric(12,2) AS cogs_demurrage,
+        SUM(cogs_quality)::numeric(12,2) AS cogs_quality,
+        SUM(cogs_other)::numeric(12,2) AS cogs_other,
+        SUM(fee_commission)::numeric(12,2) AS fee_commission,
+        SUM(fee_fba_fulfillment)::numeric(12,2) AS fee_fba_fulfillment,
+        SUM(fee_fixed_closing)::numeric(12,2) AS fee_fixed_closing,
+        SUM(fee_variable_closing)::numeric(12,2) AS fee_variable_closing,
+        SUM(fee_digital_services)::numeric(12,2) AS fee_digital_services,
+        SUM(fee_giftwrap)::numeric(12,2) AS fee_giftwrap,
+        SUM(fee_shipping_chargeback)::numeric(12,2) AS fee_shipping_chargeback
+      FROM combined_lines
       GROUP BY 1 ORDER BY 1
     `, [dateFrom, dateTo]);
 
     // Refunds, attributed by refund_date (independent of the order population above)
+    const refundsChannelFilter = channel === 'amazon' ? `AND channel = 'amazon'` : channel === 'shopify' ? `AND channel = 'shopify'` : '';
     const refundsResult = await pool.query(`
       SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded)::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
-      FROM v_refunds_by_date WHERE channel = 'amazon' AND refund_date::date BETWEEN $1 AND $2
+      FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2 ${refundsChannelFilter}
       GROUP BY 1
     `, [dateFrom, dateTo]);
 

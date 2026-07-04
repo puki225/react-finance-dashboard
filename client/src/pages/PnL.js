@@ -28,6 +28,7 @@ const COGS_LABELS = [
 ];
 
 const GROUPS = ['day', 'week', 'month', 'year'];
+const CHANNELS = [{ id: 'all', label: 'All' }, { id: 'shopify', label: 'Shopify' }, { id: 'amazon', label: 'Amazon' }];
 const FULFILLMENT = [{ id: 'all', label: 'All' }, { id: 'FBA', label: 'FBA' }, { id: 'FBM', label: 'FBM' }];
 const ORDER_TYPE = [{ id: 'all', label: 'All' }, { id: 'B2B', label: 'B2B' }, { id: 'B2C', label: 'B2C' }];
 
@@ -135,6 +136,7 @@ export default function PnL() {
     try { const s = localStorage.getItem('gb_pnl_range'); return s ? JSON.parse(s) : getRange({ days: 90 }); } catch { return getRange({ days: 90 }); }
   });
   const [group, setGroup] = useState(() => localStorage.getItem('gb_pnl_group') || 'month');
+  const [channel, setChannel] = useState(() => localStorage.getItem('gb_pnl_channel') || 'all');
   const [fulfillment, setFulfillment] = useState(() => localStorage.getItem('gb_pnl_fulfillment') || 'all');
   const [orderType, setOrderType] = useState(() => localStorage.getItem('gb_pnl_order_type') || 'all');
   const [search, setSearch] = useState('');
@@ -149,9 +151,19 @@ export default function PnL() {
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
   const handleFulfillment = (f) => { setFulfillment(f); localStorage.setItem('gb_pnl_fulfillment', f); };
   const handleOrderType = (o) => { setOrderType(o); localStorage.setItem('gb_pnl_order_type', o); };
+  const handleChannel = (c) => {
+    setChannel(c);
+    localStorage.setItem('gb_pnl_channel', c);
+    // FBA/FBM and B2B/B2C are Amazon-only concepts with no Shopify equivalent — reset them
+    // whenever leaving the Amazon-only view so a stale filter can't silently linger unseen.
+    if (c !== 'amazon') {
+      setFulfillment('all'); localStorage.setItem('gb_pnl_fulfillment', 'all');
+      setOrderType('all'); localStorage.setItem('gb_pnl_order_type', 'all');
+    }
+  };
 
   const params = {
-    ...range, group,
+    ...range, group, channel,
     ...(fulfillment !== 'all' ? { fulfillment } : {}),
     ...(orderType !== 'all' ? { order_type: orderType } : {}),
     ...(search ? { search } : {}),
@@ -252,20 +264,31 @@ export default function PnL() {
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>P&L</h1>
-          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Amazon only — Product Contribution reflects per-product economics; OPEX bridges to Profit</p>
+          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>
+            {channel === 'amazon' ? 'Amazon only' : channel === 'shopify' ? 'Shopify only' : 'All channels'} — Product Contribution reflects per-product economics; OPEX bridges to Profit
+            {channel !== 'amazon' && ' (OPEX and PPC remain Amazon-specific overhead)'}
+          </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
             {GROUPS.map(g => (<button key={g} onClick={() => handleGroup(g)} style={{ ...toggleBtn(group === g), textTransform: 'capitalize' }}>{g}</button>))}
           </div>
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
-            {FULFILLMENT.map(f => (<button key={f.id} onClick={() => handleFulfillment(f.id)} style={toggleBtn(fulfillment === f.id)}>{f.label}</button>))}
+            {CHANNELS.map(c => (<button key={c.id} onClick={() => handleChannel(c.id)} style={toggleBtn(channel === c.id)}>{c.label}</button>))}
           </div>
-          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
-            {ORDER_TYPE.map(o => (<button key={o.id} onClick={() => handleOrderType(o.id)} style={toggleBtn(orderType === o.id)}>{o.label}</button>))}
-          </div>
+          {channel === 'amazon' && (
+            <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+              {FULFILLMENT.map(f => (<button key={f.id} onClick={() => handleFulfillment(f.id)} style={toggleBtn(fulfillment === f.id)}>{f.label}</button>))}
+            </div>
+          )}
+          {channel === 'amazon' && (
+            <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+              {ORDER_TYPE.map(o => (<button key={o.id} onClick={() => handleOrderType(o.id)} style={toggleBtn(orderType === o.id)}>{o.label}</button>))}
+            </div>
+          )}
           <input
-            value={search} onChange={e => setSearch(e.target.value)} placeholder="SKU / ASIN / Order ID"
+            value={search} onChange={e => setSearch(e.target.value)}
+            placeholder={channel === 'shopify' ? 'SKU / Order Number' : channel === 'amazon' ? 'SKU / ASIN / Order ID' : 'SKU / ASIN / Order ID or #'}
             style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 12px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--font)', width: 150 }}
           />
           <DateRangePicker value={range} onChange={handleRange} />
