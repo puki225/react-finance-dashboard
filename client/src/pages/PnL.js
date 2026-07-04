@@ -76,10 +76,10 @@ function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, s
   const pushRow = (label, key) => {
     rows.push([label, ...periods.map(p => getPath(p, key)), getPath(totals, key)]);
   };
-  pushRow('Units Sold', 'units_sold');
-  pushRow('  Refunded Units', 'units_refunded');
+  pushRow('Units Sold', 'net_units_sold');
   pushRow('  Organic Units', 'organic_units');
   pushRow('  PPC Units', 'ppc_units');
+  pushRow('  Refunded Units', 'units_refunded');
   pushRow('Gross Sales', 'gross_sales');
   pushRow('Discounts / Promos', 'total_discounts');
   pushRow('Refunds', 'total_refunded');
@@ -299,15 +299,15 @@ export default function PnL() {
             {!loading && periods.length > 0 && (
               <>
                 <ValueRow
-                  label="Units Sold" keyPath="units_sold" kind="number"
+                  label="Units Sold" keyPath="net_units_sold" kind="number"
                   expandable expanded={unitsExpanded}
                   onClick={() => setUnitsExpanded(s => !s)}
                 />
                 {unitsExpanded && (
                   <>
-                    <ValueRow label="Refunded Units" keyPath="units_refunded" kind="number" indent cost />
                     <ValueRow label="Organic Units" keyPath="organic_units" kind="number" indent />
                     <ValueRow label="PPC Units" keyPath="ppc_units" kind="number" indent />
+                    <ValueRow label="Refunded Units" keyPath="units_refunded" kind="number" indent cost />
                   </>
                 )}
                 <ValueRow label="Gross Sales" keyPath="gross_sales" bold highlight />
