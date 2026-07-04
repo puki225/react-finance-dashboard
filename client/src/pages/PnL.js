@@ -51,11 +51,15 @@ const fmtPct = (n) => parseFloat(n || 0).toFixed(1) + '%';
 
 function fmtPeriodLabel(period, group) {
   if (!period || period === '__total__') return 'Total';
+  // period is a plain "YYYY-MM-DD" string from the server, which JS parses as UTC midnight.
+  // Reading it back with local getters (getFullYear/toLocaleDateString without a timeZone) would
+  // shift the displayed day/month/year by one for any browser whose local timezone sits behind
+  // UTC — pinning everything to timeZone: 'UTC' keeps the label matched to the actual period.
   const d = new Date(period);
-  if (group === 'year') return String(d.getFullYear());
-  if (group === 'month') return d.toLocaleDateString('en-GB', { month: 'short', year: '2-digit' });
-  if (group === 'week') return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
-  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' });
+  if (group === 'year') return String(d.getUTCFullYear());
+  if (group === 'month') return d.toLocaleDateString('en-GB', { month: 'short', year: '2-digit', timeZone: 'UTC' });
+  if (group === 'week') return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
 }
 
 function getPath(obj, path) {

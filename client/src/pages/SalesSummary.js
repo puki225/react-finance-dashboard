@@ -111,12 +111,15 @@ function BreakdownCard({ title, rows, colors, fmt, emptyNote }) {
 const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 const fmt = makeFmt('£'); // default, overridden once summary loads
 
+// period/date strings from the server are plain "YYYY-MM-DD", which JS parses as UTC midnight.
+// Every getter/formatter below is pinned to UTC so labels can't shift by a day for browsers
+// whose local timezone sits behind UTC (matches the same fix applied in PnL.js).
 function makeFmtDate(data) {
-  const years = new Set((data || []).map(d => d.period ? new Date(d.period).getFullYear() : null).filter(Boolean));
+  const years = new Set((data || []).map(d => d.period ? new Date(d.period).getUTCFullYear() : null).filter(Boolean));
   const multiYear = years.size > 1;
-  return (d) => { if (!d) return ''; const date = new Date(d); const day = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }); return multiYear ? day + " '" + String(date.getFullYear()).slice(2) : day; };
+  return (d) => { if (!d) return ''; const date = new Date(d); const day = date.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' }); return multiYear ? day + " '" + String(date.getUTCFullYear()).slice(2) : day; };
 }
-const fmtDateFull = (d) => { if (!d) return ''; return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }); };
+const fmtDateFull = (d) => { if (!d) return ''; return new Date(d).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' }); };
 const COLORS = ['#7c6af7', '#34d399', '#fbbf24', '#f87171'];
 
 // Module-level formatter — updated by SalesSummary when reporting currency changes

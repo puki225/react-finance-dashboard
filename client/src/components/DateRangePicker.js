@@ -14,7 +14,12 @@ function getRange(preset) {
   const to = new Date().toISOString().split('T')[0];
   if (preset.all) return { from: '2020-01-01', to };
   if (preset.ytd) {
-    const from = new Date(new Date().getFullYear(), 0, 1).toISOString().split('T')[0];
+    // Build "Jan 1 of this year" directly from the UTC year, rather than constructing a
+    // local-timezone Date(year, 0, 1) and converting via toISOString(). That round-trip shifts
+    // the boundary back to Dec 31 of the prior year for any browser whose local timezone has a
+    // positive UTC offset at the turn of the year (e.g. most of continental Europe in winter,
+    // which sits at UTC+1 with no DST then) — which caused December orders to leak into "YTD".
+    const from = `${new Date().getUTCFullYear()}-01-01`;
     return { from, to };
   }
   if (preset.dtd) return { from: to, to };
