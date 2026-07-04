@@ -929,7 +929,8 @@ app.get('/api/pnl', async (req, res) => {
       return {
         period: periodKey,
         units_sold: unitsSold,
-        units_refunded: unitsRefunded,
+        units_refunded: -unitsRefunded,
+        net_units_sold: unitsSold - unitsRefunded,
         organic_units: organicUnits,
         ppc_units: ppcUnits,
         gross_sales: grossSales.toFixed(2),
