@@ -127,11 +127,11 @@ export default function PnL() {
   const [fulfillment, setFulfillment] = useState(() => localStorage.getItem('gb_pnl_fulfillment') || 'all');
   const [orderType, setOrderType] = useState(() => localStorage.getItem('gb_pnl_order_type') || 'all');
   const [search, setSearch] = useState('');
-  const [unitsExpanded, setUnitsExpanded] = useState(true);
-  const [cogsExpanded, setCogsExpanded] = useState(true);
-  const [feesExpanded, setFeesExpanded] = useState(true);
-  const [opexExpanded, setOpexExpanded] = useState(true);
-  const [otherFeesExpanded, setOtherFeesExpanded] = useState(true);
+  const [unitsExpanded, setUnitsExpanded] = useState(false);
+  const [cogsExpanded, setCogsExpanded] = useState(false);
+  const [feesExpanded, setFeesExpanded] = useState(false);
+  const [opexExpanded, setOpexExpanded] = useState(false);
+  const [otherFeesExpanded, setOtherFeesExpanded] = useState(false);
 
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_pnl_range', JSON.stringify(r)); };
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
