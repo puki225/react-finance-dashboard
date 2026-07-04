@@ -70,7 +70,7 @@ function prettifyFeeType(ft) {
     .split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
+function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, sym) {
   const cols = ['Line Item', ...periods.map(p => fmtPeriodLabel(p.period, group)), 'Total'];
   const rows = [];
   const pushRow = (label, key) => {
@@ -102,7 +102,12 @@ function downloadCsv(periods, totals, group, accountFeeTypes, sym) {
   for (const ft of accountFeeTypes) {
     if (parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0) pushRow('    ' + prettifyFeeType(ft), `opex.other_fees.account_fees.${ft}`);
   }
-  if (parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0) pushRow('    Adjustments', 'opex.other_fees.adjustments');
+  if (parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0) {
+    pushRow('    Adjustments', 'opex.other_fees.adjustments');
+    for (const at of adjustmentTypes) {
+      if (parseFloat(getPath(totals, `opex.other_fees.adjustment_items.${at}`) || 0) !== 0) pushRow('      ' + prettifyFeeType(at), `opex.other_fees.adjustment_items.${at}`);
+    }
+  }
   pushRow('  Other Fees - Non-Product Related', 'opex.other_fees.total');
   pushRow('Total OPEX', 'opex.total');
   pushRow('Profit', 'profit');
@@ -132,6 +137,7 @@ export default function PnL() {
   const [feesExpanded, setFeesExpanded] = useState(false);
   const [opexExpanded, setOpexExpanded] = useState(false);
   const [otherFeesExpanded, setOtherFeesExpanded] = useState(false);
+  const [adjustmentsExpanded, setAdjustmentsExpanded] = useState(false);
 
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_pnl_range', JSON.stringify(r)); };
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
@@ -163,6 +169,11 @@ export default function PnL() {
   const accountFeeRows = useMemo(() => (
     accountFeeTypes.filter(ft => parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0)
   ), [accountFeeTypes, totals]);
+
+  const adjustmentTypes = data?.adjustment_types || [];
+  const adjustmentRows = useMemo(() => (
+    adjustmentTypes.filter(at => parseFloat(getPath(totals, `opex.other_fees.adjustment_items.${at}`) || 0) !== 0)
+  ), [adjustmentTypes, totals]);
 
   const hasAdjustments = parseFloat(getPath(totals, 'opex.other_fees.adjustments') || 0) !== 0;
   const hasAccountFeeData = accountFeeRows.length > 0;
@@ -253,7 +264,7 @@ export default function PnL() {
           />
           <DateRangePicker value={range} onChange={handleRange} />
           <button
-            onClick={() => downloadCsv(periods, totals, group, accountFeeTypes, sym)}
+            onClick={() => downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, sym)}
             disabled={!periods.length}
             style={{ padding: '6px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: '1px solid var(--border)', background: 'var(--bg3)', color: periods.length ? 'var(--text)' : 'var(--muted)', cursor: periods.length ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)' }}
           >
@@ -349,8 +360,15 @@ export default function PnL() {
                       <ValueRow key={ft} label={prettifyFeeType(ft)} keyPath={`opex.other_fees.account_fees.${ft}`} indent={2} cost />
                     ))}
                     {otherFeesExpanded && hasAdjustments && (
-                      <ValueRow label="Adjustments" keyPath="opex.other_fees.adjustments" indent={2} cost />
+                      <ValueRow
+                        label="Adjustments" keyPath="opex.other_fees.adjustments" indent={2} cost
+                        expandable={adjustmentRows.length > 0} expanded={adjustmentsExpanded}
+                        onClick={() => setAdjustmentsExpanded(s => !s)}
+                      />
                     )}
+                    {otherFeesExpanded && adjustmentsExpanded && adjustmentRows.map(at => (
+                      <ValueRow key={at} label={prettifyFeeType(at)} keyPath={`opex.other_fees.adjustment_items.${at}`} indent={3} cost />
+                    ))}
                   </>
                 )}
 

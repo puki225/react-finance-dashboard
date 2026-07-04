@@ -821,16 +821,22 @@ app.get('/api/pnl', async (req, res) => {
     for (const r of mcfResult.rows) mcfByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.mcf_fees || 0);
 
     // Account fees: group by period, split into (a) named fee_type rows for display and
-    // (b) an Adjustments total, per period. Also track fee_type totals across the whole
+    // (b) itemized Adjustment rows by fee_type (e.g. ReserveDebit, WAREHOUSE_LOST,
+    // REVERSAL_REIMBURSEMENT), per period. Also track fee_type totals across the whole
     // range so the UI can list only the categories that actually have data.
     const accountFeesByPeriod = {}; // { period: { [feeType]: amount } }
-    const adjustmentsByPeriod = {}; // { period: amount }
+    const adjustmentsByPeriod = {}; // { period: amount } — scalar total, kept for OPEX math
+    const adjustmentItemsByPeriod = {}; // { period: { [feeType]: amount } } — itemized, for the dropdown
     const feeTypeTotals = {}; // { feeType: totalAbsAmount } — for sorting which rows to show
+    const adjustmentTypeTotals = {}; // { feeType: totalAbsAmount } — same, for Adjustments dropdown
     for (const r of accountFeesResult.rows) {
       const key = r.period.toISOString().split('T')[0];
       const amt = parseFloat(r.amount || 0);
       if (r.event_source === 'Adjustment') {
         adjustmentsByPeriod[key] = (adjustmentsByPeriod[key] || 0) + amt;
+        if (!adjustmentItemsByPeriod[key]) adjustmentItemsByPeriod[key] = {};
+        adjustmentItemsByPeriod[key][r.fee_type] = (adjustmentItemsByPeriod[key][r.fee_type] || 0) + amt;
+        adjustmentTypeTotals[r.fee_type] = (adjustmentTypeTotals[r.fee_type] || 0) + Math.abs(amt);
       } else {
         if (!accountFeesByPeriod[key]) accountFeesByPeriod[key] = {};
         accountFeesByPeriod[key][r.fee_type] = (accountFeesByPeriod[key][r.fee_type] || 0) + amt;
@@ -838,6 +844,7 @@ app.get('/api/pnl', async (req, res) => {
       }
     }
     const accountFeeTypes = Object.keys(feeTypeTotals).sort((a, b) => feeTypeTotals[b] - feeTypeTotals[a]);
+    const adjustmentTypes = Object.keys(adjustmentTypeTotals).sort((a, b) => adjustmentTypeTotals[b] - adjustmentTypeTotals[a]);
 
     function buildPeriodRow(periodKey, r) {
       const unitsSold = parseInt(r?.units_sold || 0, 10);
@@ -883,6 +890,11 @@ app.get('/api/pnl', async (req, res) => {
         accountFeesTotal += v;
       }
       const adjustments = fx(adjustmentsByPeriod[periodKey] || 0); // signed as Amazon reports it (can be +/-)
+      const adjustmentItemsRaw = adjustmentItemsByPeriod[periodKey] || {};
+      const adjustmentItems = {};
+      for (const at of adjustmentTypes) {
+        adjustmentItems[at] = fx(adjustmentItemsRaw[at] || 0); // signed as Amazon reports it (can be +/-)
+      }
       const ppcCost = -fx(ppcByPeriod[periodKey] || 0); // negative (spend)
 
       // Gross Margin / Product Contribution only include costs that can be attributed to a
@@ -956,6 +968,7 @@ app.get('/api/pnl', async (req, res) => {
             account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
             account_fees_total: accountFeesTotal.toFixed(2),
             adjustments: adjustments.toFixed(2),
+            adjustment_items: Object.fromEntries(Object.entries(adjustmentItems).map(([k, v]) => [k, v.toFixed(2)])),
             total: otherFeesTotal.toFixed(2),
           },
           total: opexTotal.toFixed(2),
@@ -1005,6 +1018,7 @@ app.get('/api/pnl', async (req, res) => {
     // captured before adding the '__total__' key itself, so it can't fold into its own sum.
     const sumMap = (m) => Object.values(m).reduce((s, v) => s + v, 0);
     const perPeriodAccountFees = Object.values(accountFeesByPeriod);
+    const perPeriodAdjustmentItems = Object.values(adjustmentItemsByPeriod);
     refundsByPeriod['__total__'] = sumMap(refundsByPeriod);
     unitsRefundedByPeriod['__total__'] = sumMap(unitsRefundedByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
@@ -1015,12 +1029,17 @@ app.get('/api/pnl', async (req, res) => {
     for (const ft of accountFeeTypes) {
       accountFeesByPeriod['__total__'][ft] = perPeriodAccountFees.reduce((s, m) => s + (m[ft] || 0), 0);
     }
+    adjustmentItemsByPeriod['__total__'] = {};
+    for (const at of adjustmentTypes) {
+      adjustmentItemsByPeriod['__total__'][at] = perPeriodAdjustmentItems.reduce((s, m) => s + (m[at] || 0), 0);
+    }
     const totals = buildPeriodRow('__total__', totalRaw);
 
     res.json({
       periods,
       totals,
       account_fee_types: accountFeeTypes,
+      adjustment_types: adjustmentTypes,
       currency_symbol: currencySymbol(reportingCurrency),
       group: trunc,
     });
