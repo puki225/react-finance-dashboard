@@ -1659,7 +1659,8 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         SUM(COALESCE(aol.fee_digital_services, 0))::numeric AS fee_digital_services,
         SUM(COALESCE(aol.fee_giftwrap_chargeback, 0))::numeric AS fee_giftwrap,
         SUM(COALESCE(aol.fee_shipping_chargeback, 0))::numeric AS fee_shipping_chargeback,
-        SUM(aol.quantity)::int AS units_sold
+        SUM(aol.quantity)::int AS units_sold,
+        BOOL_OR(aol.is_estimated_fee) AS has_estimated_fees
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -1805,6 +1806,9 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const feeShipping        = fx(amz.fee_shipping_chargeback || 0);
     const feeMCF             = fx(shp.mcf_fees || 0);
     const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF;
+    // True when any Amazon fee for this SKU/period is still an estimate (from /estimate-fees,
+    // pending settlement via the Finances API) rather than a confirmed final amount.
+    const hasEstimatedFees = amz.has_estimated_fees === true;
 
     // Sum COGS components across both channels
     const cogsSt  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_standard  || 0), 0);
@@ -1839,6 +1843,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         shipping_chargeback: f(-feeShipping),
         mcf_fulfillment:     f(-feeMCF),
         total:               f(-totalFees),
+        has_estimated:       hasEstimatedFees,
       },
       cogs: {
         standard:  f(-cogsSt),

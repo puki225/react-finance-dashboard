@@ -121,9 +121,16 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
     );
   };
 
-  const Row = ({ label, value, bold, indent, isBase }) => (
+  const EstBadge = () => (
+    <span title="Includes estimated Amazon fees, pending settlement via the Finances API" style={{ marginLeft: 6, padding: '1px 5px', borderRadius: 4, fontSize: 9, fontWeight: 700, background: '#fbbf2420', color: '#fbbf24', letterSpacing: '0.05em', verticalAlign: 'middle' }}>EST</span>
+  );
+
+  const Row = ({ label, value, bold, indent, isBase, est }) => (
     <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '5px 0', borderBottom: '1px solid var(--border)', paddingLeft: indent ? 16 : 0, alignItems: 'center' }}>
-      <span style={{ fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400, color: bold ? 'var(--text)' : 'var(--muted)' }}>{label}</span>
+      <span style={{ fontSize: bold ? 13 : 12, fontWeight: bold ? 700 : 400, color: bold ? 'var(--text)' : 'var(--muted)' }}>
+        {label}
+        {est && <EstBadge />}
+      </span>
       {fmtVal(value, isBase)}
     </div>
   );
@@ -160,7 +167,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         {parseFloat(data.fees.digital_services) !== 0 && <Row label="Digital Services" value={data.fees.digital_services} indent />}
         {parseFloat(data.fees.giftwrap) !== 0 && <Row label="Giftwrap Chargeback" value={data.fees.giftwrap} indent />}
         {parseFloat(data.fees.shipping_chargeback) !== 0 && <Row label="Shipping Chargeback" value={data.fees.shipping_chargeback} indent />}
-        <Row label="Total Fees" value={data.fees.total} bold />
+        <Row label="Total Fees" value={data.fees.total} bold est={data.fees.has_estimated} />
       </>}
 
       {data.has_cogs && <>
@@ -173,7 +180,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       </>}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: margin >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (margin >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Margin</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)' }}>Gross Margin{data.fees.has_estimated && <EstBadge />}</span>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: margin >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
           {margin < 0 ? `−${s}${Math.abs(margin).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${s}${margin.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({marginPct.toFixed(1)}%)</span>
@@ -185,7 +192,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
       </>}
 
       <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', padding: '10px 12px', marginTop: 10, borderRadius: 8, background: contribution >= 0 ? '#34d39920' : '#f8717120', border: '1px solid ' + (contribution >= 0 ? '#34d39940' : '#f8717140'), alignItems: 'center' }}>
-        <span style={{ fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)' }}>Product Contribution</span>
+        <span style={{ fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)' }}>Product Contribution{data.fees.has_estimated && <EstBadge />}</span>
         <span style={{ fontFamily: 'var(--mono)', fontSize: 13, fontWeight: 700, color: contribution >= 0 ? 'var(--green)' : 'var(--red)', whiteSpace: 'nowrap' }}>
           {contribution < 0 ? `−${s}${Math.abs(contribution).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` : `${s}${contribution.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`}
           {' '}<span style={{ fontSize: 11, fontWeight: 400 }}>({contributionPct.toFixed(1)}%)</span>
