@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
 
@@ -68,6 +68,42 @@ const CustomTooltip = ({ active, payload, label, fmt, name }) => {
   );
 };
 
+// Amazon's aged-inventory surcharge kicks in at 271 days and steps up again at 365 - "at risk"
+// (181-270) is the bucket about to fall into a charged tier, not yet charged itself.
+const AGE_BUCKETS = [
+  { key: 'age_0_90',    label: '0-90d',   status: 'safe' },
+  { key: 'age_91_180',  label: '91-180d', status: 'safe' },
+  { key: 'age_181_270', label: '181-270d', status: 'risk' },
+  { key: 'age_271_365', label: '271-365d', status: 'critical' },
+  { key: 'age_365_plus', label: '365d+',  status: 'critical' },
+];
+const STATUS_COLOR = { safe: '#34d399', risk: '#fbbf24', critical: '#f87171' };
+const STATUS_LABEL = { safe: 'Safe', risk: 'At risk of surcharge', critical: 'Incurring surcharge' };
+
+const AgingTooltip = ({ active, payload }) => {
+  if (!active || !payload?.length) return null;
+  const p = payload[0];
+  const bucket = AGE_BUCKETS.find(b => b.key === p.payload.key);
+  return (
+    <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{bucket?.label} · {STATUS_LABEL[bucket?.status]}</div>
+      <div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: STATUS_COLOR[bucket?.status] }}>{fmtN(p.value)} units</div>
+    </div>
+  );
+};
+
+const SellThroughTooltip = ({ active, payload, label }) => {
+  if (!active || !payload?.length) return null;
+  const row = payload[0].payload;
+  return (
+    <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
+      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{fmtDateFull(label)}</div>
+      <div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: '#7c6af7' }}>Sell-through: {row.sell_through_pct}%</div>
+      <div style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--muted)', marginTop: 2 }}>{fmtN(row.units_sold)} sold of {fmtN(row.units_on_hand)} on hand</div>
+    </div>
+  );
+};
+
 const COLS = [
   { key: 'product_title', label: 'Product',  width: '1fr' },
   { key: 'sellable',      label: 'Sellable',  width: '110px' },
@@ -88,6 +124,10 @@ export default function Inventory() {
 
   const { data: rows, loading } = useApi('/api/inventory');
   const { data: history, loading: loadingHistory } = useApi('/api/inventory/history', selectedSku ? { sku: selectedSku } : {});
+  const { data: sellThrough, loading: loadingSellThrough } = useApi('/api/inventory/sell-through', selectedSku ? { sku: selectedSku } : {});
+  const { data: aging, loading: loadingAging } = useApi('/api/inventory/aging', selectedSku ? { sku: selectedSku } : {});
+
+  const agingRows = useMemo(() => AGE_BUCKETS.map(b => ({ key: b.key, label: b.label, units: aging?.[b.key] || 0, status: b.status })), [aging]);
 
   const sym = history?.currency_symbol || '£';
   const fmtCurrency = useMemo(() => makeFmt(sym), [sym]);
@@ -95,6 +135,7 @@ export default function Inventory() {
   const selectedRow = selectedSku ? rows?.find(r => r.sku === selectedSku) : null;
   const unitsDomain = useMemo(() => computeDomain(historyRows, 'units'), [historyRows]);
   const valueDomain = useMemo(() => computeDomain(historyRows, 'value'), [historyRows]);
+  const sellThroughDomain = useMemo(() => computeDomain(sellThrough || [], 'sell_through_pct'), [sellThrough]);
 
   const handleSort = (key) => {
     if (sort === key) setDir(dir === 'desc' ? 'asc' : 'desc');
@@ -176,6 +217,59 @@ export default function Inventory() {
                 <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={valueDomain} />
                 <Tooltip content={<CustomTooltip fmt={fmtCurrency} name="Value" />} />
                 <Area type="monotone" dataKey="value" name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
+              </AreaChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+
+      {/* Aging and sell-through - also different scales (unit counts vs a %), so kept as
+          separate small-multiples rather than combined onto one axis */}
+      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 16 }}>
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>
+            Inventory Aging {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
+          </h2>
+          {loadingAging ? (<div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
+            <>
+              <ResponsiveContainer width="100%" height={200}>
+                <BarChart data={agingRows} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
+                  <XAxis dataKey="label" tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                  <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} />
+                  <Tooltip content={<AgingTooltip />} />
+                  <Bar dataKey="units" radius={[3, 3, 0, 0]}>
+                    {agingRows.map((r, i) => <Cell key={i} fill={STATUS_COLOR[r.status]} />)}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
+                {['safe', 'risk', 'critical'].map(s => (
+                  <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                    <div style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLOR[s], flexShrink: 0 }} />
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>{STATUS_LABEL[s]}</span>
+                  </div>
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+
+        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>
+            Sell-Through {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
+          </h2>
+          {loadingSellThrough ? (<div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
+            <ResponsiveContainer width="100%" height={200}>
+              <AreaChart data={sellThrough || []} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
+                <defs>
+                  <linearGradient id="gradSellThrough" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7c6af7" stopOpacity={0.3} /><stop offset="100%" stopColor="#7c6af7" stopOpacity={0} /></linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
+                <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
+                <YAxis tickFormatter={(v) => v + '%'} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={45} domain={sellThroughDomain} />
+                <Tooltip content={<SellThroughTooltip />} />
+                <Area type="monotone" dataKey="sell_through_pct" name="Sell-Through" stroke="#7c6af7" strokeWidth={2} fill="url(#gradSellThrough)" />
               </AreaChart>
             </ResponsiveContainer>
           )}
