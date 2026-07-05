@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import SalesSummary from './pages/SalesSummary';
 import ProductBreakdown from './pages/ProductBreakdown';
 import PnL from './pages/PnL';
+import Inventory from './pages/Inventory';
 import Settings from './pages/Settings';
 import { useIsMobile } from './hooks/useIsMobile';
 
@@ -10,7 +11,7 @@ const NAV = [
   { id: 'products',  label: 'Product Breakdown',   icon: '◉', active: true },
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
-  { id: 'inventory', label: 'Inventory',            icon: '◑', active: false },
+  { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
   { id: 'cashflow',  label: 'Cash Flow',            icon: '◒', active: false },
   { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
@@ -146,7 +147,7 @@ export default function App() {
         {active === 'products'  && <ProductBreakdown />}
         {active === 'pnl'       && <PnL />}
         {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
-        {active === 'inventory' && <Placeholder label="Inventory" />}
+        {active === 'inventory' && <Inventory />}
         {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
         {active === 'settings'  && <Settings />}
       </div>

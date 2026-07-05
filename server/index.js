@@ -2252,6 +2252,37 @@ app.get('/api/brands', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Inventory — latest FBA stock snapshot per SKU
+app.get('/api/inventory', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH latest AS (
+        SELECT DISTINCT ON (sku)
+          sku, asin, fulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity,
+          inbound_receiving_quantity, reserved_quantity, unfulfillable_quantity,
+          researching_quantity, total_quantity, snapshot_date
+        FROM amazon_inventory_snapshots
+        ORDER BY sku, snapshot_date DESC
+      )
+      SELECT
+        l.sku,
+        COALESCE(l.asin, sp.asin) AS asin,
+        sp.image_url,
+        sp.product_name AS product_title,
+        l.fulfillable_quantity::int AS sellable,
+        (l.inbound_working_quantity + l.inbound_shipped_quantity + l.inbound_receiving_quantity)::int AS inbound,
+        l.unfulfillable_quantity::int AS damaged,
+        (l.reserved_quantity + l.researching_quantity)::int AS other,
+        l.total_quantity::int AS total,
+        l.snapshot_date
+      FROM latest l
+      LEFT JOIN sku_parameters sp ON sp.sku = l.sku
+      ORDER BY l.total_quantity DESC
+    `);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
