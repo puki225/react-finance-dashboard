@@ -460,7 +460,19 @@ app.get('/api/recent-orders', async (req, res) => {
         FROM shopify_orders WHERE financial_status != 'voided' ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
     }
-    res.json(result.rows);
+
+    // FX conversion — same period-average-rate pattern as every other revenue endpoint
+    const reportingCurrency = await getReportingCurrency();
+    const dateFrom = result.rows.length ? result.rows[result.rows.length - 1].order_date : new Date().toISOString().split('T')[0];
+    const dateTo = result.rows.length ? result.rows[0].order_date : new Date().toISOString().split('T')[0];
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const rows = result.rows.map(r => ({
+      ...r,
+      gross_revenue: (parseFloat(r.gross_revenue || 0) * fxRate).toFixed(2),
+      net_revenue: (parseFloat(r.net_revenue || 0) * fxRate).toFixed(2),
+      total_refunded: (parseFloat(r.total_refunded || 0) * fxRate).toFixed(2),
+    }));
+    res.json(rows);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
