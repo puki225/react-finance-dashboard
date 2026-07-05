@@ -2283,6 +2283,50 @@ app.get('/api/inventory', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Inventory units + £ value over time, optionally filtered to a single SKU.
+// Value uses each SKU's current COGS rate (itemized, falling back to flat unit_cogs) applied
+// uniformly across history - not date-matched to historical cogs_entries like the P&L pages,
+// since this is a present-day valuation of past stock levels, not a historical revenue figure.
+app.get('/api/inventory/history', async (req, res) => {
+  const { sku } = req.query;
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.snapshot_date,
+        SUM(s.total_quantity)::int AS units,
+        SUM(s.total_quantity * (
+          COALESCE(
+          NULLIF(sp.cogs_standard, 0),
+          CASE WHEN COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+            THEN COALESCE(sp.unit_cogs, 0) ELSE 0 END, 0)
+          + COALESCE(NULLIF(sp.cogs_freight,   0), 0)
+          + COALESCE(NULLIF(sp.cogs_demurrage, 0), 0)
+          + COALESCE(NULLIF(sp.cogs_quality,   0), 0)
+          + COALESCE(NULLIF(sp.cogs_other,     0), 0)
+        ))::numeric(12,2) AS value_gbp
+      FROM amazon_inventory_snapshots s
+      LEFT JOIN sku_parameters sp ON sp.sku = s.sku
+      WHERE $1::text IS NULL OR s.sku = $1
+      GROUP BY s.snapshot_date
+      ORDER BY s.snapshot_date
+    `, [sku || null]);
+
+    const reportingCurrency = await getReportingCurrency();
+    const today = new Date().toISOString().split('T')[0];
+    const fxRate = await getFxRate('GBP', reportingCurrency, today);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+
+    res.json({
+      currency_symbol: sym,
+      rows: result.rows.map(r => ({
+        snapshot_date: r.snapshot_date,
+        units: r.units,
+        value: (parseFloat(r.value_gbp || 0) * fxRate).toFixed(2),
+      })),
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
