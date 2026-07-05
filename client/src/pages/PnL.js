@@ -27,7 +27,7 @@ const COGS_LABELS = [
   ['other', 'Other COGS'],
 ];
 
-const GROUPS = ['day', 'week', 'month', 'year'];
+const GROUPS = ['day', 'week', 'month', 'quarter', 'year'];
 
 const toggleBtn = (active) => ({
   padding: '5px 12px', borderRadius: 6, fontSize: 12, fontWeight: 600,
@@ -56,6 +56,9 @@ function fmtPeriodLabel(period, group) {
   // UTC — pinning everything to timeZone: 'UTC' keeps the label matched to the actual period.
   const d = new Date(period);
   if (group === 'year') return String(d.getUTCFullYear());
+  // Postgres's DATE_TRUNC('quarter', ...) returns the quarter's first day (e.g. 2026-07-01 for
+  // Q3) - derive the quarter number from that month rather than needing a separate server field.
+  if (group === 'quarter') return `Q${Math.floor(d.getUTCMonth() / 3) + 1} ${d.getUTCFullYear()}`;
   if (group === 'month') return d.toLocaleDateString('en-GB', { month: 'short', year: '2-digit', timeZone: 'UTC' });
   if (group === 'week') return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
   return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
@@ -248,9 +251,12 @@ export default function PnL() {
             All channels — Product Contribution reflects per-product economics; OPEX bridges to Profit (OPEX and PPC remain Amazon-specific overhead)
           </p>
         </div>
-        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
-          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
-            {GROUPS.map(g => (<button key={g} onClick={() => handleGroup(g)} style={{ ...toggleBtn(group === g), textTransform: 'capitalize' }}>{g}</button>))}
+        <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap' }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+            <span style={{ fontSize: 9, fontWeight: 700, color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase', paddingLeft: 2 }}>Group By</span>
+            <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+              {GROUPS.map(g => (<button key={g} onClick={() => handleGroup(g)} style={{ ...toggleBtn(group === g), textTransform: 'capitalize' }}>{g}</button>))}
+            </div>
           </div>
           <DateRangePicker value={range} onChange={handleRange} />
           <button
