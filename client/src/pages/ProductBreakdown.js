@@ -38,11 +38,11 @@ const COLS = [
   { key: 'acos',             label: 'ACOS',            sortable: false, width: '11%'  },
   { key: 'channels',         label: 'Channel',         sortable: false, width: '7%'   },
 ];
-// Shared column template for the header + every row — a floor of 160px on the product column
-// (rather than minmax(0,1fr)) keeps titles readable once the table scrolls horizontally on
-// narrow screens, instead of squishing to unreadable width.
-const TABLE_GRID = '36px minmax(160px,1fr) 90px 100px 80px 100px 70px 110px 100px';
-const TABLE_MIN_WIDTH = 36 + 160 + 90 + 100 + 80 + 100 + 70 + 110 + 100;
+// Shared column template for the header + every row — the product column no longer needs to
+// fit a long title (shown as a hover tooltip on the image instead), so it just needs room for
+// the image + SKU/ASIN; the freed-up width goes to the numeric columns, which run bigger text.
+const TABLE_GRID = '36px minmax(100px,1fr) 100px 110px 90px 110px 80px 120px 110px';
+const TABLE_MIN_WIDTH = 36 + 100 + 100 + 110 + 90 + 110 + 80 + 120 + 110;
 
 function PnlPanel({ sku, from, to, sym, country, channel }) {
   // Normalise channel: 'both' and undefined → 'all'
@@ -421,59 +421,60 @@ export default function ProductBreakdown() {
                   </button>
                 </div>
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, overflow: 'hidden' }}>
-                  <div style={{ width: 44, height: 44, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                    {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 16, opacity: 0.2 }}>◉</span>}
+                  {/* Product title shows as a native tooltip on hover instead of taking up row
+                      space permanently — frees width/font size for the numeric columns. */}
+                  <div title={row.product_title || row.sku} style={{ width: 48, height: 48, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'help' }}>
+                    {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 18, opacity: 0.2 }}>◉</span>}
                   </div>
                   <div style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={row.product_title}>{row.product_title || row.sku}</div>
-                    <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.sku}</div>
-                    {row.asin && <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.asin}</div>}
+                    <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.sku}</div>
+                    {row.asin && <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.asin}</div>}
                   </div>
                 </div>
 
                 {/* Units */}
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
-                  <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(row.units_sold)}</span>
+                  <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(row.units_sold)}</span>
                   {row.units_refunded > 0 && (
-                    <span style={{ fontSize: 11, color: 'var(--red)', fontFamily: 'var(--mono)' }}>
+                    <span style={{ fontSize: 12, color: 'var(--red)', fontFamily: 'var(--mono)' }}>
                       −{fmtN(row.units_refunded)} ({parseFloat(row.units_refunded / row.units_sold * 100).toFixed(0)}%)
                     </span>
                   )}
-                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
-                  <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
                 </div>
 
                 {/* Revenue */}
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 3 }}>
-                  <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmt(row.gross_sales)}</span>
-                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(row.net_revenue)}</span>
+                  <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmt(row.gross_sales)}</span>
+                  <span style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(row.net_revenue)}</span>
                 </div>
 
                 {/* Margin % */}
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
                   {hasCogs ? (
                     <>
-                      <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: marginPct >= 20 ? 'var(--green)' : marginPct >= 10 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(marginPct)}</span>
-                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>gross</span>
+                      <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: marginPct >= 20 ? 'var(--green)' : marginPct >= 10 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(marginPct)}</span>
+                      <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>gross</span>
                     </>
-                  ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
+                  ) : <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>}
                 </div>
 
                 {/* Contribution £ */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {hasCogs ? (
-                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: productContribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(productContribution)}</span>
+                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: productContribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(productContribution)}</span>
                   ) : (
-                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>No COGS</span>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>No COGS</span>
                   )}
                 </div>
 
                 {/* ROI */}
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                   {hasCogs ? (
-                    <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: roiPct >= 100 ? 'var(--green)' : roiPct >= 40 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(roiPct)}</span>
+                    <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: roiPct >= 100 ? 'var(--green)' : roiPct >= 40 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(roiPct)}</span>
                   ) : (
-                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>
+                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>
                   )}
                 </div>
 
@@ -481,11 +482,11 @@ export default function ProductBreakdown() {
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
                   {hasPpc ? (
                     <>
-                      <span style={{ fontSize: 13, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.acos) <= 15 ? 'var(--green)' : parseFloat(row.acos) <= 30 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(row.acos)}</span>
-                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>TACOS: {fmtPct(row.tacos)}</span>
-                      <span style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>ROAS: {row.roas}x</span>
+                      <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.acos) <= 15 ? 'var(--green)' : parseFloat(row.acos) <= 30 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(row.acos)}</span>
+                      <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>TACOS: {fmtPct(row.tacos)}</span>
+                      <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>ROAS: {row.roas}x</span>
                     </>
-                  ) : <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>}
+                  ) : <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>}
                 </div>
 
                 {/* Channel + Breakdown button */}
