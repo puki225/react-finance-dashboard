@@ -67,8 +67,12 @@ function getPath(obj, path) {
 
 // Prettify raw Amazon fee_type strings (e.g. "Subscription" / "FBAStorageFee") into readable labels
 // without a hardcoded lookup table, since real fee_type values haven't been confirmed via sync yet.
+// FBAPerUnitFulfillmentFee is the one exception - it's Amazon's MCF (Multi-Channel Fulfillment)
+// charge, and the generic camelCase splitter renders it as the confusing "FBAPer Unit Fulfillment
+// Fee" (no space after "FBA" since both letters around the split point are uppercase).
 function prettifyFeeType(ft) {
   if (!ft) return 'Unknown Fee';
+  if (ft === 'FBAPerUnitFulfillmentFee') return 'MCF Fees';
   return ft.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/_/g, ' ')
     .split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
