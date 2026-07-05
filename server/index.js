@@ -2263,6 +2263,18 @@ app.get('/api/inventory', async (req, res) => {
           researching_quantity, total_quantity, snapshot_date
         FROM amazon_inventory_snapshots
         ORDER BY sku, snapshot_date DESC
+      ),
+      latest_aging AS (
+        SELECT DISTINCT ON (sku) sku, age_0_90, age_91_180, age_181_270, age_271_365, age_365_plus
+        FROM amazon_inventory_aging
+        ORDER BY sku, snapshot_date DESC
+      ),
+      -- All-time actual long-term storage surcharge Amazon has billed for this SKU - real
+      -- charged amounts, not a projected/speculative figure (amount is stored negative).
+      ltsf_by_sku AS (
+        SELECT sku, SUM(-amount)::numeric(12,2) AS surcharge_gbp
+        FROM amazon_ltsf_charges
+        GROUP BY sku
       )
       SELECT
         l.sku,
@@ -2274,12 +2286,29 @@ app.get('/api/inventory', async (req, res) => {
         l.unfulfillable_quantity::int AS damaged,
         (l.reserved_quantity + l.researching_quantity)::int AS other,
         l.total_quantity::int AS total,
-        l.snapshot_date
+        l.snapshot_date,
+        COALESCE(la.age_0_90, 0)::int AS age_0_90,
+        COALESCE(la.age_91_180, 0)::int AS age_91_180,
+        COALESCE(la.age_181_270, 0)::int AS age_181_270,
+        COALESCE(la.age_271_365, 0)::int AS age_271_365,
+        COALESCE(la.age_365_plus, 0)::int AS age_365_plus,
+        COALESCE(ltsf.surcharge_gbp, 0)::numeric(12,2) AS surcharge_gbp
       FROM latest l
       LEFT JOIN sku_parameters sp ON sp.sku = l.sku
+      LEFT JOIN latest_aging la ON la.sku = l.sku
+      LEFT JOIN ltsf_by_sku ltsf ON ltsf.sku = l.sku
       ORDER BY l.total_quantity DESC
     `);
-    res.json(result.rows);
+
+    const reportingCurrency = await getReportingCurrency();
+    const today = new Date().toISOString().split('T')[0];
+    const fxRate = await getFxRate('GBP', reportingCurrency, today);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+
+    res.json({
+      currency_symbol: sym,
+      rows: result.rows.map(r => ({ ...r, surcharge: (parseFloat(r.surcharge_gbp || 0) * fxRate).toFixed(2) })),
+    });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
@@ -2368,29 +2397,6 @@ app.get('/api/inventory/sell-through', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Latest units-by-age-bucket, for flagging aged inventory at risk of (271-365 days) or
-// already incurring (365+ days) Amazon's long-term storage surcharge.
-app.get('/api/inventory/aging', async (req, res) => {
-  const { sku } = req.query;
-  try {
-    const result = await pool.query(`
-      WITH latest AS (
-        SELECT DISTINCT ON (sku) sku, age_0_90, age_91_180, age_181_270, age_271_365, age_365_plus
-        FROM amazon_inventory_aging
-        ORDER BY sku, snapshot_date DESC
-      )
-      SELECT
-        COALESCE(SUM(age_0_90), 0)::int AS age_0_90,
-        COALESCE(SUM(age_91_180), 0)::int AS age_91_180,
-        COALESCE(SUM(age_181_270), 0)::int AS age_181_270,
-        COALESCE(SUM(age_271_365), 0)::int AS age_271_365,
-        COALESCE(SUM(age_365_plus), 0)::int AS age_365_plus
-      FROM latest
-      WHERE $1::text IS NULL OR sku = $1
-    `, [sku || null]);
-    res.json(result.rows[0] || { age_0_90: 0, age_91_180: 0, age_181_270: 0, age_271_365: 0, age_365_plus: 0 });
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
 
 // Sync status
 app.get('/api/sync-status', async (req, res) => {

@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { createPortal } from 'react-dom';
-import { AreaChart, Area, BarChart, Bar, Cell, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
+import { AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
 
@@ -71,26 +71,14 @@ const CustomTooltip = ({ active, payload, label, fmt, name }) => {
 // Amazon's aged-inventory surcharge kicks in at 271 days and steps up again at 365 - "at risk"
 // (181-270) is the bucket about to fall into a charged tier, not yet charged itself.
 const AGE_BUCKETS = [
-  { key: 'age_0_90',    label: '0-90d',   status: 'safe' },
-  { key: 'age_91_180',  label: '91-180d', status: 'safe' },
-  { key: 'age_181_270', label: '181-270d', status: 'risk' },
-  { key: 'age_271_365', label: '271-365d', status: 'critical' },
-  { key: 'age_365_plus', label: '365d+',  status: 'critical' },
+  { key: 'age_0_90',    label: '0-90',   status: 'safe' },
+  { key: 'age_91_180',  label: '91-180', status: 'safe' },
+  { key: 'age_181_270', label: '181-270', status: 'risk' },
+  { key: 'age_271_365', label: '271-365', status: 'critical' },
+  { key: 'age_365_plus', label: '365+',  status: 'critical' },
 ];
 const STATUS_COLOR = { safe: '#34d399', risk: '#fbbf24', critical: '#f87171' };
 const STATUS_LABEL = { safe: 'Safe', risk: 'At risk of surcharge', critical: 'Incurring surcharge' };
-
-const AgingTooltip = ({ active, payload }) => {
-  if (!active || !payload?.length) return null;
-  const p = payload[0];
-  const bucket = AGE_BUCKETS.find(b => b.key === p.payload.key);
-  return (
-    <div style={{ background: '#1a1a24', border: '1px solid #ffffff18', borderRadius: 8, padding: '10px 14px' }}>
-      <div style={{ fontSize: 11, color: '#6b6b80', marginBottom: 6 }}>{bucket?.label} · {STATUS_LABEL[bucket?.status]}</div>
-      <div style={{ fontSize: 13, fontFamily: 'var(--mono)', color: STATUS_COLOR[bucket?.status] }}>{fmtN(p.value)} units</div>
-    </div>
-  );
-};
 
 const SellThroughTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
@@ -105,15 +93,17 @@ const SellThroughTooltip = ({ active, payload, label }) => {
 };
 
 const COLS = [
-  { key: 'product_title', label: 'Product',  width: '1fr' },
-  { key: 'sellable',      label: 'Sellable',  width: '110px' },
-  { key: 'inbound',       label: 'Inbound',   width: '110px' },
-  { key: 'damaged',       label: 'Damaged',   width: '110px' },
-  { key: 'other',         label: 'Other',     width: '110px' },
-  { key: 'total',         label: 'Total',     width: '110px' },
+  { key: 'product_title', label: 'Product',  width: '1fr',   sortable: false },
+  { key: 'sellable',      label: 'Sellable',  width: '100px', sortable: true },
+  { key: 'inbound',       label: 'Inbound',   width: '100px', sortable: true },
+  { key: 'damaged',       label: 'Damaged',   width: '100px', sortable: true },
+  { key: 'other',         label: 'Other',     width: '100px', sortable: true },
+  { key: 'total',         label: 'Total',     width: '100px', sortable: true },
+  { key: 'aging',         label: 'Aging (days)', width: '270px', sortable: false },
+  { key: 'surcharge',     label: 'Est. Surcharge Paid', width: '150px', sortable: true },
 ];
-const TABLE_GRID = 'minmax(160px,1fr) 110px 110px 110px 110px 110px';
-const TABLE_MIN_WIDTH = 160 + 110 * 5;
+const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 270px 150px';
+const TABLE_MIN_WIDTH = 160 + 100 * 5 + 270 + 150;
 
 export default function Inventory() {
   const isMobile = useIsMobile();
@@ -121,15 +111,14 @@ export default function Inventory() {
   const [dir, setDir] = useState('desc');
   const [selectedSku, setSelectedSku] = useState(null);
   const [hoverTip, setHoverTip] = useState(null);
+  const [chartMetric, setChartMetric] = useState('units'); // 'units' | 'value'
 
-  const { data: rows, loading } = useApi('/api/inventory');
+  const { data: inventory, loading } = useApi('/api/inventory');
   const { data: history, loading: loadingHistory } = useApi('/api/inventory/history', selectedSku ? { sku: selectedSku } : {});
   const { data: sellThrough, loading: loadingSellThrough } = useApi('/api/inventory/sell-through', selectedSku ? { sku: selectedSku } : {});
-  const { data: aging, loading: loadingAging } = useApi('/api/inventory/aging', selectedSku ? { sku: selectedSku } : {});
 
-  const agingRows = useMemo(() => AGE_BUCKETS.map(b => ({ key: b.key, label: b.label, units: aging?.[b.key] || 0, status: b.status })), [aging]);
-
-  const sym = history?.currency_symbol || '£';
+  const rows = inventory?.rows;
+  const sym = inventory?.currency_symbol || '£';
   const fmtCurrency = useMemo(() => makeFmt(sym), [sym]);
   const historyRows = history?.rows || [];
   const selectedRow = selectedSku ? rows?.find(r => r.sku === selectedSku) : null;
@@ -152,7 +141,7 @@ export default function Inventory() {
     const mult = dir === 'asc' ? 1 : -1;
     return [...rows].sort((a, b) => {
       if (sort === 'product_title') return (a.product_title || a.sku).localeCompare(b.product_title || b.sku) * mult;
-      return (parseInt(a[sort] || 0) - parseInt(b[sort] || 0)) * mult;
+      return (parseFloat(a[sort] || 0) - parseFloat(b[sort] || 0)) * mult;
     });
   }, [rows, sort, dir]);
 
@@ -165,93 +154,57 @@ export default function Inventory() {
         <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Latest FBA stock levels by SKU</p>
       </div>
 
-      {/* Charts - units and value are different scales, so two small-multiple charts
-          rather than one dual-axis chart */}
+      {/* Units/Value share one chart with a toggle (a real dual-axis chart would be ambiguous
+          to read since they're different scales) - Sell-Through sits beside it since it's a
+          third, independent measure (a %). */}
       <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 16 }}>
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, flexWrap: 'wrap', gap: 8 }}>
             <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>
-              Units {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
+              {chartMetric === 'units' ? 'Units' : 'Value'} {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
             </h2>
-            {selectedSku && (
-              <button onClick={() => setSelectedSku(null)} style={{ background: 'none', border: 'none', color: 'var(--muted)', fontSize: 11, cursor: 'pointer', fontFamily: 'var(--font)' }}>
-                Clear ×
-              </button>
-            )}
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+              <div style={{ display: 'flex', gap: 4, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8, padding: 3 }}>
+                {[{ id: 'units', label: 'Units' }, { id: 'value', label: 'Value' }].map(m => (
+                  <button key={m.id} onClick={() => setChartMetric(m.id)}
+                    style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: 'none', background: chartMetric === m.id ? 'var(--accent)20' : 'transparent', color: chartMetric === m.id ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)' }}>
+                    {m.label}
+                  </button>
+                ))}
+              </div>
+              {selectedSku && (
+                <button onClick={() => setSelectedSku(null)} style={{ background: 'none', border: 'none', color: 'var(--muted)', fontSize: 11, cursor: 'pointer', fontFamily: 'var(--font)' }}>
+                  Clear ×
+                </button>
+              )}
+            </div>
           </div>
           {loadingHistory ? (<div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
             <ResponsiveContainer width="100%" height={200}>
               <AreaChart data={historyRows} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
                 <defs>
                   <linearGradient id="gradUnits" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#7c6af7" stopOpacity={0.3} /><stop offset="100%" stopColor="#7c6af7" stopOpacity={0} /></linearGradient>
-                </defs>
-                <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
-                <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} domain={unitsDomain} />
-                <Tooltip content={<CustomTooltip fmt={fmtN} name="Units" />} />
-                <Area type="monotone" dataKey="units" name="Units" stroke="#7c6af7" strokeWidth={2} fill="url(#gradUnits)" />
-              </AreaChart>
-            </ResponsiveContainer>
-          )}
-        </div>
-
-        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20 }}>
-            <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>
-              Value {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
-            </h2>
-            {selectedSku && (
-              <button onClick={() => setSelectedSku(null)} style={{ background: 'none', border: 'none', color: 'var(--muted)', fontSize: 11, cursor: 'pointer', fontFamily: 'var(--font)' }}>
-                Clear ×
-              </button>
-            )}
-          </div>
-          {loadingHistory ? (<div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <AreaChart data={historyRows} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-                <defs>
                   <linearGradient id="gradValue" x1="0" y1="0" x2="0" y2="1"><stop offset="0%" stopColor="#34d399" stopOpacity={0.3} /><stop offset="100%" stopColor="#34d399" stopOpacity={0} /></linearGradient>
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
                 <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={valueDomain} />
-                <Tooltip content={<CustomTooltip fmt={fmtCurrency} name="Value" />} />
-                <Area type="monotone" dataKey="value" name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
+                {chartMetric === 'units' ? (
+                  <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} domain={unitsDomain} />
+                ) : (
+                  <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={valueDomain} />
+                )}
+                {chartMetric === 'units' ? (
+                  <Tooltip content={<CustomTooltip fmt={fmtN} name="Units" />} />
+                ) : (
+                  <Tooltip content={<CustomTooltip fmt={fmtCurrency} name="Value" />} />
+                )}
+                {chartMetric === 'units' ? (
+                  <Area type="monotone" dataKey="units" name="Units" stroke="#7c6af7" strokeWidth={2} fill="url(#gradUnits)" />
+                ) : (
+                  <Area type="monotone" dataKey="value" name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
+                )}
               </AreaChart>
             </ResponsiveContainer>
-          )}
-        </div>
-      </div>
-
-      {/* Aging and sell-through - also different scales (unit counts vs a %), so kept as
-          separate small-multiples rather than combined onto one axis */}
-      <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr' : '1fr 1fr', gap: 16 }}>
-        <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
-          <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)', marginBottom: 20 }}>
-            Inventory Aging {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
-          </h2>
-          {loadingAging ? (<div style={{ height: 200, display: 'flex', alignItems: 'center', justifyContent: 'center', color: 'var(--muted)' }}>Loading…</div>) : (
-            <>
-              <ResponsiveContainer width="100%" height={200}>
-                <BarChart data={agingRows} margin={{ top: 4, right: 4, bottom: 0, left: 0 }}>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" vertical={false} />
-                  <XAxis dataKey="label" tick={{ fill: '#6b6b80', fontSize: 10, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                  <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} />
-                  <Tooltip content={<AgingTooltip />} />
-                  <Bar dataKey="units" radius={[3, 3, 0, 0]}>
-                    {agingRows.map((r, i) => <Cell key={i} fill={STATUS_COLOR[r.status]} />)}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px', marginTop: 14 }}>
-                {['safe', 'risk', 'critical'].map(s => (
-                  <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <div style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLOR[s], flexShrink: 0 }} />
-                    <span style={{ fontSize: 12, color: 'var(--muted)' }}>{STATUS_LABEL[s]}</span>
-                  </div>
-                ))}
-              </div>
-            </>
           )}
         </div>
 
@@ -277,15 +230,23 @@ export default function Inventory() {
       </div>
 
       {/* Table */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px' }}>
+        {['safe', 'risk', 'critical'].map(s => (
+          <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <div style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLOR[s], flexShrink: 0 }} />
+            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{STATUS_LABEL[s]}</span>
+          </div>
+        ))}
+      </div>
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         <div style={{ overflowX: 'auto' }}>
           <div style={{ minWidth: TABLE_MIN_WIDTH }}>
             {/* Header row */}
             <div style={{ display: 'grid', gridTemplateColumns: TABLE_GRID, borderBottom: '1px solid var(--border)', background: 'var(--bg3)' }}>
               {COLS.map(col => (
-                <div key={col.key} onClick={() => handleSort(col.key)}
-                  style={{ padding: '11px 8px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: 'pointer', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none', color: sort === col.key ? 'var(--accent2)' : 'var(--muted)' }}>
-                  {col.label} <SortIcon col={col.key} />
+                <div key={col.key} onClick={() => col.sortable && handleSort(col.key)}
+                  style={{ padding: '11px 8px', fontSize: 11, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase', cursor: col.sortable ? 'pointer' : 'default', display: 'flex', alignItems: 'center', gap: 4, userSelect: 'none', color: sort === col.key ? 'var(--accent2)' : 'var(--muted)' }}>
+                  {col.label} {col.sortable && <SortIcon col={col.key} />}
                 </div>
               ))}
             </div>
@@ -349,6 +310,21 @@ export default function Inventory() {
                   </div>
                   <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                     <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(row.total)}</span>
+                  </div>
+                  <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                    {AGE_BUCKETS.map(b => (
+                      <div key={b.key} style={{ textAlign: 'center', minWidth: 38 }}>
+                        <div style={{ fontSize: 9, color: 'var(--muted)' }}>{b.label}</div>
+                        <div style={{ fontSize: 12, fontWeight: 700, fontFamily: 'var(--mono)', color: row[b.key] > 0 ? STATUS_COLOR[b.status] : 'var(--muted)' }}>
+                          {fmtN(row[b.key])}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+                    <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.surcharge) > 0 ? 'var(--red)' : 'var(--muted)' }}>
+                      {fmtCurrency(row.surcharge)}
+                    </span>
                   </div>
                 </div>
               );
