@@ -98,6 +98,30 @@ function matchPreset(value) {
   return 'custom';
 }
 
+const groupLabel = {
+  fontSize: 9, fontWeight: 700, color: 'var(--muted)', letterSpacing: '0.08em',
+  textTransform: 'uppercase', paddingLeft: 2,
+};
+
+// Each set of presets (plus the custom range) gets its own labeled, bordered box instead of
+// a flat row split by thin divider lines — with more presets added over time, the flat row
+// became hard to scan at a glance. Rolling and Calendar get distinct backgrounds (bg2 vs bg3,
+// both already part of the app's palette) purely for visual contrast between the two sets.
+function PresetGroup({ title, presets, active, onSelect, bg }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+      <span style={groupLabel}>{title}</span>
+      <div style={{ display: 'flex', gap: 4, background: bg, border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+        {presets.map(p => (
+          <button key={p.label} style={btn(active === p.label)} onClick={() => onSelect(p)}>
+            {p.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function DateRangePicker({ value, onChange }) {
   const [active, setActive] = useState(() => matchPreset(value));
 
@@ -107,32 +131,27 @@ export default function DateRangePicker({ value, onChange }) {
   };
 
   return (
-    <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', rowGap: 8 }}>
-      {ROLLING_PRESETS.map(p => (
-        <button key={p.label} style={btn(active === p.label)} onClick={() => handlePreset(p)}>
-          {p.label}
-        </button>
-      ))}
-      <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
-      {CALENDAR_PRESETS.map(p => (
-        <button key={p.label} style={btn(active === p.label)} onClick={() => handlePreset(p)}>
-          {p.label}
-        </button>
-      ))}
-      <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
-      <input
-        type="date"
-        value={value.from}
-        onChange={e => { setActive('custom'); onChange({ ...value, from: e.target.value }); }}
-        style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 10px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--mono)', cursor: 'pointer' }}
-      />
-      <span style={{ color: 'var(--muted)', fontSize: 12 }}>→</span>
-      <input
-        type="date"
-        value={value.to}
-        onChange={e => { setActive('custom'); onChange({ ...value, to: e.target.value }); }}
-        style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 10px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--mono)', cursor: 'pointer' }}
-      />
+    <div style={{ display: 'flex', alignItems: 'flex-end', gap: 10, flexWrap: 'wrap', rowGap: 10 }}>
+      <PresetGroup title="Rolling" presets={ROLLING_PRESETS} active={active} onSelect={handlePreset} bg="var(--bg2)" />
+      <PresetGroup title="Calendar" presets={CALENDAR_PRESETS} active={active} onSelect={handlePreset} bg="var(--bg3)" />
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+        <span style={groupLabel}>Custom Range</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+          <input
+            type="date"
+            value={value.from}
+            onChange={e => { setActive('custom'); onChange({ ...value, from: e.target.value }); }}
+            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 10px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--mono)', cursor: 'pointer' }}
+          />
+          <span style={{ color: 'var(--muted)', fontSize: 12 }}>→</span>
+          <input
+            type="date"
+            value={value.to}
+            onChange={e => { setActive('custom'); onChange({ ...value, to: e.target.value }); }}
+            style={{ background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 6, padding: '5px 10px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--mono)', cursor: 'pointer' }}
+          />
+        </div>
+      </div>
     </div>
   );
 }
