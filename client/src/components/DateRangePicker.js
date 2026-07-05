@@ -1,26 +1,67 @@
 import React, { useState } from 'react';
 
-const PRESETS = [
+// Grouped in two logical tiers, separated visually by a divider in the render below:
+// rolling windows anchored to "now" (Today .. 90D), then calendar-aligned periods in
+// ascending size (This Month .. All).
+const ROLLING_PRESETS = [
   { label: 'Today',     days: 0,    dtd: true },
   { label: 'Yesterday', days: null, yesterday: true },
   { label: '7D',  days: 7 },
   { label: '30D', days: 30 },
   { label: '90D', days: 90 },
-  { label: 'YTD', days: null, ytd: true },
-  { label: 'All', days: null, all: true },
 ];
+const CALENDAR_PRESETS = [
+  { label: 'This Month',   days: null, thisMonth: true },
+  { label: 'This Quarter', days: null, thisQuarter: true },
+  { label: 'Last Quarter', days: null, lastQuarter: true },
+  { label: 'YTD',          days: null, ytd: true },
+  { label: 'Last Year',    days: null, lastYear: true },
+  { label: 'All',          days: null, all: true },
+];
+const PRESETS = [...ROLLING_PRESETS, ...CALENDAR_PRESETS];
+
+const pad2 = (n) => String(n).padStart(2, '0');
+// Last day of a UTC month: day 0 of the following month rolls back to the last day of "month".
+function lastDayOfMonth(year, month0) {
+  return new Date(Date.UTC(year, month0 + 1, 0)).getUTCDate();
+}
+function quarterStart(year, q0) { return `${year}-${pad2(q0 * 3 + 1)}-01`; }
+function quarterEnd(year, q0) {
+  const month0 = q0 * 3 + 2;
+  return `${year}-${pad2(month0 + 1)}-${pad2(lastDayOfMonth(year, month0))}`;
+}
 
 function getRange(preset) {
   const to = new Date().toISOString().split('T')[0];
   if (preset.all) return { from: '2020-01-01', to };
+  // Built directly from UTC getters throughout (rather than constructing local-timezone Date
+  // objects and round-tripping through toISOString) - that round-trip shifts month/quarter/year
+  // boundaries back a day for any browser whose local timezone sits ahead of UTC, which is
+  // exactly the bug the existing YTD case below was already written to avoid.
   if (preset.ytd) {
-    // Build "Jan 1 of this year" directly from the UTC year, rather than constructing a
-    // local-timezone Date(year, 0, 1) and converting via toISOString(). That round-trip shifts
-    // the boundary back to Dec 31 of the prior year for any browser whose local timezone has a
-    // positive UTC offset at the turn of the year (e.g. most of continental Europe in winter,
-    // which sits at UTC+1 with no DST then) — which caused December orders to leak into "YTD".
     const from = `${new Date().getUTCFullYear()}-01-01`;
     return { from, to };
+  }
+  if (preset.lastYear) {
+    const y = new Date().getUTCFullYear() - 1;
+    return { from: `${y}-01-01`, to: `${y}-12-31` };
+  }
+  if (preset.thisMonth) {
+    const now = new Date();
+    const from = `${now.getUTCFullYear()}-${pad2(now.getUTCMonth() + 1)}-01`;
+    return { from, to };
+  }
+  if (preset.thisQuarter) {
+    const now = new Date();
+    const q0 = Math.floor(now.getUTCMonth() / 3);
+    return { from: quarterStart(now.getUTCFullYear(), q0), to };
+  }
+  if (preset.lastQuarter) {
+    const now = new Date();
+    const q0 = Math.floor(now.getUTCMonth() / 3);
+    const year = q0 === 0 ? now.getUTCFullYear() - 1 : now.getUTCFullYear();
+    const prevQ0 = q0 === 0 ? 3 : q0 - 1;
+    return { from: quarterStart(year, prevQ0), to: quarterEnd(year, prevQ0) };
   }
   if (preset.dtd) return { from: to, to };
   if (preset.yesterday) {
@@ -67,7 +108,13 @@ export default function DateRangePicker({ value, onChange }) {
 
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 6, flexWrap: 'wrap', rowGap: 8 }}>
-      {PRESETS.map(p => (
+      {ROLLING_PRESETS.map(p => (
+        <button key={p.label} style={btn(active === p.label)} onClick={() => handlePreset(p)}>
+          {p.label}
+        </button>
+      ))}
+      <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
+      {CALENDAR_PRESETS.map(p => (
         <button key={p.label} style={btn(active === p.label)} onClick={() => handlePreset(p)}>
           {p.label}
         </button>
