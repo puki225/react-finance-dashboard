@@ -62,7 +62,12 @@ async function getPeriodRate(fromCurrency, toCurrency, dateFrom, dateTo) {
       WHERE base_currency = $1 AND target_currency = $2
         AND date BETWEEN $3::date AND $4::date
     `, [fromCurrency, toCurrency, dateFrom, dateTo]);
-    return result.rows[0]?.avg_rate ? parseFloat(result.rows[0].avg_rate) : 1;
+    if (result.rows[0]?.avg_rate) return parseFloat(result.rows[0].avg_rate);
+    // No synced rate falls inside the range yet - e.g. dateTo is today/a weekend and
+    // the ECB source (via the daily FX sync) has nothing newer than last Friday. Fall
+    // back to the nearest available rate on/before dateTo instead of silently
+    // returning 1, which used to show unconverted GBP figures under a USD/EUR symbol.
+    return getFxRate(fromCurrency, toCurrency, dateTo);
   } catch { return 1; }
 }
 
