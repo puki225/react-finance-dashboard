@@ -12,6 +12,19 @@ const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleSt
 const fmtTick = (d) => { if (!d) return ''; const date = new Date(d); return date.toLocaleDateString('en-GB', { month: 'short', year: '2-digit', timeZone: 'UTC' }); };
 const fmtDateFull = (d) => { if (!d) return ''; return new Date(d).toLocaleDateString('en-GB', { month: 'long', year: 'numeric', timeZone: 'UTC' }); };
 
+// Same auto-scale pattern as SalesSummary's revenue trend chart - a tight-fitting domain
+// (10% padding, rounded to a clean step) instead of Recharts' default [0, auto], which forces
+// a zero baseline and flattens the visible variation for a series that never gets near zero.
+function computeDomain(data, key) {
+  if (!data?.length) return ['auto', 'auto'];
+  let min = Infinity, max = -Infinity;
+  for (const row of data) { const v = parseFloat(row[key] || 0); if (v < min) min = v; if (v > max) max = v; }
+  if (!isFinite(min) || !isFinite(max)) return ['auto', 'auto'];
+  const pad = (max - min) * 0.1 || max * 0.1 || 10;
+  const step = max > 1000 ? 100 : max > 100 ? 10 : 1;
+  return [Math.max(0, Math.floor((min - pad) / step) * step), Math.ceil((max + pad) / step) * step];
+}
+
 function HoverTooltip({ tip }) {
   if (!tip) return null;
   return createPortal(
@@ -80,6 +93,8 @@ export default function Inventory() {
   const fmtCurrency = useMemo(() => makeFmt(sym), [sym]);
   const historyRows = history?.rows || [];
   const selectedRow = selectedSku ? rows?.find(r => r.sku === selectedSku) : null;
+  const unitsDomain = useMemo(() => computeDomain(historyRows, 'units'), [historyRows]);
+  const valueDomain = useMemo(() => computeDomain(historyRows, 'value'), [historyRows]);
 
   const handleSort = (key) => {
     if (sort === key) setDir(dir === 'desc' ? 'asc' : 'desc');
@@ -131,7 +146,7 @@ export default function Inventory() {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
                 <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} />
+                <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} domain={unitsDomain} />
                 <Tooltip content={<CustomTooltip fmt={fmtN} name="Units" />} />
                 <Area type="monotone" dataKey="units" name="Units" stroke="#7c6af7" strokeWidth={2} fill="url(#gradUnits)" />
               </AreaChart>
@@ -158,7 +173,7 @@ export default function Inventory() {
                 </defs>
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
                 <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
-                <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} />
+                <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={valueDomain} />
                 <Tooltip content={<CustomTooltip fmt={fmtCurrency} name="Value" />} />
                 <Area type="monotone" dataKey="value" name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
               </AreaChart>
@@ -210,24 +225,19 @@ export default function Inventory() {
                     />
                     <div style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
                       <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.sku}</div>
-                      {(() => {
-                        const url = amazonUrl(row.asin);
-                        const Tag = url ? 'a' : 'div';
-                        const linkProps = url ? { href: url, target: '_blank', rel: 'noopener noreferrer', onClick: (e) => e.stopPropagation() } : {};
-                        return (
-                          <Tag
-                            {...linkProps}
-                            onMouseEnter={e => {
-                              const r = e.currentTarget.getBoundingClientRect();
-                              setHoverTip({ text: row.product_title || row.sku, top: r.bottom + 6, left: r.left });
-                            }}
-                            onMouseLeave={() => setHoverTip(null)}
-                            style={{ display: 'block', fontSize: 12, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', textDecoration: 'none', cursor: url ? 'pointer' : 'default' }}
-                          >
-                            {row.product_title || row.asin || '—'}
-                          </Tag>
-                        );
-                      })()}
+                      {/* Not a link - only the thumbnail navigates to Amazon. Clicking anywhere
+                          else in the row (including here) selects it instead. Hover tooltip
+                          still shows the full title on truncated rows. */}
+                      <div
+                        onMouseEnter={e => {
+                          const r = e.currentTarget.getBoundingClientRect();
+                          setHoverTip({ text: row.product_title || row.sku, top: r.bottom + 6, left: r.left });
+                        }}
+                        onMouseLeave={() => setHoverTip(null)}
+                        style={{ fontSize: 12, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                      >
+                        {row.product_title || row.asin || '—'}
+                      </div>
                     </div>
                   </div>
 
