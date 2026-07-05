@@ -78,7 +78,6 @@ const AGE_BUCKETS = [
   { key: 'age_365_plus', label: '365+',  status: 'critical' },
 ];
 const STATUS_COLOR = { safe: '#34d399', risk: '#fbbf24', critical: '#f87171' };
-const STATUS_LABEL = { safe: 'Safe', risk: 'At risk of surcharge', critical: 'Incurring surcharge' };
 
 const SellThroughTooltip = ({ active, payload, label }) => {
   if (!active || !payload?.length) return null;
@@ -99,11 +98,11 @@ const COLS = [
   { key: 'damaged',       label: 'Damaged',   width: '100px', sortable: true },
   { key: 'other',         label: 'Other',     width: '100px', sortable: true },
   { key: 'total',         label: 'Total',     width: '100px', sortable: true },
-  { key: 'aging',         label: 'Aging (days)', width: '270px', sortable: false },
+  { key: 'aging',         label: 'Aging (days)', width: '320px', sortable: false },
   { key: 'surcharge',     label: 'Est. Surcharge Paid', width: '150px', sortable: true },
 ];
-const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 270px 150px';
-const TABLE_MIN_WIDTH = 160 + 100 * 5 + 270 + 150;
+const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 320px 150px';
+const TABLE_MIN_WIDTH = 160 + 100 * 5 + 320 + 150;
 
 export default function Inventory() {
   const isMobile = useIsMobile();
@@ -230,14 +229,6 @@ export default function Inventory() {
       </div>
 
       {/* Table */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: '6px 16px' }}>
-        {['safe', 'risk', 'critical'].map(s => (
-          <div key={s} style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-            <div style={{ width: 8, height: 8, borderRadius: 2, background: STATUS_COLOR[s], flexShrink: 0 }} />
-            <span style={{ fontSize: 12, color: 'var(--muted)' }}>{STATUS_LABEL[s]}</span>
-          </div>
-        ))}
-      </div>
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
         <div style={{ overflowX: 'auto' }}>
           <div style={{ minWidth: TABLE_MIN_WIDTH }}>
@@ -311,11 +302,11 @@ export default function Inventory() {
                   <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                     <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(row.total)}</span>
                   </div>
-                  <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 10 }}>
                     {AGE_BUCKETS.map(b => (
-                      <div key={b.key} style={{ textAlign: 'center', minWidth: 38 }}>
-                        <div style={{ fontSize: 9, color: 'var(--muted)' }}>{b.label}</div>
-                        <div style={{ fontSize: 12, fontWeight: 700, fontFamily: 'var(--mono)', color: row[b.key] > 0 ? STATUS_COLOR[b.status] : 'var(--muted)' }}>
+                      <div key={b.key} style={{ textAlign: 'center', minWidth: 48 }}>
+                        <div style={{ fontSize: 11.5, color: 'var(--muted)', whiteSpace: 'nowrap' }}>{b.label}</div>
+                        <div style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: row[b.key] > 0 ? STATUS_COLOR[b.status] : 'var(--muted)' }}>
                           {fmtN(row[b.key])}
                         </div>
                       </div>
