@@ -2327,6 +2327,71 @@ app.get('/api/inventory/history', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Sell-through rate per month: units sold that month / units on hand that month (as a %).
+// Built entirely from data already synced (orders + inventory snapshots) - no new Amazon
+// report needed, unlike the aging endpoint below.
+app.get('/api/inventory/sell-through', async (req, res) => {
+  const { sku } = req.query;
+  try {
+    const result = await pool.query(`
+      WITH monthly_sales AS (
+        SELECT date_trunc('month', ao.order_date)::date AS month, aol.sku, SUM(aol.quantity) AS qty
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.status != 'Canceled' AND ($1::text IS NULL OR aol.sku = $1)
+        GROUP BY 1, 2
+        UNION ALL
+        SELECT date_trunc('month', sol.order_date)::date AS month, sol.sku, SUM(sol.quantity) AS qty
+        FROM shopify_order_lines sol
+        WHERE $1::text IS NULL OR sol.sku = $1
+        GROUP BY 1, 2
+      ),
+      sales_by_month AS (
+        SELECT month, SUM(qty)::int AS units_sold FROM monthly_sales GROUP BY month
+      ),
+      inventory_by_month AS (
+        SELECT snapshot_date AS month, SUM(total_quantity)::int AS units_on_hand
+        FROM amazon_inventory_snapshots
+        WHERE $1::text IS NULL OR sku = $1
+        GROUP BY snapshot_date
+      )
+      SELECT
+        i.month AS snapshot_date,
+        i.units_on_hand,
+        COALESCE(s.units_sold, 0) AS units_sold,
+        CASE WHEN i.units_on_hand > 0 THEN ROUND(COALESCE(s.units_sold,0)::numeric / i.units_on_hand * 100, 1) ELSE 0 END AS sell_through_pct
+      FROM inventory_by_month i
+      LEFT JOIN sales_by_month s ON s.month = i.month
+      ORDER BY i.month
+    `, [sku || null]);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Latest units-by-age-bucket, for flagging aged inventory at risk of (271-365 days) or
+// already incurring (365+ days) Amazon's long-term storage surcharge.
+app.get('/api/inventory/aging', async (req, res) => {
+  const { sku } = req.query;
+  try {
+    const result = await pool.query(`
+      WITH latest AS (
+        SELECT DISTINCT ON (sku) sku, age_0_90, age_91_180, age_181_270, age_271_365, age_365_plus
+        FROM amazon_inventory_aging
+        ORDER BY sku, snapshot_date DESC
+      )
+      SELECT
+        COALESCE(SUM(age_0_90), 0)::int AS age_0_90,
+        COALESCE(SUM(age_91_180), 0)::int AS age_91_180,
+        COALESCE(SUM(age_181_270), 0)::int AS age_181_270,
+        COALESCE(SUM(age_271_365), 0)::int AS age_271_365,
+        COALESCE(SUM(age_365_plus), 0)::int AS age_365_plus
+      FROM latest
+      WHERE $1::text IS NULL OR sku = $1
+    `, [sku || null]);
+    res.json(result.rows[0] || { age_0_90: 0, age_91_180: 0, age_181_270: 0, age_271_365: 0, age_365_plus: 0 });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
