@@ -2134,54 +2134,63 @@ app.put('/api/settings/cogs/entry/:id', async (req, res) => {
   } finally { client.release(); }
 });
 
-// FX Rates — sync all pairs between GBP, USD, EUR from Frankfurter API (ECB data)
+// FX Rates — sync all pairs between GBP, USD, EUR from Frankfurter API (ECB data).
+// Extracted from the route handler so it can also be called on a schedule (see bottom of
+// this file) — Settings.js has always told users this syncs "automatically", but until now
+// nothing actually called this endpoint on its own, so exchange_rates could sit empty/stale
+// and every getPeriodRate() lookup silently fell back to a rate of 1 (no visible conversion).
+async function syncFxRates(daysBack = 3) {
+  // Fetch GBP→USD and GBP→EUR from Frankfurter, then derive all 6 pairs
+  const basePairs = [['GBP', 'USD'], ['GBP', 'EUR']];
+  const endDate = new Date().toISOString().split('T')[0];
+  const startDate = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
+
+  // Collect raw rates keyed by date
+  const rawRates = {}; // { '2024-01-15': { 'GBP_USD': 1.27, 'GBP_EUR': 1.17 } }
+  for (const [base, target] of basePairs) {
+    const url = `https://api.frankfurter.app/${startDate}..${endDate}?from=${base}&to=${target}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!data.rates) continue;
+    for (const [date, rates] of Object.entries(data.rates)) {
+      if (!rawRates[date]) rawRates[date] = {};
+      rawRates[date][`${base}_${target}`] = parseFloat(rates[target]);
+    }
+  }
+
+  let synced = 0;
+  for (const [date, rates] of Object.entries(rawRates)) {
+    const gbpUsd = rates['GBP_USD'];
+    const gbpEur = rates['GBP_EUR'];
+    if (!gbpUsd || !gbpEur) continue;
+
+    // Derive all 6 pairs
+    const pairs = [
+      ['GBP', 'USD', gbpUsd],
+      ['GBP', 'EUR', gbpEur],
+      ['USD', 'GBP', 1 / gbpUsd],
+      ['EUR', 'GBP', 1 / gbpEur],
+      ['USD', 'EUR', gbpEur / gbpUsd],
+      ['EUR', 'USD', gbpUsd / gbpEur],
+    ];
+
+    for (const [base, target, rate] of pairs) {
+      await pool.query(`
+        INSERT INTO exchange_rates (date, base_currency, target_currency, rate, source, created_at)
+        VALUES ($1, $2, $3, $4, 'frankfurter', NOW())
+        ON CONFLICT (date, base_currency, target_currency) DO UPDATE SET rate = EXCLUDED.rate
+      `, [date, base, target, rate]);
+      synced++;
+    }
+  }
+  return { synced, days: Object.keys(rawRates).length };
+}
+
 app.post('/api/sync-fx', async (req, res) => {
   const { daysBack = 3 } = req.body || {};
   try {
-    // Fetch GBP→USD and GBP→EUR from Frankfurter, then derive all 6 pairs
-    const basePairs = [['GBP', 'USD'], ['GBP', 'EUR']];
-    const endDate = new Date().toISOString().split('T')[0];
-    const startDate = new Date(Date.now() - daysBack * 86400000).toISOString().split('T')[0];
-
-    // Collect raw rates keyed by date
-    const rawRates = {}; // { '2024-01-15': { 'GBP_USD': 1.27, 'GBP_EUR': 1.17 } }
-    for (const [base, target] of basePairs) {
-      const url = `https://api.frankfurter.app/${startDate}..${endDate}?from=${base}&to=${target}`;
-      const resp = await fetch(url);
-      const data = await resp.json();
-      if (!data.rates) continue;
-      for (const [date, rates] of Object.entries(data.rates)) {
-        if (!rawRates[date]) rawRates[date] = {};
-        rawRates[date][`${base}_${target}`] = parseFloat(rates[target]);
-      }
-    }
-
-    let synced = 0;
-    for (const [date, rates] of Object.entries(rawRates)) {
-      const gbpUsd = rates['GBP_USD'];
-      const gbpEur = rates['GBP_EUR'];
-      if (!gbpUsd || !gbpEur) continue;
-
-      // Derive all 6 pairs
-      const pairs = [
-        ['GBP', 'USD', gbpUsd],
-        ['GBP', 'EUR', gbpEur],
-        ['USD', 'GBP', 1 / gbpUsd],
-        ['EUR', 'GBP', 1 / gbpEur],
-        ['USD', 'EUR', gbpEur / gbpUsd],
-        ['EUR', 'USD', gbpUsd / gbpEur],
-      ];
-
-      for (const [base, target, rate] of pairs) {
-        await pool.query(`
-          INSERT INTO exchange_rates (date, base_currency, target_currency, rate, source, created_at)
-          VALUES ($1, $2, $3, $4, 'frankfurter', NOW())
-          ON CONFLICT (date, base_currency, target_currency) DO UPDATE SET rate = EXCLUDED.rate
-        `, [date, base, target, rate]);
-        synced++;
-      }
-    }
-    res.json({ ok: true, synced, days: Object.keys(rawRates).length });
+    const result = await syncFxRates(daysBack);
+    res.json({ ok: true, ...result });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
@@ -2316,4 +2325,13 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+  // Backfill any gap immediately on boot, then keep exchange_rates fresh daily going
+  // forward — this is what actually makes the "synced automatically" claim in
+  // Settings.js true, instead of relying on someone remembering to POST /api/sync-fx.
+  syncFxRates(3).then(r => console.log(`[fx-sync] synced ${r.synced} rates over ${r.days} day(s)`)).catch(err => console.error('[fx-sync] startup sync failed:', err.message));
+  setInterval(() => {
+    syncFxRates(3).then(r => console.log(`[fx-sync] synced ${r.synced} rates over ${r.days} day(s)`)).catch(err => console.error('[fx-sync] scheduled sync failed:', err.message));
+  }, 24 * 60 * 60 * 1000);
+});
