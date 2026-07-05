@@ -1,8 +1,53 @@
 import React, { useState, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import KpiCard from '../components/KpiCard';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
+
+// Native `title` tooltips have a fixed ~1s OS-level delay that can't be sped up, so the product
+// title hover needs its own tiny implementation instead - a plain conditional render on
+// mouseenter (no CSS transition/setTimeout) appears essentially instantly. Rendered via portal
+// straight into document.body so it can't get clipped by the table's scroll/overflow-hidden
+// containers, positioned from the hovered element's own bounding rect at hover time.
+function HoverTooltip({ tip }) {
+  if (!tip) return null;
+  return createPortal(
+    <div style={{
+      position: 'fixed', top: tip.top, left: tip.left, zIndex: 9999, maxWidth: 320,
+      background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 6,
+      padding: '6px 10px', fontSize: 12, color: 'var(--text)', fontFamily: 'var(--font)',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.35)', pointerEvents: 'none',
+    }}>
+      {tip.text}
+    </div>,
+    document.body
+  );
+}
+
+// Amazon is the account's UK marketplace throughout this dashboard - always link there when
+// an ASIN is known, even for a "both channels" SKU (per explicit tie-break: Amazon wins).
+// Shopify has no product handle/domain stored anywhere yet, so Shopify-only SKUs (no ASIN)
+// get the tooltip but no link until that data exists.
+const amazonUrl = (asin) => asin ? `https://www.amazon.co.uk/dp/${asin}` : null;
+
+// Links out to Amazon when an ASIN is known (whichever channel(s) the SKU sold on); otherwise
+// just a hover target for the tooltip, since there's no Shopify product link data yet.
+function ProductImage({ row, onEnter, onLeave }) {
+  const url = amazonUrl(row.asin);
+  const Tag = url ? 'a' : 'div';
+  const linkProps = url ? { href: url, target: '_blank', rel: 'noopener noreferrer' } : {};
+  return (
+    <Tag
+      {...linkProps}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      style={{ width: 48, height: 48, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: url ? 'pointer' : 'help', textDecoration: 'none' }}
+    >
+      {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 18, opacity: 0.2 }}>◉</span>}
+    </Tag>
+  );
+}
 
 const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const fmtN = (n) => parseInt(n || 0).toLocaleString('en-GB');
@@ -287,6 +332,7 @@ export default function ProductBreakdown() {
   const [dir, setDir] = useState(() => localStorage.getItem('gb_prod_dir') || 'desc');
   const [expandedSku, setExpandedSku] = useState(null);
   const [expandedPnl, setExpandedPnl] = useState(null);
+  const [hoverTip, setHoverTip] = useState(null);
   const [brandFilter, setBrandFilter] = useState('');
   const [parentFilter, setParentFilter] = useState('');
 
@@ -421,11 +467,17 @@ export default function ProductBreakdown() {
                   </button>
                 </div>
                 <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 12, minWidth: 0, overflow: 'hidden' }}>
-                  {/* Product title shows as a native tooltip on hover instead of taking up row
-                      space permanently — frees width/font size for the numeric columns. */}
-                  <div title={row.product_title || row.sku} style={{ width: 48, height: 48, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'help' }}>
-                    {row.image_url ? <img src={row.image_url} alt={row.sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 18, opacity: 0.2 }}>◉</span>}
-                  </div>
+                  {/* Product title shows as a fast custom tooltip on hover instead of taking up
+                      row space permanently — frees width/font size for the numeric columns.
+                      Also links to Amazon when an ASIN is known. */}
+                  <ProductImage
+                    row={row}
+                    onEnter={e => {
+                      const r = e.currentTarget.getBoundingClientRect();
+                      setHoverTip({ text: row.product_title || row.sku, top: r.bottom + 6, left: r.left });
+                    }}
+                    onLeave={() => setHoverTip(null)}
+                  />
                   <div style={{ minWidth: 0, flex: 1, overflow: 'hidden' }}>
                     <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.sku}</div>
                     {row.asin && <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.asin}</div>}
@@ -520,6 +572,7 @@ export default function ProductBreakdown() {
         </div>
        </div>
       </div>
+      <HoverTooltip tip={hoverTip} />
     </div>
   );
 }

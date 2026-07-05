@@ -137,7 +137,6 @@ export default function PnL() {
     try { const s = localStorage.getItem('gb_pnl_range'); return s ? JSON.parse(s) : getRange({ days: 90 }); } catch { return getRange({ days: 90 }); }
   });
   const [group, setGroup] = useState(() => localStorage.getItem('gb_pnl_group') || 'month');
-  const [search, setSearch] = useState('');
   const [unitsExpanded, setUnitsExpanded] = useState(false);
   const [cogsExpanded, setCogsExpanded] = useState(false);
   const [feesExpanded, setFeesExpanded] = useState(false);
@@ -148,10 +147,7 @@ export default function PnL() {
   const handleRange = (r) => { setRange(r); localStorage.setItem('gb_pnl_range', JSON.stringify(r)); };
   const handleGroup = (g) => { setGroup(g); localStorage.setItem('gb_pnl_group', g); };
 
-  const params = {
-    ...range, group,
-    ...(search ? { search } : {}),
-  };
+  const params = { ...range, group };
   const { data, loading } = useApi('/api/pnl', params);
 
   const sym = data?.currency_symbol || '£';
@@ -256,11 +252,6 @@ export default function PnL() {
           <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
             {GROUPS.map(g => (<button key={g} onClick={() => handleGroup(g)} style={{ ...toggleBtn(group === g), textTransform: 'capitalize' }}>{g}</button>))}
           </div>
-          <input
-            value={search} onChange={e => setSearch(e.target.value)}
-            placeholder="SKU / ASIN / Order ID or #"
-            style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: '6px 12px', color: 'var(--text)', fontSize: 12, fontFamily: 'var(--font)', width: 150 }}
-          />
           <DateRangePicker value={range} onChange={handleRange} />
           <button
             onClick={() => downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, sym)}
