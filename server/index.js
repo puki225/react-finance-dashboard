@@ -2325,13 +2325,4 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-  // Backfill any gap immediately on boot, then keep exchange_rates fresh daily going
-  // forward — this is what actually makes the "synced automatically" claim in
-  // Settings.js true, instead of relying on someone remembering to POST /api/sync-fx.
-  syncFxRates(3).then(r => console.log(`[fx-sync] synced ${r.synced} rates over ${r.days} day(s)`)).catch(err => console.error('[fx-sync] startup sync failed:', err.message));
-  setInterval(() => {
-    syncFxRates(3).then(r => console.log(`[fx-sync] synced ${r.synced} rates over ${r.days} day(s)`)).catch(err => console.error('[fx-sync] scheduled sync failed:', err.message));
-  }, 24 * 60 * 60 * 1000);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
