@@ -178,6 +178,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         {parseFloat(data.cogs.demurrage) !== 0 && <Row label="Demurrage / Duties" value={data.cogs.demurrage} indent />}
         {parseFloat(data.cogs.quality) !== 0 && <Row label="Quality / Inspection" value={data.cogs.quality} indent />}
         {parseFloat(data.cogs.other) !== 0 && <Row label="Other COGS" value={data.cogs.other} indent />}
+        {parseFloat(data.cogs.returned) !== 0 && <Row label="Returns Credit" value={data.cogs.returned} indent />}
         <Row label="Total COGS" value={data.cogs.total} bold />
       </>}
 
