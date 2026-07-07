@@ -111,6 +111,7 @@ export default function Inventory() {
   const [selectedSku, setSelectedSku] = useState(null);
   const [hoverTip, setHoverTip] = useState(null);
   const [chartMetric, setChartMetric] = useState('units'); // 'units' | 'value'
+  const [hideZeroStock, setHideZeroStock] = useState(false);
 
   const { data: inventory, loading } = useApi('/api/inventory');
   const { data: history, loading: loadingHistory } = useApi('/api/inventory/history', selectedSku ? { sku: selectedSku } : {});
@@ -138,19 +139,27 @@ export default function Inventory() {
   const sortedRows = useMemo(() => {
     if (!rows?.length) return [];
     const mult = dir === 'asc' ? 1 : -1;
-    return [...rows].sort((a, b) => {
+    const filtered = hideZeroStock ? rows.filter(r => parseInt(r.total || 0) > 0) : rows;
+    return [...filtered].sort((a, b) => {
       if (sort === 'product_title') return (a.product_title || a.sku).localeCompare(b.product_title || b.sku) * mult;
       return (parseFloat(a[sort] || 0) - parseFloat(b[sort] || 0)) * mult;
     });
-  }, [rows, sort, dir]);
+  }, [rows, sort, dir, hideZeroStock]);
 
   return (
     <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 18 : 24 }}>
 
       {/* Header */}
-      <div>
-        <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Inventory</h1>
-        <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Latest FBA stock levels by SKU</p>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
+        <div>
+          <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Inventory</h1>
+          <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>Latest FBA stock levels by SKU</p>
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--muted)', cursor: 'pointer', userSelect: 'none', marginTop: 4 }}>
+          <input type="checkbox" checked={hideZeroStock} onChange={e => setHideZeroStock(e.target.checked)}
+            style={{ width: 15, height: 15, accentColor: 'var(--accent)', cursor: 'pointer' }} />
+          Hide SKUs with 0 inventory
+        </label>
       </div>
 
       {/* Units/Value share one chart with a toggle (a real dual-axis chart would be ambiguous
