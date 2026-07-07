@@ -2269,12 +2269,19 @@ app.get('/api/inventory', async (req, res) => {
         FROM amazon_inventory_aging
         ORDER BY sku, snapshot_date DESC
       ),
-      -- All-time actual long-term storage surcharge Amazon has billed for this SKU - real
-      -- charged amounts, not a projected/speculative figure (amount is stored negative).
+      -- Real £-per-unit surcharge rate, derived from what Amazon has actually billed
+      -- (amount / qty-charged), not a flat historical total - lets the estimate below scale
+      -- with *current* aged stock instead of showing a fixed number forever.
       ltsf_by_sku AS (
-        SELECT sku, SUM(-amount)::numeric(12,2) AS surcharge_gbp
+        SELECT sku,
+          SUM(-amount)::numeric(12,4) AS total_surcharge_gbp,
+          SUM(NULLIF(raw_json->>'qty-charged', '')::numeric) AS total_qty_charged
         FROM amazon_ltsf_charges
         GROUP BY sku
+      ),
+      global_rate AS (
+        SELECT (SUM(-amount) / NULLIF(SUM(NULLIF(raw_json->>'qty-charged', '')::numeric), 0))::numeric(12,4) AS rate_per_unit
+        FROM amazon_ltsf_charges
       )
       SELECT
         l.sku,
@@ -2292,7 +2299,11 @@ app.get('/api/inventory', async (req, res) => {
         COALESCE(la.age_181_270, 0)::int AS age_181_270,
         COALESCE(la.age_271_365, 0)::int AS age_271_365,
         COALESCE(la.age_365_plus, 0)::int AS age_365_plus,
-        COALESCE(ltsf.surcharge_gbp, 0)::numeric(12,2) AS surcharge_gbp
+        COALESCE(
+          ltsf.total_surcharge_gbp / NULLIF(ltsf.total_qty_charged, 0),
+          (SELECT rate_per_unit FROM global_rate),
+          0
+        )::numeric(12,4) AS rate_per_unit_gbp
       FROM latest l
       LEFT JOIN sku_parameters sp ON sp.sku = l.sku
       LEFT JOIN latest_aging la ON la.sku = l.sku
@@ -2305,10 +2316,41 @@ app.get('/api/inventory', async (req, res) => {
     const fxRate = await getFxRate('GBP', reportingCurrency, today);
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
 
-    res.json({
-      currency_symbol: sym,
-      rows: result.rows.map(r => ({ ...r, surcharge: (parseFloat(r.surcharge_gbp || 0) * fxRate).toFixed(2) })),
+    // Reconcile the age-bucket breakdown (from the separate Inventory Planning report) to sum
+    // to `sellable` (from the live Inventory API) rather than showing two Amazon sources that
+    // were fetched independently and won't line up. Inbound units are excluded on purpose -
+    // they aren't in a fulfillment center yet, so "age" doesn't apply to them. The bucket
+    // *shape* (relative proportions) comes from Amazon's real aging report; only the total is
+    // re-anchored to the trusted sellable count.
+    const AGE_KEYS = ['age_0_90', 'age_91_180', 'age_181_270', 'age_271_365', 'age_365_plus'];
+    const rows = result.rows.map(r => {
+      const sellable = parseInt(r.sellable || 0);
+      const rawBuckets = AGE_KEYS.map(k => parseInt(r[k] || 0));
+      const rawTotal = rawBuckets.reduce((s, v) => s + v, 0);
+      let buckets = rawBuckets;
+      if (rawTotal > 0 && sellable > 0) {
+        buckets = rawBuckets.map(v => Math.round((v / rawTotal) * sellable));
+        // Rounding can leave the scaled buckets a unit or two off `sellable` - correct the
+        // largest bucket so the row's own numbers always sum exactly.
+        const scaledTotal = buckets.reduce((s, v) => s + v, 0);
+        const diff = sellable - scaledTotal;
+        if (diff !== 0) {
+          const maxIdx = buckets.indexOf(Math.max(...buckets));
+          buckets[maxIdx] += diff;
+        }
+      } else if (rawTotal === 0) {
+        buckets = AGE_KEYS.map(() => 0); // no aging data synced yet - nothing to distribute
+      }
+      const agedUnits = buckets[3] + buckets[4]; // 271-365 + 365+ - the surcharge-incurring tiers
+      const surcharge = agedUnits * parseFloat(r.rate_per_unit_gbp || 0) * fxRate;
+
+      const out = { ...r, surcharge: surcharge.toFixed(2) };
+      AGE_KEYS.forEach((k, i) => { out[k] = buckets[i]; });
+      delete out.rate_per_unit_gbp;
+      return out;
     });
+
+    res.json({ currency_symbol: sym, rows });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
