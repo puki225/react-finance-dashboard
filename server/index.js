@@ -2282,12 +2282,21 @@ app.get('/api/inventory', async (req, res) => {
       global_rate AS (
         SELECT (SUM(-amount) / NULLIF(SUM(NULLIF(raw_json->>'qty-charged', '')::numeric), 0))::numeric(12,4) AS rate_per_unit
         FROM amazon_ltsf_charges
+      ),
+      -- sku_parameters.product_name is never populated on this account - fall back to the
+      -- real Amazon listing title captured per order line, which is populated for every SKU
+      -- that's ever sold.
+      order_title AS (
+        SELECT DISTINCT ON (sku) sku, title
+        FROM amazon_order_lines
+        WHERE title IS NOT NULL
+        ORDER BY sku, synced_at DESC
       )
       SELECT
         l.sku,
         COALESCE(l.asin, sp.asin) AS asin,
         sp.image_url,
-        sp.product_name AS product_title,
+        COALESCE(sp.product_name, ot.title) AS product_title,
         l.fulfillable_quantity::int AS sellable,
         (l.inbound_working_quantity + l.inbound_shipped_quantity + l.inbound_receiving_quantity)::int AS inbound,
         l.unfulfillable_quantity::int AS damaged,
@@ -2308,6 +2317,7 @@ app.get('/api/inventory', async (req, res) => {
       LEFT JOIN sku_parameters sp ON sp.sku = l.sku
       LEFT JOIN latest_aging la ON la.sku = l.sku
       LEFT JOIN ltsf_by_sku ltsf ON ltsf.sku = l.sku
+      LEFT JOIN order_title ot ON ot.sku = l.sku
       ORDER BY l.total_quantity DESC
     `);
 
