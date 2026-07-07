@@ -2269,19 +2269,28 @@ app.get('/api/inventory', async (req, res) => {
         FROM amazon_inventory_aging
         ORDER BY sku, snapshot_date DESC
       ),
-      -- Real £-per-unit surcharge rate, derived from what Amazon has actually billed
-      -- (amount / qty-charged), not a flat historical total - lets the estimate below scale
-      -- with *current* aged stock instead of showing a fixed number forever.
+      -- Real £-per-unit MONTHLY surcharge rate, from the most recent LTSF billing cycle only
+      -- (not blended across all of history - the per-unit-volume rate drifts over time, and
+      -- this is meant to answer "what does this cost every month it stays unsold", i.e. the
+      -- current rate, not a stale average from charges months/years ago). LTSF bills monthly,
+      -- so every unit still sitting in the 271+/365+ buckets repeats this charge each cycle.
+      latest_ltsf_month AS (
+        SELECT sku, MAX(snapshot_date) AS latest_date FROM amazon_ltsf_charges GROUP BY sku
+      ),
       ltsf_by_sku AS (
-        SELECT sku,
-          SUM(-amount)::numeric(12,4) AS total_surcharge_gbp,
-          SUM(NULLIF(raw_json->>'qty-charged', '')::numeric) AS total_qty_charged
-        FROM amazon_ltsf_charges
-        GROUP BY sku
+        SELECT c.sku,
+          SUM(-c.amount)::numeric(12,4) AS total_surcharge_gbp,
+          SUM(NULLIF(c.raw_json->>'qty-charged', '')::numeric) AS total_qty_charged
+        FROM amazon_ltsf_charges c
+        JOIN latest_ltsf_month m ON m.sku = c.sku AND c.snapshot_date = m.latest_date
+        GROUP BY c.sku
       ),
       global_rate AS (
+        -- Latest global billing cycle's blended rate, for SKUs with no charge history of
+        -- their own yet.
         SELECT (SUM(-amount) / NULLIF(SUM(NULLIF(raw_json->>'qty-charged', '')::numeric), 0))::numeric(12,4) AS rate_per_unit
         FROM amazon_ltsf_charges
+        WHERE snapshot_date = (SELECT MAX(snapshot_date) FROM amazon_ltsf_charges)
       ),
       -- sku_parameters.product_name is never populated on this account - fall back to the
       -- real Amazon listing title captured per order line, which is populated for every SKU
@@ -2351,10 +2360,13 @@ app.get('/api/inventory', async (req, res) => {
       } else if (rawTotal === 0) {
         buckets = AGE_KEYS.map(() => 0); // no aging data synced yet - nothing to distribute
       }
-      const agedUnits = buckets[3] + buckets[4]; // 271-365 + 365+ - the surcharge-incurring tiers
-      const surcharge = agedUnits * parseFloat(r.rate_per_unit_gbp || 0) * fxRate;
+      // Accumulated units already old enough to be billed the long-term storage surcharge
+      // (271-365 + 365+) - LTSF is a recurring MONTHLY charge, so every one of these units
+      // repeats this cost again next cycle for as long as it stays unsold.
+      const agedUnits = buckets[3] + buckets[4];
+      const monthlySurcharge = agedUnits * parseFloat(r.rate_per_unit_gbp || 0) * fxRate;
 
-      const out = { ...r, surcharge: surcharge.toFixed(2) };
+      const out = { ...r, surcharge_monthly: monthlySurcharge.toFixed(2) };
       AGE_KEYS.forEach((k, i) => { out[k] = buckets[i]; });
       delete out.rate_per_unit_gbp;
       return out;
