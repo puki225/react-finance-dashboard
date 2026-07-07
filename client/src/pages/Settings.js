@@ -292,9 +292,88 @@ function CogsRow({ row, onRefresh }) {
   );
 }
 
+// ── Company Information ─────────────────────────────────────────────────
+const COMPANY_FIELDS = [
+  { key: 'client_name',     label: 'Company Name',      placeholder: 'e.g. Gritty Blenders Ltd', textarea: false },
+  { key: 'company_address', label: 'Address',            placeholder: 'Registered business address', textarea: true },
+  { key: 'company_id',      label: 'Company ID / NIF',   placeholder: 'Company registration number / NIF', textarea: false },
+  { key: 'vat_number',      label: 'VAT Number',         placeholder: 'e.g. GB123456789', textarea: false },
+];
+
+function CompanyInfoSettings({ config, onRefresh }) {
+  const [form, setForm] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (config && form === null) {
+      setForm({
+        client_name: config.client_name || '',
+        company_address: config.company_address || '',
+        company_id: config.company_id || '',
+        vat_number: config.vat_number || '',
+      });
+    }
+  }, [config, form]);
+
+  if (!form) return null;
+
+  const handleChange = (key, val) => { setForm(f => ({ ...f, [key]: val })); setSaved(false); };
+
+  const dirty = COMPANY_FIELDS.some(f => form[f.key] !== (config?.[f.key] || ''));
+
+  const handleSave = async () => {
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const resp = await fetch('/api/settings/config', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+      const data = await resp.json();
+      if (data.ok) { setSaved(true); onRefresh?.(); }
+      else setError(data.error || 'Save failed');
+    } catch (e) { setError(e.message); }
+    setSaving(false);
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Company Information</h2>
+      <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
+        Used to identify your business on generated reports and exports.
+      </p>
+
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16, marginBottom: 16 }}>
+          {COMPANY_FIELDS.map(f => (
+            <div key={f.key} style={f.textarea ? { gridColumn: '1 / -1' } : undefined}>
+              <label style={labelStyle}>{f.label}</label>
+              {f.textarea ? (
+                <textarea value={form[f.key]} onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} rows={2}
+                  style={{ ...inputStyle, resize: 'vertical', fontFamily: 'var(--font)' }} />
+              ) : (
+                <input type="text" value={form[f.key]} onChange={e => handleChange(f.key, e.target.value)} placeholder={f.placeholder} style={inputStyle} />
+              )}
+            </div>
+          ))}
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 12 }}>
+          {saved && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ Saved</span>}
+          {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
+          <button onClick={handleSave} disabled={saving || !dirty}
+            style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid ' + (dirty ? 'var(--accent)' : 'var(--border)'), background: dirty ? 'var(--accent)' : 'transparent', color: dirty ? '#fff' : 'var(--muted)', cursor: dirty ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ── Reporting subtab ───────────────────────────────────────────────────────
 function ReportingSettings() {
-  const { data: config } = useApi('/api/settings/config');
+  const { data: config, refetch } = useApi('/api/settings/config');
   const [currency, setCurrency] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -354,6 +433,8 @@ function ReportingSettings() {
           </div>
         </div>
       </div>
+
+      <CompanyInfoSettings config={config} onRefresh={refetch} />
     </div>
   );
 }
