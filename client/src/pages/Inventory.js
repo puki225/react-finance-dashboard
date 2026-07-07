@@ -111,6 +111,7 @@ export default function Inventory() {
   const [selectedSku, setSelectedSku] = useState(null);
   const [hoverTip, setHoverTip] = useState(null);
   const [chartMetric, setChartMetric] = useState('units'); // 'units' | 'value'
+  const [chartStock, setChartStock] = useState('all'); // 'all' | 'sellable' - chart only, table is unaffected
   const [hideZeroStock, setHideZeroStock] = useState(false);
 
   const { data: inventory, loading } = useApi('/api/inventory');
@@ -122,8 +123,12 @@ export default function Inventory() {
   const fmtCurrency = useMemo(() => makeFmt(sym), [sym]);
   const historyRows = history?.rows || [];
   const selectedRow = selectedSku ? rows?.find(r => r.sku === selectedSku) : null;
-  const unitsDomain = useMemo(() => computeDomain(historyRows, 'units'), [historyRows]);
-  const valueDomain = useMemo(() => computeDomain(historyRows, 'value'), [historyRows]);
+  // Which field the chart plots depends on both toggles - the table below always shows both
+  // Sellable and Total regardless, this only narrows what the chart draws.
+  const chartDataKey = chartMetric === 'units'
+    ? (chartStock === 'sellable' ? 'sellable_units' : 'units')
+    : (chartStock === 'sellable' ? 'sellable_value' : 'value');
+  const chartDomain = useMemo(() => computeDomain(historyRows, chartDataKey), [historyRows, chartDataKey]);
   const sellThroughDomain = useMemo(() => computeDomain(sellThrough || [], 'sell_through_pct'), [sellThrough]);
 
   const handleSort = (key) => {
@@ -169,14 +174,25 @@ export default function Inventory() {
         <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 20, flexWrap: 'wrap', gap: 8 }}>
             <h2 style={{ fontSize: 14, fontWeight: 600, letterSpacing: '0.04em', textTransform: 'uppercase', color: 'var(--muted)' }}>
-              {chartMetric === 'units' ? 'Units' : 'Value'} {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
+              {chartStock === 'sellable' ? 'Sellable ' : ''}{chartMetric === 'units' ? 'Units' : 'Value'} {selectedRow ? `· ${selectedRow.sku}` : '· All SKUs'}
             </h2>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', gap: 4, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8, padding: 3 }}>
                 {[{ id: 'units', label: 'Units' }, { id: 'value', label: 'Value' }].map(m => (
                   <button key={m.id} onClick={() => setChartMetric(m.id)}
                     style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: 'none', background: chartMetric === m.id ? 'var(--accent)20' : 'transparent', color: chartMetric === m.id ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)' }}>
                     {m.label}
+                  </button>
+                ))}
+              </div>
+              {/* Chart-only filter - narrows what the chart above plots without touching the
+                  table below, which always shows the full Sellable/Inbound/Damaged/Other/Total
+                  breakdown regardless of this toggle. */}
+              <div style={{ display: 'flex', gap: 4, background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8, padding: 3 }}>
+                {[{ id: 'all', label: 'All' }, { id: 'sellable', label: 'Sellable' }].map(s => (
+                  <button key={s.id} onClick={() => setChartStock(s.id)}
+                    style={{ padding: '4px 12px', borderRadius: 6, fontSize: 11, fontWeight: 600, border: 'none', background: chartStock === s.id ? 'var(--accent)20' : 'transparent', color: chartStock === s.id ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)' }}>
+                    {s.label}
                   </button>
                 ))}
               </div>
@@ -197,19 +213,19 @@ export default function Inventory() {
                 <CartesianGrid strokeDasharray="3 3" stroke="#ffffff08" />
                 <XAxis dataKey="snapshot_date" tickFormatter={fmtTick} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} />
                 {chartMetric === 'units' ? (
-                  <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} domain={unitsDomain} />
+                  <YAxis tickFormatter={fmtN} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={50} domain={chartDomain} />
                 ) : (
-                  <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={valueDomain} />
+                  <YAxis tickFormatter={fmtCurrency} tick={{ fill: '#6b6b80', fontSize: 11, fontFamily: 'DM Mono' }} axisLine={false} tickLine={false} width={70} domain={chartDomain} />
                 )}
                 {chartMetric === 'units' ? (
-                  <Tooltip content={<CustomTooltip fmt={fmtN} name="Units" />} />
+                  <Tooltip content={<CustomTooltip fmt={fmtN} name={chartStock === 'sellable' ? 'Sellable Units' : 'Units'} />} />
                 ) : (
-                  <Tooltip content={<CustomTooltip fmt={fmtCurrency} name="Value" />} />
+                  <Tooltip content={<CustomTooltip fmt={fmtCurrency} name={chartStock === 'sellable' ? 'Sellable Value' : 'Value'} />} />
                 )}
                 {chartMetric === 'units' ? (
-                  <Area type="monotone" dataKey="units" name="Units" stroke="#7c6af7" strokeWidth={2} fill="url(#gradUnits)" />
+                  <Area type="monotone" dataKey={chartDataKey} name="Units" stroke="#7c6af7" strokeWidth={2} fill="url(#gradUnits)" />
                 ) : (
-                  <Area type="monotone" dataKey="value" name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
+                  <Area type="monotone" dataKey={chartDataKey} name="Value" stroke="#34d399" strokeWidth={2} fill="url(#gradValue)" />
                 )}
               </AreaChart>
             </ResponsiveContainer>
