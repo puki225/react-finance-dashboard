@@ -944,6 +944,18 @@ app.get('/api/pnl', async (req, res) => {
       GROUP BY 1
     `, [dateFrom, dateTo]);
 
+    // Commission reversal / refund admin fee, attributed by refund_date (same table/date basis
+    // as refundsResult above). Amazon-only — Shopify has no equivalent. Kept as a separate query
+    // from v_refunds_by_date (a view we don't have DDL access to alter) since these two columns
+    // only exist on amazon_order_line_refunds.
+    const refundFeesResult = includeAmazon ? await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period,
+        SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
+        SUM(fee_refund_admin)::numeric AS fee_refund_admin
+      FROM amazon_order_line_refunds WHERE refund_date::date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]) : { rows: [] };
+
     // PPC spend, Amazon Ads only
     const ppcResult = await pool.query(`
       SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost)::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
@@ -1005,6 +1017,14 @@ app.get('/api/pnl', async (req, res) => {
       const key = r.period.toISOString().split('T')[0];
       refundsByPeriod[key] = parseFloat(r.total_refunded || 0);
       unitsRefundedByPeriod[key] = parseInt(r.units_refunded || 0, 10);
+    }
+    const refundFeesByPeriod = {};
+    for (const r of refundFeesResult.rows) {
+      const key = r.period.toISOString().split('T')[0];
+      refundFeesByPeriod[key] = {
+        commission_refunded: parseFloat(r.fee_commission_refunded || 0),
+        refund_admin_fee: parseFloat(r.fee_refund_admin || 0),
+      };
     }
     const ppcByPeriod = {};
     const ppcUnitsByPeriod = {};
@@ -1075,14 +1095,21 @@ app.get('/api/pnl', async (req, res) => {
         other: -fx(r?.cogs_other || 0),
       };
       cogs.total = cogs.standard + cogs.freight + cogs.demurrage + cogs.quality + cogs.other;
+      const refundFees = refundFeesByPeriod[periodKey] || { commission_refunded: 0, refund_admin_fee: 0 };
       const lineFees = {
         commission: -fx(r?.fee_commission || 0),
+        // Amazon reverses (credits back) its commission on a refund, but keeps ~20% of that
+        // reversal as an admin fee (RefundCommission) — see runSyncFinances in
+        // amazon-spapi-proxy. Both are refund-date-scoped like total_refunded above, not
+        // order-date-scoped like the original commission.
+        commission_refunded: fx(refundFees.commission_refunded || 0), // positive: a credit
         fba_fulfillment: -fx(r?.fee_fba_fulfillment || 0),
         fixed_closing: -fx(r?.fee_fixed_closing || 0),
         variable_closing: -fx(r?.fee_variable_closing || 0),
         digital_services: -fx(r?.fee_digital_services || 0),
         giftwrap: -fx(r?.fee_giftwrap || 0),
         shipping_chargeback: -fx(r?.fee_shipping_chargeback || 0),
+        refund_admin_fee: -fx(refundFees.refund_admin_fee || 0), // negative: a charge
         // MCF fee is period-keyed independently (from amazon_mcf_fees), not part of the Amazon
         // order-line query above, since the underlying order is a Shopify order fulfilled via FBA.
         mcf: -fx(mcfByPeriod[periodKey] || 0),
@@ -1150,12 +1177,14 @@ app.get('/api/pnl', async (req, res) => {
         },
         fees: {
           commission: lineFees.commission.toFixed(2),
+          commission_refunded: lineFees.commission_refunded.toFixed(2),
           fba_fulfillment: lineFees.fba_fulfillment.toFixed(2),
           fixed_closing: lineFees.fixed_closing.toFixed(2),
           variable_closing: lineFees.variable_closing.toFixed(2),
           digital_services: lineFees.digital_services.toFixed(2),
           giftwrap: lineFees.giftwrap.toFixed(2),
           shipping_chargeback: lineFees.shipping_chargeback.toFixed(2),
+          refund_admin_fee: lineFees.refund_admin_fee.toFixed(2),
           mcf: lineFees.mcf.toFixed(2),
           total: lineFeesTotal.toFixed(2),
         },
@@ -1192,6 +1221,7 @@ app.get('/api/pnl', async (req, res) => {
     const allPeriodKeys = new Set([
       ...linesResult.rows.map(r => r.period.toISOString().split('T')[0]),
       ...Object.keys(refundsByPeriod),
+      ...Object.keys(refundFeesByPeriod),
       ...Object.keys(ppcByPeriod),
       ...Object.keys(accountFeesByPeriod),
       ...Object.keys(adjustmentsByPeriod),
@@ -1230,6 +1260,10 @@ app.get('/api/pnl', async (req, res) => {
     const perPeriodAdjustmentItems = Object.values(adjustmentItemsByPeriod);
     refundsByPeriod['__total__'] = sumMap(refundsByPeriod);
     unitsRefundedByPeriod['__total__'] = sumMap(unitsRefundedByPeriod);
+    refundFeesByPeriod['__total__'] = {
+      commission_refunded: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.commission_refunded || 0), 0),
+      refund_admin_fee: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.refund_admin_fee || 0), 0),
+    };
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
     ppcUnitsByPeriod['__total__'] = sumMap(ppcUnitsByPeriod);
     adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
@@ -1275,7 +1309,9 @@ app.get('/api/product-breakdown', async (req, res) => {
     // Refunds by SKU, attributed by refund_date within selected range
     const refundCte = `
       refunds_by_sku AS (
-        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded
+        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded,
+          SUM(COALESCE(fee_commission_refunded,0))::numeric AS fee_commission_refunded,
+          SUM(COALESCE(fee_refund_admin,0))::numeric AS fee_refund_admin
         FROM amazon_order_line_refunds
         WHERE sku IS NOT NULL AND refund_date::date BETWEEN $1 AND $2
         GROUP BY sku
@@ -1522,7 +1558,9 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(o.total_discounts, 0)::numeric(12,2) AS total_discounts,
           COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
           COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
-          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees,
+          -- Net commission reversal (credit) and refund admin fee (charge) into fees, both
+          -- refund-date-scoped from refunds_by_sku — same reasoning as total_refunded above.
+          (COALESCE(cogs.total_fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
           COALESCE(ppc.ppc_units, 0)::int AS ppc_units
@@ -1586,7 +1624,10 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
           (COALESCE(ra.total_refunded, 0) + COALESCE(rs.total_refunded, 0))::numeric(12,2) AS total_refunded,
           COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
-          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees,
+          -- Net commission reversal (credit) and refund admin fee (charge) into fees, both
+          -- refund-date-scoped from refunds_by_sku (Amazon-only) — same reasoning as
+          -- total_refunded above.
+          (COALESCE(cogs.total_fees, 0) - COALESCE(ra.fee_commission_refunded, 0) + COALESCE(ra.fee_refund_admin, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
           COALESCE(ppc.ppc_units, 0)::int AS ppc_units
@@ -1718,6 +1759,17 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         ${!includeShopify ? `AND channel != 'shopify'` : ''}
     `, [sku, dateFrom, dateTo]);
 
+    // Commission reversal / refund admin fee, refund-date-scoped (same table/date basis as
+    // refundResult above) — lives on amazon_order_line_refunds, not the v_refunds_by_date view
+    // (which we don't have DDL access to alter), so queried separately. Amazon-only.
+    const refundFeesResult = includeAmazon ? await pool.query(`
+      SELECT
+        COALESCE(SUM(fee_commission_refunded), 0)::numeric AS fee_commission_refunded,
+        COALESCE(SUM(fee_refund_admin), 0)::numeric AS fee_refund_admin
+      FROM amazon_order_line_refunds
+      WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0 }] };
+
     // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
     const ppcResult = includeAmazon ? await pool.query(`
       SELECT COALESCE(SUM(cost), 0)::numeric AS ppc_cost, COALESCE(SUM(sales_14d), 0)::numeric AS ppc_sales
@@ -1829,7 +1881,12 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const feeGiftwrap        = fx(amz.fee_giftwrap || 0);
     const feeShipping        = fx(amz.fee_shipping_chargeback || 0);
     const feeMCF             = fx(shp.mcf_fees || 0);
-    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF;
+    // Refund-date-scoped, unlike the fee sums above which are order-date-scoped — same
+    // reasoning as totalRefunded vs. gross_sales. commissionRefunded is a credit (reduces
+    // total cost); refundAdminFee is Amazon's ~20% cut of that reversal (adds to total cost).
+    const commissionRefunded = fx(refundFeesResult.rows[0]?.fee_commission_refunded || 0);
+    const refundAdminFee     = fx(refundFeesResult.rows[0]?.fee_refund_admin || 0);
+    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee;
     // True when any Amazon fee for this SKU/period is still an estimate (from /estimate-fees,
     // pending settlement via the Finances API) rather than a confirmed final amount.
     const hasEstimatedFees = amz.has_estimated_fees === true;
@@ -1859,12 +1916,14 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       },
       fees: {
         commission:          f(-feeCommission),
+        commission_refunded: f(commissionRefunded), // positive: a credit
         fba_fulfillment:     f(-feeFBA),
         fixed_closing:       f(-feeFixedClosing),
         variable_closing:    f(-feeVariableClosing),
         digital_services:    f(-feeDigitalServices),
         giftwrap:            f(-feeGiftwrap),
         shipping_chargeback: f(-feeShipping),
+        refund_admin_fee:    f(-refundAdminFee),
         mcf_fulfillment:     f(-feeMCF),
         total:               f(-totalFees),
         has_estimated:       hasEstimatedFees,
@@ -1883,7 +1942,10 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       },
       product_contribution: f(productContribution),
       has_cogs: totalCogs > 0,
-      has_fees: totalFees > 0,
+      // totalFees can net to <= 0 when a refund's commission credit outweighs the period's
+      // other fees — check the components too so that case still shows the fee breakdown
+      // instead of hiding a real commission_refunded/refund_admin_fee amount.
+      has_fees: totalFees > 0 || commissionRefunded > 0 || refundAdminFee > 0,
       has_ppc: ppcCost > 0,
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }

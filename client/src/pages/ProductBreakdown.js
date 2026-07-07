@@ -160,6 +160,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
 
       {data.has_fees && <>
         {parseFloat(data.fees.commission) !== 0 && <Row label="Commission" value={data.fees.commission} indent />}
+        {parseFloat(data.fees.commission_refunded) !== 0 && <Row label="Commission Refunded" value={data.fees.commission_refunded} indent />}
         {parseFloat(data.fees.fba_fulfillment) !== 0 && <Row label="FBA Fulfillment" value={data.fees.fba_fulfillment} indent />}
         {parseFloat(data.fees.mcf_fulfillment) !== 0 && <Row label="MCF Fulfillment" value={data.fees.mcf_fulfillment} indent />}
         {parseFloat(data.fees.fixed_closing) !== 0 && <Row label="Fixed Closing Fee" value={data.fees.fixed_closing} indent />}
@@ -167,6 +168,7 @@ function PnlPanel({ sku, from, to, sym, country, channel }) {
         {parseFloat(data.fees.digital_services) !== 0 && <Row label="Digital Services" value={data.fees.digital_services} indent />}
         {parseFloat(data.fees.giftwrap) !== 0 && <Row label="Giftwrap Chargeback" value={data.fees.giftwrap} indent />}
         {parseFloat(data.fees.shipping_chargeback) !== 0 && <Row label="Shipping Chargeback" value={data.fees.shipping_chargeback} indent />}
+        {parseFloat(data.fees.refund_admin_fee) !== 0 && <Row label="Refund Admin Fee" value={data.fees.refund_admin_fee} indent />}
         <Row label="Total Fees" value={data.fees.total} bold est={data.fees.has_estimated} />
       </>}
 
