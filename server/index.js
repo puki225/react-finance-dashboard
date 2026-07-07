@@ -967,14 +967,17 @@ app.get('/api/pnl', async (req, res) => {
       GROUP BY 1
     `, [dateFrom, dateTo]) : { rows: [] };
 
-    // COGS credit-back for genuine physical returns, attributed by return_date (event-dated,
-    // like refundFeesResult above) but priced at the COGS rate active on the ORIGINAL order
-    // date — reversing at the same cost basis it was recorded at. A refund alone does NOT
-    // credit COGS here — only a matching row in amazon_customer_returns (Amazon's FBA Customer
-    // Returns report) does, since a refund only reverses revenue and doesn't mean the unit
-    // physically came back.
+    // COGS credit-back for genuine physical returns — priced at the COGS rate active on the
+    // ORIGINAL order date (reversing at the same cost basis it was recorded at), but attributed
+    // to the matching REFUND's date rather than the physical return_date, so it lands in the
+    // same period as the revenue reversal it corresponds to (matches refundsResult above). Each
+    // return row is matched to its nearest-in-time refund event on the same order/sku (refund
+    // usually precedes the physical return by ~1-2 weeks in this account, but not always, so
+    // "nearest" rather than "most recent prior"). A refund alone does NOT credit COGS here —
+    // only a matching row in amazon_customer_returns (Amazon's FBA Customer Returns report)
+    // does, since a refund only reverses revenue and doesn't mean the unit physically came back.
     const returnsCogsResult = includeAmazon ? await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', acr.return_date)::date AS period,
+      SELECT DATE_TRUNC('${trunc}', COALESCE(rf.refund_date, acr.return_date))::date AS period,
         SUM(acr.quantity * (
           COALESCE(
             NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
@@ -989,6 +992,12 @@ app.get('/api/pnl', async (req, res) => {
       FROM amazon_customer_returns acr
       JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT olr.refund_date FROM amazon_order_line_refunds olr
+        WHERE olr.amazon_order_id = acr.amazon_order_id AND olr.sku = acr.sku
+        ORDER BY ABS(EXTRACT(EPOCH FROM (olr.refund_date - acr.return_date::timestamptz))) ASC
+        LIMIT 1
+      ) rf ON true
       LEFT JOIN LATERAL (
         SELECT
           ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
@@ -1009,7 +1018,7 @@ app.get('/api/pnl', async (req, res) => {
           AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
         ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
-      WHERE acr.return_date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter} ${fulfillmentFilter} ${orderTypeFilter}
+      WHERE COALESCE(rf.refund_date::date, acr.return_date) BETWEEN $1 AND $2 ${brandFilter} ${parentFilter} ${fulfillmentFilter} ${orderTypeFilter}
       GROUP BY 1
     `, [dateFrom, dateTo]) : { rows: [] };
 
@@ -1524,13 +1533,15 @@ app.get('/api/product-breakdown', async (req, res) => {
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku
       ),
-      -- COGS credit-back for genuine physical returns, attributed by return_date (event-dated,
-      -- like refunds_by_sku above) but priced at the COGS rate active on the ORIGINAL order
-      -- date - reversing at the same cost basis it was recorded at, not whatever rate applies
-      -- today. Amazon-only (amazon_customer_returns is sourced from an FBA-only report); a
-      -- Shopify order fulfilled via MCF would ship back to an FBA fulfillment center too, but
-      -- the returns report's order-id for those is the MCF fulfillment order id, not the
-      -- Shopify order id, so it wouldn't join here even if present - out of scope for now.
+      -- COGS credit-back for genuine physical returns - priced at the COGS rate active on the
+      -- ORIGINAL order date (reversing at the same cost basis it was recorded at), but
+      -- attributed to the matching REFUND's date rather than the physical return_date, so it
+      -- lands in the same window as the revenue reversal it corresponds to (matches
+      -- refunds_by_sku above). Each return is matched to its nearest-in-time refund event on
+      -- the same order/sku. Amazon-only (amazon_customer_returns is sourced from an FBA-only
+      -- report); a Shopify order fulfilled via MCF would ship back to an FBA fulfillment center
+      -- too, but the returns report's order-id for those is the MCF fulfillment order id, not
+      -- the Shopify order id, so it wouldn't join here even if present - out of scope for now.
       returns_by_sku AS (
         SELECT
           acr.sku,
@@ -1549,6 +1560,12 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM amazon_customer_returns acr
         JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+        LEFT JOIN LATERAL (
+          SELECT olr.refund_date FROM amazon_order_line_refunds olr
+          WHERE olr.amazon_order_id = acr.amazon_order_id AND olr.sku = acr.sku
+          ORDER BY ABS(EXTRACT(EPOCH FROM (olr.refund_date - acr.return_date::timestamptz))) ASC
+          LIMIT 1
+        ) rf ON true
         LEFT JOIN LATERAL (
           SELECT
             ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
@@ -1569,7 +1586,7 @@ app.get('/api/product-breakdown', async (req, res) => {
             AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
           ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
-        WHERE acr.return_date BETWEEN $1 AND $2
+        WHERE COALESCE(rf.refund_date::date, acr.return_date) BETWEEN $1 AND $2
         GROUP BY acr.sku
       ),
       cogs_by_sku_raw AS (
@@ -2003,8 +2020,9 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const cogsResult = { rows: cogsRows };
 
     // COGS credit-back for genuine physical returns only (amazon_customer_returns), not every
-    // refund — return_date-scoped, priced at the COGS rate active on the original order date.
-    // See the equivalent query in /api/pnl for the full rationale.
+    // refund — attributed to the matching refund's date (nearest-in-time refund event on the
+    // same order/sku), priced at the COGS rate active on the original order date. See the
+    // equivalent query in /api/pnl for the full rationale.
     const returnsCogsResult = includeAmazon ? await pool.query(`
       SELECT COALESCE(SUM(acr.quantity * (
         COALESCE(
@@ -2020,6 +2038,12 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
       FROM amazon_customer_returns acr
       JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT olr.refund_date FROM amazon_order_line_refunds olr
+        WHERE olr.amazon_order_id = acr.amazon_order_id AND olr.sku = acr.sku
+        ORDER BY ABS(EXTRACT(EPOCH FROM (olr.refund_date - acr.return_date::timestamptz))) ASC
+        LIMIT 1
+      ) rf ON true
       LEFT JOIN LATERAL (
         SELECT
           ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
@@ -2039,7 +2063,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
           AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
         ORDER BY ce0.effective_from DESC LIMIT 1
       ) ce ON true
-      WHERE acr.sku = $1 AND acr.return_date BETWEEN $2 AND $3
+      WHERE acr.sku = $1 AND COALESCE(rf.refund_date::date, acr.return_date) BETWEEN $2 AND $3
     `, [sku, dateFrom, dateTo]) : { rows: [{ total_cogs_returned: 0 }] };
 
     const reportingCurrency = await getReportingCurrency();
