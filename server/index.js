@@ -948,11 +948,22 @@ app.get('/api/pnl', async (req, res) => {
     // as refundsResult above). Amazon-only — Shopify has no equivalent. Kept as a separate query
     // from v_refunds_by_date (a view we don't have DDL access to alter) since these two columns
     // only exist on amazon_order_line_refunds.
+    //
+    // Amazon sometimes posts the monetary refund before the commission-reversal fee event
+    // settles (fee_commission_refunded/fee_refund_admin still 0 despite a real amount_refunded).
+    // For those rows, estimate from the original per-unit commission on the order line, prorated
+    // by quantity refunded, with the admin fee at this account's own observed settled ratio
+    // (~20% of the reversed commission — Amazon's admin cut on refunds).
     const refundFeesResult = includeAmazon ? await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period,
-        SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
-        SUM(fee_refund_admin)::numeric AS fee_refund_admin
-      FROM amazon_order_line_refunds WHERE refund_date::date BETWEEN $1 AND $2
+      SELECT DATE_TRUNC('${trunc}', olr.refund_date)::date AS period,
+        SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
+        SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
+        BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      WHERE olr.refund_date::date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]) : { rows: [] };
 
@@ -1306,15 +1317,21 @@ app.get('/api/product-breakdown', async (req, res) => {
   const brandFilter = brand ? `AND sp.brand = '${brand.replace(/'/g, "''")}'` : '';
   const parentFilter = parent_asin ? `AND sp.parent_asin = '${parent_asin.replace(/'/g, "''")}'` : '';
   try {
-    // Refunds by SKU, attributed by refund_date within selected range
+    // Refunds by SKU, attributed by refund_date within selected range. Estimates
+    // fee_commission_refunded/fee_refund_admin (prorated from the order line's original
+    // commission, admin fee at the account's observed ~20% ratio) for refunds where the
+    // monetary amount has posted but Amazon's commission-reversal fee event hasn't settled yet.
     const refundCte = `
       refunds_by_sku AS (
-        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded,
-          SUM(COALESCE(fee_commission_refunded,0))::numeric AS fee_commission_refunded,
-          SUM(COALESCE(fee_refund_admin,0))::numeric AS fee_refund_admin
-        FROM amazon_order_line_refunds
-        WHERE sku IS NOT NULL AND refund_date::date BETWEEN $1 AND $2
-        GROUP BY sku
+        SELECT olr.sku, SUM(olr.amount_refunded)::numeric AS total_refunded, SUM(COALESCE(olr.quantity_refunded,0))::int AS units_refunded,
+          SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
+          SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin
+        FROM amazon_order_line_refunds olr
+        LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+        WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
+        GROUP BY olr.sku
       ),
       shopify_refunds_by_sku AS (
         SELECT
@@ -1762,13 +1779,22 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     // Commission reversal / refund admin fee, refund-date-scoped (same table/date basis as
     // refundResult above) — lives on amazon_order_line_refunds, not the v_refunds_by_date view
     // (which we don't have DDL access to alter), so queried separately. Amazon-only.
+    //
+    // Estimates fee_commission_refunded/fee_refund_admin (prorated from the order line's
+    // original commission, admin fee at the account's observed ~20% ratio) for refunds where
+    // the monetary amount has posted but Amazon's commission-reversal fee event hasn't settled
+    // yet — flagged via has_estimated so it feeds the same EST badge as is_estimated_fee.
     const refundFeesResult = includeAmazon ? await pool.query(`
       SELECT
-        COALESCE(SUM(fee_commission_refunded), 0)::numeric AS fee_commission_refunded,
-        COALESCE(SUM(fee_refund_admin), 0)::numeric AS fee_refund_admin
-      FROM amazon_order_line_refunds
-      WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
-    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0 }] };
+        COALESCE(SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_commission_refunded,
+        COALESCE(SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END), 0)::numeric AS fee_refund_admin,
+        BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      WHERE olr.sku = $1 AND olr.refund_date::date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0, has_estimated: false }] };
 
     // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
     const ppcResult = includeAmazon ? await pool.query(`
@@ -1889,7 +1915,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee;
     // True when any Amazon fee for this SKU/period is still an estimate (from /estimate-fees,
     // pending settlement via the Finances API) rather than a confirmed final amount.
-    const hasEstimatedFees = amz.has_estimated_fees === true;
+    const hasEstimatedFees = amz.has_estimated_fees === true || refundFeesResult.rows[0]?.has_estimated === true;
 
     // Sum COGS components across both channels
     const cogsSt  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_standard  || 0), 0);
