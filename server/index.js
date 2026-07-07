@@ -1447,29 +1447,44 @@ app.get('/api/product-breakdown', async (req, res) => {
     let result;
     if (channel === 'shopify') {
       result = await pool.query(`
-        WITH ${refundCte}
+        WITH ${refundCte},
+        -- Pre-aggregated so a SKU refunded this period but ordered outside it (no rows in
+        -- shopify_order_lines within range) can still FULL OUTER JOIN in as its own row,
+        -- instead of its refund being silently dropped because nothing to attach it to
+        -- existed - the exact gap that let a real refund show in P&L but not here.
+        shopify_order_agg AS (
+          SELECT
+            sol.sku,
+            MAX(sol.product_title) AS product_title,
+            SUM(sol.quantity)::int AS units_sold,
+            SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
+            (SUM(sol.unit_price * sol.quantity) - SUM(sol.discount_per_unit * sol.quantity))::numeric(12,2) AS net_before_refunds,
+            SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts
+          FROM shopify_order_lines sol
+          WHERE sol.order_date::date BETWEEN $1 AND $2
+          GROUP BY sol.sku
+        )
         SELECT
-          sol.sku,
-          MAX(sol.product_title) AS product_title,
+          COALESCE(o.sku, r.sku) AS sku,
+          COALESCE(o.product_title, sp.product_name) AS product_title,
           NULL AS asin,
           sp.image_url,
           sp.brand,
           sp.parent_asin,
           'shopify' AS channels,
-          SUM(sol.quantity)::int AS units_sold,
-          COALESCE(MAX(r.units_refunded), 0)::int AS units_refunded,
-          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          (SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity) - COALESCE(MAX(r.total_refunded), 0))::numeric(12,2) AS net_revenue,
-          SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
-          COALESCE(MAX(r.total_refunded), 0)::numeric(12,2) AS total_refunded,
-          COALESCE(MAX(cogs.total_cogs_sold), 0)::numeric(12,2) AS total_cogs,
-          COALESCE(MAX(cogs.total_fees), 0)::numeric(12,2) AS total_fees
-        FROM shopify_order_lines sol
-        LEFT JOIN shopify_refunds_by_sku r ON r.sku = sol.sku
-        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
-        LEFT JOIN shopify_cogs_only cogs ON cogs.sku = sol.sku
-        WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
-        GROUP BY sol.sku, sp.image_url, sp.brand, sp.parent_asin
+          COALESCE(o.units_sold, 0)::int AS units_sold,
+          COALESCE(r.units_refunded, 0)::int AS units_refunded,
+          COALESCE(o.gross_sales, 0)::numeric(12,2) AS gross_sales,
+          (COALESCE(o.net_before_refunds, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
+          COALESCE(o.total_discounts, 0)::numeric(12,2) AS total_discounts,
+          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
+          COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
+          COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees
+        FROM shopify_order_agg o
+        FULL OUTER JOIN shopify_refunds_by_sku r ON r.sku = o.sku
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, r.sku)
+        LEFT JOIN shopify_cogs_only cogs ON cogs.sku = COALESCE(o.sku, r.sku)
+        WHERE 1=1 ${brandFilter} ${parentFilter}
       `, [dateFrom, dateTo]);
     } else if (channel === 'amazon') {
       result = await pool.query(`
@@ -1493,7 +1508,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           GROUP BY aol.sku
         )
         SELECT
-          COALESCE(o.sku, ppc.sku) AS sku,
+          COALESCE(o.sku, ppc.sku, r.sku) AS sku,
           COALESCE(o.product_title, sp.product_name) AS product_title,
           COALESCE(o.asin, sp.asin) AS asin,
           sp.image_url,
@@ -1513,9 +1528,12 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(ppc.ppc_units, 0)::int AS ppc_units
         FROM amazon_order_agg o
         FULL OUTER JOIN ppc_by_sku ppc ON ppc.sku = o.sku
-        LEFT JOIN refunds_by_sku r ON r.sku = COALESCE(o.sku, ppc.sku)
-        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, ppc.sku)
-        LEFT JOIN amazon_cogs_only cogs ON cogs.sku = COALESCE(o.sku, ppc.sku)
+        -- FULL OUTER so a SKU refunded this period but ordered outside it still surfaces as
+        -- its own row, instead of the refund being silently dropped (same gap as the shopify
+        -- branch above - the exact bug that let a real refund show in P&L but not here).
+        FULL OUTER JOIN refunds_by_sku r ON r.sku = COALESCE(o.sku, ppc.sku)
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, ppc.sku, r.sku)
+        LEFT JOIN amazon_cogs_only cogs ON cogs.sku = COALESCE(o.sku, ppc.sku, r.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
       `, [dateFrom, dateTo]);
     } else {
@@ -1550,21 +1568,23 @@ app.get('/api/product-breakdown', async (req, res) => {
           GROUP BY aol.sku
         )
         SELECT
-          COALESCE(s.sku, a.sku, ppc.sku) AS sku,
+          COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku) AS sku,
           COALESCE(a.product_title, s.product_title, sp.product_name) AS product_title,
           COALESCE(a.asin, sp.asin) AS asin,
           sp.image_url,
           sp.brand,
           sp.parent_asin,
-          CASE WHEN s.sku IS NOT NULL AND a.sku IS NOT NULL THEN 'both'
-               WHEN s.sku IS NOT NULL THEN 'shopify'
-               ELSE 'amazon' END AS channels,
+          CASE
+            WHEN (s.sku IS NOT NULL OR rs.sku IS NOT NULL) AND (a.sku IS NOT NULL OR ra.sku IS NOT NULL) THEN 'both'
+            WHEN (s.sku IS NOT NULL OR rs.sku IS NOT NULL) THEN 'shopify'
+            ELSE 'amazon'
+          END AS channels,
           (COALESCE(s.units_sold, 0) + COALESCE(a.units_sold, 0))::int AS units_sold,
-          COALESCE(r.units_refunded, 0)::int AS units_refunded,
+          (COALESCE(ra.units_refunded, 0) + COALESCE(rs.units_refunded, 0))::int AS units_refunded,
           (COALESCE(s.gross_sales, 0) + COALESCE(a.gross_sales, 0))::numeric(12,2) AS gross_sales,
-          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(r.total_refunded, 0))::numeric(12,2) AS net_revenue,
+          (COALESCE(s.net_revenue, 0) + COALESCE(a.net_revenue, 0) - COALESCE(ra.total_refunded, 0) - COALESCE(rs.total_refunded, 0))::numeric(12,2) AS net_revenue,
           (COALESCE(s.total_discounts, 0) + COALESCE(a.total_discounts, 0))::numeric(12,2) AS total_discounts,
-          COALESCE(r.total_refunded, 0)::numeric(12,2) AS total_refunded,
+          (COALESCE(ra.total_refunded, 0) + COALESCE(rs.total_refunded, 0))::numeric(12,2) AS total_refunded,
           COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
           COALESCE(cogs.total_fees, 0)::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
@@ -1575,9 +1595,13 @@ app.get('/api/product-breakdown', async (req, res) => {
         -- FULL OUTER so a SKU with ad spend but zero orders anywhere (no Shopify, no
         -- Amazon sale) still surfaces as its own row instead of disappearing entirely.
         FULL OUTER JOIN ppc_by_sku ppc ON ppc.sku = COALESCE(s.sku, a.sku)
-        LEFT JOIN all_refunds_by_sku r ON r.sku = COALESCE(s.sku, a.sku, ppc.sku)
-        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku, ppc.sku)
-        LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku, ppc.sku)
+        -- FULL OUTER (and split by channel, not the pre-combined all_refunds_by_sku) so a SKU
+        -- refunded this period but ordered outside it still surfaces as its own row with the
+        -- right channel badge - the exact gap that let a real refund show in P&L but not here.
+        FULL OUTER JOIN refunds_by_sku ra ON ra.sku = COALESCE(s.sku, a.sku, ppc.sku)
+        FULL OUTER JOIN shopify_refunds_by_sku rs ON rs.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku)
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku)
+        LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
       `, [dateFrom, dateTo]);
     }
