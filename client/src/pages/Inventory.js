@@ -151,6 +151,22 @@ export default function Inventory() {
     });
   }, [rows, sort, dir, hideZeroStock]);
 
+  // Sums respect the current "hide zero inventory" filter, same population as the table below.
+  const totals = useMemo(() => {
+    const t = { sellable: 0, inbound: 0, damaged: 0, other: 0, total: 0, surcharge_monthly: 0 };
+    AGE_BUCKETS.forEach(b => { t[b.key] = 0; });
+    for (const r of sortedRows) {
+      t.sellable += parseInt(r.sellable || 0);
+      t.inbound  += parseInt(r.inbound || 0);
+      t.damaged  += parseInt(r.damaged || 0);
+      t.other    += parseInt(r.other || 0);
+      t.total    += parseInt(r.total || 0);
+      t.surcharge_monthly += parseFloat(r.surcharge_monthly || 0);
+      AGE_BUCKETS.forEach(b => { t[b.key] += parseInt(r[b.key] || 0); });
+    }
+    return t;
+  }, [sortedRows]);
+
   return (
     <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 18 : 24 }}>
 
@@ -250,6 +266,48 @@ export default function Inventory() {
               </AreaChart>
             </ResponsiveContainer>
           )}
+        </div>
+      </div>
+
+      {/* Totals across all SKUs currently in the table (respects the hide-zero-stock filter) */}
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--accent)', borderRadius: 12, overflow: 'hidden' }}>
+        <div style={{ overflowX: 'auto' }}>
+          <div style={{ minWidth: TABLE_MIN_WIDTH, display: 'grid', gridTemplateColumns: TABLE_GRID }}>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 13, fontWeight: 700 }}>All SKUs</span>
+              <span style={{ fontSize: 11, color: 'var(--muted)', marginLeft: 8 }}>({sortedRows.length})</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.sellable)}</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.inbound)}</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: totals.damaged > 0 ? 'var(--red)' : 'var(--text)' }}>{fmtN(totals.damaged)}</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.other)}</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 17, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(totals.total)}</span>
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center', gap: 10 }}>
+              {AGE_BUCKETS.map(b => (
+                <div key={b.key} style={{ textAlign: 'center', minWidth: 48 }}>
+                  <div style={{ fontSize: 11.5, color: 'var(--muted)', whiteSpace: 'nowrap' }}>{b.label}</div>
+                  <div style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: totals[b.key] > 0 ? STATUS_COLOR[b.status] : 'var(--muted)' }}>
+                    {fmtN(totals[b.key])}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: totals.surcharge_monthly > 0 ? 'var(--red)' : 'var(--muted)' }}>
+                {fmtCurrency(totals.surcharge_monthly)}{totals.surcharge_monthly > 0 ? '/mo' : ''}
+              </span>
+            </div>
+          </div>
         </div>
       </div>
 
