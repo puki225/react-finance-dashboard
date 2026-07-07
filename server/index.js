@@ -948,11 +948,68 @@ app.get('/api/pnl', async (req, res) => {
     // as refundsResult above). Amazon-only — Shopify has no equivalent. Kept as a separate query
     // from v_refunds_by_date (a view we don't have DDL access to alter) since these two columns
     // only exist on amazon_order_line_refunds.
+    //
+    // Amazon sometimes posts the monetary refund before the commission-reversal fee event
+    // settles (fee_commission_refunded/fee_refund_admin still 0 despite a real amount_refunded).
+    // For those rows, estimate from the original per-unit commission on the order line, prorated
+    // by quantity refunded, with the admin fee at this account's own observed settled ratio
+    // (~20% of the reversed commission — Amazon's admin cut on refunds).
     const refundFeesResult = includeAmazon ? await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period,
-        SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
-        SUM(fee_refund_admin)::numeric AS fee_refund_admin
-      FROM amazon_order_line_refunds WHERE refund_date::date BETWEEN $1 AND $2
+      SELECT DATE_TRUNC('${trunc}', olr.refund_date)::date AS period,
+        SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
+        SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
+        BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      WHERE olr.refund_date::date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]) : { rows: [] };
+
+    // COGS credit-back for genuine physical returns, attributed by return_date (event-dated,
+    // like refundFeesResult above) but priced at the COGS rate active on the ORIGINAL order
+    // date — reversing at the same cost basis it was recorded at. A refund alone does NOT
+    // credit COGS here — only a matching row in amazon_customer_returns (Amazon's FBA Customer
+    // Returns report) does, since a refund only reverses revenue and doesn't mean the unit
+    // physically came back.
+    const returnsCogsResult = includeAmazon ? await pool.query(`
+      SELECT DATE_TRUNC('${trunc}', acr.return_date)::date AS period,
+        SUM(acr.quantity * (
+          COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+          + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+          + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+          + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+          + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+        ))::numeric AS total_cogs_returned
+      FROM amazon_customer_returns acr
+      JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = acr.sku
+          AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE acr.return_date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter} ${fulfillmentFilter} ${orderTypeFilter}
       GROUP BY 1
     `, [dateFrom, dateTo]) : { rows: [] };
 
@@ -1026,6 +1083,10 @@ app.get('/api/pnl', async (req, res) => {
         refund_admin_fee: parseFloat(r.fee_refund_admin || 0),
       };
     }
+    const returnsCogsByPeriod = {};
+    for (const r of returnsCogsResult.rows) {
+      returnsCogsByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.total_cogs_returned || 0);
+    }
     const ppcByPeriod = {};
     const ppcUnitsByPeriod = {};
     for (const r of ppcResult.rows) {
@@ -1093,8 +1154,11 @@ app.get('/api/pnl', async (req, res) => {
         demurrage: -fx(r?.cogs_demurrage || 0),
         quality: -fx(r?.cogs_quality || 0),
         other: -fx(r?.cogs_other || 0),
+        // Credit-back for genuine physical returns only (amazon_customer_returns), not every
+        // refund — see returnsCogsResult above.
+        returned: fx(returnsCogsByPeriod[periodKey] || 0),
       };
-      cogs.total = cogs.standard + cogs.freight + cogs.demurrage + cogs.quality + cogs.other;
+      cogs.total = cogs.standard + cogs.freight + cogs.demurrage + cogs.quality + cogs.other + cogs.returned;
       const refundFees = refundFeesByPeriod[periodKey] || { commission_refunded: 0, refund_admin_fee: 0 };
       const lineFees = {
         commission: -fx(r?.fee_commission || 0),
@@ -1173,6 +1237,7 @@ app.get('/api/pnl', async (req, res) => {
           demurrage: cogs.demurrage.toFixed(2),
           quality: cogs.quality.toFixed(2),
           other: cogs.other.toFixed(2),
+          returned: cogs.returned.toFixed(2),
           total: cogs.total.toFixed(2),
         },
         fees: {
@@ -1222,6 +1287,7 @@ app.get('/api/pnl', async (req, res) => {
       ...linesResult.rows.map(r => r.period.toISOString().split('T')[0]),
       ...Object.keys(refundsByPeriod),
       ...Object.keys(refundFeesByPeriod),
+      ...Object.keys(returnsCogsByPeriod),
       ...Object.keys(ppcByPeriod),
       ...Object.keys(accountFeesByPeriod),
       ...Object.keys(adjustmentsByPeriod),
@@ -1264,6 +1330,7 @@ app.get('/api/pnl', async (req, res) => {
       commission_refunded: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.commission_refunded || 0), 0),
       refund_admin_fee: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.refund_admin_fee || 0), 0),
     };
+    returnsCogsByPeriod['__total__'] = sumMap(returnsCogsByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
     ppcUnitsByPeriod['__total__'] = sumMap(ppcUnitsByPeriod);
     adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
@@ -1306,15 +1373,21 @@ app.get('/api/product-breakdown', async (req, res) => {
   const brandFilter = brand ? `AND sp.brand = '${brand.replace(/'/g, "''")}'` : '';
   const parentFilter = parent_asin ? `AND sp.parent_asin = '${parent_asin.replace(/'/g, "''")}'` : '';
   try {
-    // Refunds by SKU, attributed by refund_date within selected range
+    // Refunds by SKU, attributed by refund_date within selected range. Estimates
+    // fee_commission_refunded/fee_refund_admin (prorated from the order line's original
+    // commission, admin fee at the account's observed ~20% ratio) for refunds where the
+    // monetary amount has posted but Amazon's commission-reversal fee event hasn't settled yet.
     const refundCte = `
       refunds_by_sku AS (
-        SELECT sku, SUM(amount_refunded)::numeric AS total_refunded, SUM(COALESCE(quantity_refunded,0))::int AS units_refunded,
-          SUM(COALESCE(fee_commission_refunded,0))::numeric AS fee_commission_refunded,
-          SUM(COALESCE(fee_refund_admin,0))::numeric AS fee_refund_admin
-        FROM amazon_order_line_refunds
-        WHERE sku IS NOT NULL AND refund_date::date BETWEEN $1 AND $2
-        GROUP BY sku
+        SELECT olr.sku, SUM(olr.amount_refunded)::numeric AS total_refunded, SUM(COALESCE(olr.quantity_refunded,0))::int AS units_refunded,
+          SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
+          SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin
+        FROM amazon_order_line_refunds olr
+        LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+        WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
+        GROUP BY olr.sku
       ),
       shopify_refunds_by_sku AS (
         SELECT
@@ -1343,8 +1416,10 @@ app.get('/api/product-breakdown', async (req, res) => {
           SELECT sku, total_refunded, units_refunded FROM shopify_refunds_by_sku
         ) combined GROUP BY sku
       ),
-      -- COGS per SKU: weighted by quantity at the COGS rate active on each order date
-      -- For refunded units, COGS is credited back (net units = sold - refunded)
+      -- COGS per SKU: weighted by quantity at the COGS rate active on each order date.
+      -- NOT credited back for refunds here — a refund only reverses revenue, it doesn't mean
+      -- the physical unit came back. The credit-back for genuine returns is a separate step
+      -- below (returns_by_sku), keyed off amazon_customer_returns rather than amount_refunded.
       amazon_cogs AS (
         SELECT
           aol.sku,
@@ -1449,7 +1524,55 @@ app.get('/api/product-breakdown', async (req, res) => {
         WHERE sol.order_date::date BETWEEN $1 AND $2
         GROUP BY sol.sku
       ),
-      cogs_by_sku AS (
+      -- COGS credit-back for genuine physical returns, attributed by return_date (event-dated,
+      -- like refunds_by_sku above) but priced at the COGS rate active on the ORIGINAL order
+      -- date - reversing at the same cost basis it was recorded at, not whatever rate applies
+      -- today. Amazon-only (amazon_customer_returns is sourced from an FBA-only report); a
+      -- Shopify order fulfilled via MCF would ship back to an FBA fulfillment center too, but
+      -- the returns report's order-id for those is the MCF fulfillment order id, not the
+      -- Shopify order id, so it wouldn't join here even if present - out of scope for now.
+      returns_by_sku AS (
+        SELECT
+          acr.sku,
+          SUM(acr.quantity * (
+            COALESCE(
+              NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+              CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+                AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+                THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+            + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+            + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+            + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+          ))::numeric AS total_cogs_returned,
+          SUM(acr.quantity)::int AS units_returned
+        FROM amazon_customer_returns acr
+        JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+        LEFT JOIN LATERAL (
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = acr.sku
+            AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE acr.return_date BETWEEN $1 AND $2
+        GROUP BY acr.sku
+      ),
+      cogs_by_sku_raw AS (
         SELECT sku,
           SUM(total_cogs_sold)::numeric AS total_cogs_sold,
           SUM(total_fees)::numeric AS total_fees
@@ -1459,11 +1582,22 @@ app.get('/api/product-breakdown', async (req, res) => {
           SELECT sku, total_cogs_sold, total_fees FROM shopify_cogs
         ) combined GROUP BY sku
       ),
+      cogs_by_sku AS (
+        SELECT r.sku,
+          (r.total_cogs_sold - COALESCE(ret.total_cogs_returned, 0))::numeric AS total_cogs_sold,
+          r.total_fees
+        FROM cogs_by_sku_raw r
+        LEFT JOIN returns_by_sku ret ON ret.sku = r.sku
+      ),
       shopify_cogs_only AS (
         SELECT sku, total_cogs_sold, total_fees FROM shopify_cogs
       ),
       amazon_cogs_only AS (
-        SELECT sku, total_cogs_sold, total_fees FROM amazon_cogs
+        SELECT ac.sku,
+          (ac.total_cogs_sold - COALESCE(ret.total_cogs_returned, 0))::numeric AS total_cogs_sold,
+          ac.total_fees
+        FROM amazon_cogs ac
+        LEFT JOIN returns_by_sku ret ON ret.sku = ac.sku
       ),
       -- PPC spend/sales per SKU (Amazon Ads only) — pre-aggregated so the join below
       -- can't fan out the surrounding SUMs (see MCF fee bug for why this matters).
@@ -1762,13 +1896,22 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     // Commission reversal / refund admin fee, refund-date-scoped (same table/date basis as
     // refundResult above) — lives on amazon_order_line_refunds, not the v_refunds_by_date view
     // (which we don't have DDL access to alter), so queried separately. Amazon-only.
+    //
+    // Estimates fee_commission_refunded/fee_refund_admin (prorated from the order line's
+    // original commission, admin fee at the account's observed ~20% ratio) for refunds where
+    // the monetary amount has posted but Amazon's commission-reversal fee event hasn't settled
+    // yet — flagged via has_estimated so it feeds the same EST badge as is_estimated_fee.
     const refundFeesResult = includeAmazon ? await pool.query(`
       SELECT
-        COALESCE(SUM(fee_commission_refunded), 0)::numeric AS fee_commission_refunded,
-        COALESCE(SUM(fee_refund_admin), 0)::numeric AS fee_refund_admin
-      FROM amazon_order_line_refunds
-      WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
-    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0 }] };
+        COALESCE(SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_commission_refunded,
+        COALESCE(SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END), 0)::numeric AS fee_refund_admin,
+        BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      WHERE olr.sku = $1 AND olr.refund_date::date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0, has_estimated: false }] };
 
     // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
     const ppcResult = includeAmazon ? await pool.query(`
@@ -1859,6 +2002,46 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     }
     const cogsResult = { rows: cogsRows };
 
+    // COGS credit-back for genuine physical returns only (amazon_customer_returns), not every
+    // refund — return_date-scoped, priced at the COGS rate active on the original order date.
+    // See the equivalent query in /api/pnl for the full rationale.
+    const returnsCogsResult = includeAmazon ? await pool.query(`
+      SELECT COALESCE(SUM(acr.quantity * (
+        COALESCE(
+          NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+          CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+            AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+            THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+        + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+        + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+        + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+        + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+      )), 0)::numeric AS total_cogs_returned
+      FROM amazon_customer_returns acr
+      JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = acr.sku AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE acr.sku = $1 AND acr.return_date BETWEEN $2 AND $3
+    `, [sku, dateFrom, dateTo]) : { rows: [{ total_cogs_returned: 0 }] };
+
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
@@ -1889,7 +2072,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee;
     // True when any Amazon fee for this SKU/period is still an estimate (from /estimate-fees,
     // pending settlement via the Finances API) rather than a confirmed final amount.
-    const hasEstimatedFees = amz.has_estimated_fees === true;
+    const hasEstimatedFees = amz.has_estimated_fees === true || refundFeesResult.rows[0]?.has_estimated === true;
 
     // Sum COGS components across both channels
     const cogsSt  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_standard  || 0), 0);
@@ -1897,7 +2080,9 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     const cogsDem = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_demurrage || 0), 0);
     const cogsQty = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_quality   || 0), 0);
     const cogsOth = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_other     || 0), 0);
-    const totalCogs = cogsSt + cogsFr + cogsDem + cogsQty + cogsOth;
+    // Credit-back for genuine physical returns only, not every refund — see returnsCogsResult above.
+    const cogsReturned = fx(returnsCogsResult.rows[0]?.total_cogs_returned || 0);
+    const totalCogs = cogsSt + cogsFr + cogsDem + cogsQty + cogsOth - cogsReturned;
 
     // Gross Margin = Net Sales − Fees − COGS (before PPC).
     // Product Contribution = Gross Margin − PPC spend — the true bottom line once ad cost is included.
@@ -1934,6 +2119,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         demurrage: f(-cogsDem),
         quality:   f(-cogsQty),
         other:     f(-cogsOth),
+        returned:  f(cogsReturned), // positive: a credit
         total:     f(-totalCogs),
       },
       gross_margin: f(grossMargin),
@@ -1941,7 +2127,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         spend: f(-ppcCost),
       },
       product_contribution: f(productContribution),
-      has_cogs: totalCogs > 0,
+      has_cogs: totalCogs > 0 || cogsReturned > 0,
       // totalFees can net to <= 0 when a refund's commission credit outweighs the period's
       // other fees — check the components too so that case still shows the fee breakdown
       // instead of hiding a real commission_refunded/refund_admin_fee amount.

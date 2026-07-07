@@ -27,6 +27,7 @@ const COGS_LABELS = [
   ['demurrage', 'Demurrage / Duties'],
   ['quality', 'Quality / Inspection'],
   ['other', 'Other COGS'],
+  ['returned', 'Returns Credit'],
 ];
 
 const GROUPS = ['day', 'week', 'month', 'quarter', 'year'];
