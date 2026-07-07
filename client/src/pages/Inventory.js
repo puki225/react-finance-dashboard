@@ -99,10 +99,10 @@ const COLS = [
   { key: 'other',         label: 'Other',     width: '100px', sortable: true },
   { key: 'total',         label: 'Total',     width: '100px', sortable: true },
   { key: 'aging',         label: 'Aging (days)', width: '320px', sortable: false },
-  { key: 'surcharge',     label: 'Est. Surcharge Paid', width: '150px', sortable: true },
+  { key: 'surcharge_monthly', label: 'Est. Monthly Surcharge', width: '160px', sortable: true },
 ];
-const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 320px 150px';
-const TABLE_MIN_WIDTH = 160 + 100 * 5 + 320 + 150;
+const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 320px 160px';
+const TABLE_MIN_WIDTH = 160 + 100 * 5 + 320 + 160;
 
 export default function Inventory() {
   const isMobile = useIsMobile();
@@ -338,8 +338,8 @@ export default function Inventory() {
                     ))}
                   </div>
                   <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
-                    <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.surcharge) > 0 ? 'var(--red)' : 'var(--muted)' }}>
-                      {fmtCurrency(row.surcharge)}
+                    <span title="Recurring cost if these units stay unsold - LTSF bills monthly, so this repeats every cycle until they sell or are removed" style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: parseFloat(row.surcharge_monthly) > 0 ? 'var(--red)' : 'var(--muted)' }}>
+                      {fmtCurrency(row.surcharge_monthly)}{parseFloat(row.surcharge_monthly) > 0 ? '/mo' : ''}
                     </span>
                   </div>
                 </div>
