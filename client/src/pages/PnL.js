@@ -9,12 +9,14 @@ import { useIsMobile } from '../hooks/useIsMobile';
 // (period-keyed) instead of the per-order-line Amazon fee columns.
 const LINE_FEE_LABELS = [
   ['commission', 'Commission'],
+  ['commission_refunded', 'Commission Refunded'],
   ['fba_fulfillment', 'FBA Fulfillment'],
   ['fixed_closing', 'Fixed Closing Fee'],
   ['variable_closing', 'Variable Closing Fee'],
   ['digital_services', 'Digital Services'],
   ['giftwrap', 'Giftwrap Chargeback'],
   ['shipping_chargeback', 'Shipping Chargeback'],
+  ['refund_admin_fee', 'Refund Admin Fee'],
   ['mcf', 'MCF'],
 ];
 
