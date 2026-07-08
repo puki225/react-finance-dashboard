@@ -16,6 +16,27 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false }
 });
 
+// order_date/refund_date (and other event-date columns) are stored as timestamptz.
+// Rather than converting to the reporting timezone in every individual query, set it once
+// per pooled connection - DATE_TRUNC/::date casts on timestamptz columns then automatically
+// bucket by the configured local calendar day/month everywhere in the app, not just wherever
+// this touches. Single-tenant app (one client_config row), so there's no risk of one
+// customer's timezone leaking into another's request on a reused connection.
+// SET TIME ZONE doesn't accept a bind parameter ($1) - Postgres only allows a literal there.
+// Safe to interpolate directly since it's validated against the IANA name pattern (letters,
+// digits, underscore, +/-, slash-separated segments - e.g. "Europe/London", "Etc/GMT+5") before
+// ever reaching here, both here and in the PUT /api/settings/config validation below.
+const IANA_TZ_PATTERN = /^[A-Za-z0-9_+\-]+(\/[A-Za-z0-9_+\-]+)*$/;
+pool.on('connect', async (client) => {
+  try {
+    const r = await client.query('SELECT timezone FROM client_config LIMIT 1');
+    const tz = r.rows[0]?.timezone || 'UTC';
+    await client.query(`SET TIME ZONE '${IANA_TZ_PATTERN.test(tz) ? tz : 'UTC'}'`);
+  } catch (e) {
+    console.error('[db] Failed to set session timezone, defaulting to UTC:', e.message);
+  }
+});
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
@@ -2512,33 +2533,40 @@ app.post('/api/sync-fx', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Client config — get reporting currency + company details (for report headers/exports)
+// Client config — get reporting currency + timezone + company details (for report headers/exports)
 app.get('/api/settings/config', async (req, res) => {
   try {
-    const result = await pool.query('SELECT reporting_currency, client_name, company_address, company_id, vat_number FROM client_config LIMIT 1');
-    res.json(result.rows[0] || { reporting_currency: 'GBP' });
+    const result = await pool.query('SELECT reporting_currency, timezone, client_name, company_address, company_id, vat_number FROM client_config LIMIT 1');
+    res.json(result.rows[0] || { reporting_currency: 'GBP', timezone: 'UTC' });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Client config — update reporting currency and/or company details. Each field is optional -
-// only the ones present in the request body are changed (COALESCE keeps the rest as-is), so the
-// currency selector and the company info form on the Settings page can save independently.
+// Client config — update reporting currency, timezone, and/or company details. Each field is
+// optional - only the ones present in the request body are changed (COALESCE keeps the rest
+// as-is), so the currency selector, timezone selector, and company info form on the Settings
+// page can save independently.
 app.put('/api/settings/config', async (req, res) => {
-  const { reporting_currency, client_name, company_address, company_id, vat_number } = req.body;
+  const { reporting_currency, timezone, client_name, company_address, company_id, vat_number } = req.body;
   if (reporting_currency !== undefined && !['GBP', 'USD', 'EUR'].includes(reporting_currency)) {
     return res.status(400).json({ error: 'Invalid currency' });
+  }
+  // Matches the IANA_TZ_PATTERN used for the pooled-connection SET TIME ZONE near the top of
+  // this file - keep these in sync.
+  if (timezone !== undefined && !/^[A-Za-z0-9_+\-]+(\/[A-Za-z0-9_+\-]+)*$/.test(timezone)) {
+    return res.status(400).json({ error: 'Invalid timezone' });
   }
   try {
     const result = await pool.query(`
       UPDATE client_config SET
         reporting_currency = COALESCE($1, reporting_currency),
-        client_name = COALESCE($2, client_name),
-        company_address = COALESCE($3, company_address),
-        company_id = COALESCE($4, company_id),
-        vat_number = COALESCE($5, vat_number),
+        timezone = COALESCE($2, timezone),
+        client_name = COALESCE($3, client_name),
+        company_address = COALESCE($4, company_address),
+        company_id = COALESCE($5, company_id),
+        vat_number = COALESCE($6, vat_number),
         updated_at = NOW()
-      RETURNING reporting_currency, client_name, company_address, company_id, vat_number
-    `, [reporting_currency ?? null, client_name ?? null, company_address ?? null, company_id ?? null, vat_number ?? null]);
+      RETURNING reporting_currency, timezone, client_name, company_address, company_id, vat_number
+    `, [reporting_currency ?? null, timezone ?? null, client_name ?? null, company_address ?? null, company_id ?? null, vat_number ?? null]);
     res.json({ ok: true, ...(result.rows[0] || {}) });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
