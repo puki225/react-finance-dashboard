@@ -2590,8 +2590,36 @@ app.get('/api/brands', async (req, res) => {
 // Inventory — latest FBA stock snapshot per SKU
 app.get('/api/inventory', async (req, res) => {
   try {
+    // Sales velocity windows for the "days of inventory left" estimate below - a seasonal
+    // PY-based forecast rather than a flat trailing average, so a SKU about to enter its high
+    // season (e.g. a Christmas item) doesn't read as having ample runway just because the last
+    // 90 days were quiet. Base velocity comes from PY's units in the calendar-equivalent NEXT
+    // 90 days (i.e. what happened a year ago in the period that seasonally corresponds to
+    // what's coming up), then scaled by this SKU's own YoY growth rate (this year's trailing
+    // 90D vs PY's same trailing 90D) so a growing or shrinking SKU still gets an accurate
+    // forecast, not just last year's raw shape.
+    const velocityNow = new Date();
+    const fmtDate = (d) => d.toISOString().split('T')[0];
+    const cyTrailingEnd = new Date(velocityNow);
+    const cyTrailingStart = new Date(velocityNow); cyTrailingStart.setDate(cyTrailingStart.getDate() - 89);
+    const pyAnchor = new Date(velocityNow); pyAnchor.setFullYear(pyAnchor.getFullYear() - 1);
+    const pyTrailingEnd = new Date(pyAnchor);
+    const pyTrailingStart = new Date(pyAnchor); pyTrailingStart.setDate(pyTrailingStart.getDate() - 89);
+    const pyForwardStart = new Date(pyAnchor);
+    const pyForwardEnd = new Date(pyAnchor); pyForwardEnd.setDate(pyForwardEnd.getDate() + 89);
+
     const result = await pool.query(`
-      WITH latest AS (
+      WITH sales_velocity AS (
+        SELECT aol.sku,
+          SUM(CASE WHEN ao.order_date::date BETWEEN $1 AND $2 THEN aol.quantity ELSE 0 END)::int AS cy_trailing_units,
+          SUM(CASE WHEN ao.order_date::date BETWEEN $3 AND $4 THEN aol.quantity ELSE 0 END)::int AS py_trailing_units,
+          SUM(CASE WHEN ao.order_date::date BETWEEN $5 AND $6 THEN aol.quantity ELSE 0 END)::int AS py_forward_units
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.status != 'Canceled' AND ao.order_date::date BETWEEN $3 AND $2
+        GROUP BY aol.sku
+      ),
+      latest AS (
         SELECT DISTINCT ON (sku)
           sku, asin, fulfillable_quantity, inbound_working_quantity, inbound_shipped_quantity,
           inbound_receiving_quantity, reserved_quantity, unfulfillable_quantity,
@@ -2656,14 +2684,18 @@ app.get('/api/inventory', async (req, res) => {
           ltsf.total_surcharge_gbp / NULLIF(ltsf.total_qty_charged, 0),
           (SELECT rate_per_unit FROM global_rate),
           0
-        )::numeric(12,4) AS rate_per_unit_gbp
+        )::numeric(12,4) AS rate_per_unit_gbp,
+        COALESCE(sv.cy_trailing_units, 0)::int AS cy_trailing_units,
+        COALESCE(sv.py_trailing_units, 0)::int AS py_trailing_units,
+        COALESCE(sv.py_forward_units, 0)::int AS py_forward_units
       FROM latest l
       LEFT JOIN sku_parameters sp ON sp.sku = l.sku
       LEFT JOIN latest_aging la ON la.sku = l.sku
       LEFT JOIN ltsf_by_sku ltsf ON ltsf.sku = l.sku
       LEFT JOIN order_title ot ON ot.sku = l.sku
+      LEFT JOIN sales_velocity sv ON sv.sku = l.sku
       ORDER BY l.total_quantity DESC
-    `);
+    `, [fmtDate(cyTrailingStart), fmtDate(cyTrailingEnd), fmtDate(pyTrailingStart), fmtDate(pyTrailingEnd), fmtDate(pyForwardStart), fmtDate(pyForwardEnd)]);
 
     const reportingCurrency = await getReportingCurrency();
     const today = new Date().toISOString().split('T')[0];
@@ -2701,9 +2733,37 @@ app.get('/api/inventory', async (req, res) => {
       const agedUnits = buckets[3] + buckets[4];
       const monthlySurcharge = agedUnits * parseFloat(r.rate_per_unit_gbp || 0) * fxRate;
 
-      const out = { ...r, surcharge_monthly: monthlySurcharge.toFixed(2) };
+      // Days of inventory left = sellable units / projected daily sales velocity. Velocity is a
+      // seasonal PY forecast, not a flat trailing average: base = PY's units in the
+      // calendar-equivalent NEXT 90 days (what happened a year ago in the period that
+      // seasonally corresponds to what's coming), scaled by this SKU's own YoY growth rate
+      // (this year's trailing 90D vs PY's same trailing 90D). Falls back to a flat trailing-90D
+      // rate for SKUs with no comparable PY window (e.g. launched within the last year).
+      const cyTrailingUnits = parseInt(r.cy_trailing_units || 0, 10);
+      const pyTrailingUnits = parseInt(r.py_trailing_units || 0, 10);
+      const pyForwardUnits = parseInt(r.py_forward_units || 0, 10);
+      let dailyVelocity;
+      if (pyForwardUnits > 0) {
+        const growthPct = pyTrailingUnits > 0 ? (cyTrailingUnits - pyTrailingUnits) / pyTrailingUnits : 0;
+        dailyVelocity = Math.max(0, (pyForwardUnits / 90) * (1 + growthPct));
+      } else if (cyTrailingUnits > 0) {
+        dailyVelocity = cyTrailingUnits / 90;
+      } else {
+        dailyVelocity = 0;
+      }
+      const daysOfInventory = dailyVelocity > 0 ? sellable / dailyVelocity : null;
+
+      const out = {
+        ...r,
+        surcharge_monthly: monthlySurcharge.toFixed(2),
+        daily_velocity: dailyVelocity.toFixed(2),
+        days_of_inventory: daysOfInventory === null ? null : Math.round(daysOfInventory),
+      };
       AGE_KEYS.forEach((k, i) => { out[k] = buckets[i]; });
       delete out.rate_per_unit_gbp;
+      delete out.cy_trailing_units;
+      delete out.py_trailing_units;
+      delete out.py_forward_units;
       return out;
     });
 

@@ -7,6 +7,12 @@ import { useIsMobile } from '../hooks/useIsMobile';
 const fmtN = (n) => parseInt(n || 0).toLocaleString('en-GB');
 const makeFmt = (symbol = '£') => (n) => symbol + parseFloat(n || 0).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 
+// Days-of-inventory-left thresholds - under a month is close to stocking out (critical), under
+// two months is worth watching (risk), null means no sales velocity to forecast from at all
+// (SKU has no PY or trailing sales data - not the same as "plenty of stock").
+const fmtDaysLeft = (d) => (d === null || d === undefined) ? '—' : d > 999 ? '999+' : fmtN(d);
+const daysLeftColor = (d) => (d === null || d === undefined) ? 'var(--muted)' : d < 30 ? '#f87171' : d < 60 ? '#fbbf24' : 'var(--text)';
+
 // snapshot_date values are month-starts ("YYYY-MM-01") for backfilled history and plain dates
 // for live daily snapshots - pinned to UTC so labels can't shift a day in behind-UTC timezones.
 const fmtTick = (d) => { if (!d) return ''; const date = new Date(d); return date.toLocaleDateString('en-GB', { month: 'short', year: '2-digit', timeZone: 'UTC' }); };
@@ -98,11 +104,12 @@ const COLS = [
   { key: 'damaged',       label: 'Damaged',   width: '100px', sortable: true },
   { key: 'other',         label: 'Other',     width: '100px', sortable: true },
   { key: 'total',         label: 'Total',     width: '100px', sortable: true },
+  { key: 'days_of_inventory', label: 'Days Left', width: '110px', sortable: true },
   { key: 'aging',         label: 'Aging (days)', width: '320px', sortable: false },
   { key: 'surcharge_monthly', label: 'Est. Monthly Surcharge', width: '160px', sortable: true },
 ];
-const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 320px 160px';
-const TABLE_MIN_WIDTH = 160 + 100 * 5 + 320 + 160;
+const TABLE_GRID = 'minmax(160px,1fr) 100px 100px 100px 100px 100px 110px 320px 160px';
+const TABLE_MIN_WIDTH = 160 + 100 * 5 + 110 + 320 + 160;
 
 export default function Inventory() {
   const isMobile = useIsMobile();
@@ -153,7 +160,7 @@ export default function Inventory() {
 
   // Sums respect the current "hide zero inventory" filter, same population as the table below.
   const totals = useMemo(() => {
-    const t = { sellable: 0, inbound: 0, damaged: 0, other: 0, total: 0, surcharge_monthly: 0 };
+    const t = { sellable: 0, inbound: 0, damaged: 0, other: 0, total: 0, surcharge_monthly: 0, total_velocity: 0 };
     AGE_BUCKETS.forEach(b => { t[b.key] = 0; });
     for (const r of sortedRows) {
       t.sellable += parseInt(r.sellable || 0);
@@ -162,8 +169,12 @@ export default function Inventory() {
       t.other    += parseInt(r.other || 0);
       t.total    += parseInt(r.total || 0);
       t.surcharge_monthly += parseFloat(r.surcharge_monthly || 0);
+      t.total_velocity += parseFloat(r.daily_velocity || 0);
       AGE_BUCKETS.forEach(b => { t[b.key] += parseInt(r[b.key] || 0); });
     }
+    // Days left isn't meaningful summed row-by-row - derive it from aggregate sellable stock
+    // over aggregate daily velocity, same formula each row uses individually.
+    t.days_of_inventory = t.total_velocity > 0 ? Math.round(t.sellable / t.total_velocity) : null;
     return t;
   }, [sortedRows]);
 
@@ -292,6 +303,11 @@ export default function Inventory() {
             <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
               <span style={{ fontSize: 17, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(totals.total)}</span>
             </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: daysLeftColor(totals.days_of_inventory) }}>
+                {fmtDaysLeft(totals.days_of_inventory)}
+              </span>
+            </div>
             <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center', gap: 10 }}>
               {AGE_BUCKETS.map(b => (
                 <div key={b.key} style={{ textAlign: 'center', minWidth: 48 }}>
@@ -384,6 +400,12 @@ export default function Inventory() {
                   </div>
                   <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                     <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(row.total)}</span>
+                  </div>
+                  <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}
+                    title="Forecast: PY units in the seasonally-equivalent next 90 days, scaled by this SKU's own YoY growth rate (this year's trailing 90D vs PY's same window)">
+                    <span style={{ fontSize: 14, fontWeight: 700, fontFamily: 'var(--mono)', color: daysLeftColor(row.days_of_inventory) }}>
+                      {fmtDaysLeft(row.days_of_inventory)}
+                    </span>
                   </div>
                   <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center', gap: 10 }}>
                     {AGE_BUCKETS.map(b => (
