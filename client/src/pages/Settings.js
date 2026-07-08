@@ -7,6 +7,15 @@ const today = () => new Date().toISOString().split('T')[0];
 
 const CURRENCIES = ['GBP', 'USD', 'EUR'];
 const SYMBOL = { GBP: '£', USD: '$', EUR: '€' };
+// Common business timezones, not the full ~400 IANA list - covers the major commerce hubs.
+const TIMEZONES = [
+  'UTC', 'Europe/London', 'Europe/Dublin', 'Europe/Madrid', 'Europe/Paris', 'Europe/Berlin',
+  'Europe/Rome', 'Europe/Amsterdam', 'Europe/Warsaw', 'Europe/Athens', 'Europe/Moscow',
+  'America/New_York', 'America/Chicago', 'America/Denver', 'America/Los_Angeles',
+  'America/Toronto', 'America/Sao_Paulo', 'America/Mexico_City',
+  'Asia/Dubai', 'Asia/Kolkata', 'Asia/Shanghai', 'Asia/Hong_Kong', 'Asia/Singapore',
+  'Asia/Tokyo', 'Asia/Seoul', 'Australia/Sydney', 'Pacific/Auckland',
+];
 const COGS_FIELDS = [
   { key: 'cogs_standard',  label: 'Standard COGS',       placeholder: 'Manufacturing / unit cost' },
   { key: 'cogs_freight',   label: 'Freight',              placeholder: 'Shipping / logistics per unit' },
@@ -372,6 +381,62 @@ function CompanyInfoSettings({ config, onRefresh }) {
 }
 
 // ── Reporting subtab ───────────────────────────────────────────────────────
+function TimezoneSettings({ config, onRefresh }) {
+  const [timezone, setTimezone] = useState(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (config?.timezone && timezone === null) setTimezone(config.timezone);
+  }, [config, timezone]);
+
+  const handleSave = async () => {
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const resp = await fetch('/api/settings/config', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ timezone }),
+      });
+      const data = await resp.json();
+      if (data.ok) { setSaved(true); onRefresh?.(); }
+      else setError(data.error || 'Save failed');
+    } catch (e) { setError(e.message); }
+    setSaving(false);
+  };
+
+  const dirty = timezone !== null && timezone !== config?.timezone;
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Reporting Timezone</h2>
+      <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
+        All orders and refunds are dated against this timezone — it decides which calendar day
+        and month an order or refund falls into throughout the dashboard, not just the display.
+      </p>
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 200 }}>
+            <label style={labelStyle}>Timezone</label>
+            <select value={timezone || ''} onChange={e => { setTimezone(e.target.value); setSaved(false); }}
+              style={{ ...inputStyle, cursor: 'pointer', maxWidth: 320, marginTop: 4 }}>
+              {TIMEZONES.map(tz => <option key={tz} value={tz}>{tz.replace(/_/g, ' ')}</option>)}
+            </select>
+          </div>
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+            {saved && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ Saved</span>}
+            {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
+            <button onClick={handleSave} disabled={saving || !dirty}
+              style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid ' + (dirty ? 'var(--accent)' : 'var(--border)'), background: dirty ? 'var(--accent)' : 'transparent', color: dirty ? '#fff' : 'var(--muted)', cursor: dirty ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
+              {saving ? 'Saving…' : 'Save'}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function ReportingSettings() {
   const { data: config, refetch } = useApi('/api/settings/config');
   const [currency, setCurrency] = useState(null);
@@ -434,6 +499,7 @@ function ReportingSettings() {
         </div>
       </div>
 
+      <TimezoneSettings config={config} onRefresh={refetch} />
       <CompanyInfoSettings config={config} onRefresh={refetch} />
     </div>
   );
