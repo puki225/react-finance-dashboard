@@ -2860,11 +2860,18 @@ app.get('/api/inventory/sell-through', async (req, res) => {
       sales_by_month AS (
         SELECT month, SUM(qty)::int AS units_sold FROM monthly_sales GROUP BY month
       ),
-      inventory_by_month AS (
-        SELECT snapshot_date AS month, SUM(total_quantity)::int AS units_on_hand
+      latest_snapshot_per_month AS (
+        SELECT date_trunc('month', snapshot_date)::date AS month, MAX(snapshot_date) AS latest_date
         FROM amazon_inventory_snapshots
         WHERE $1::text IS NULL OR sku = $1
-        GROUP BY snapshot_date
+        GROUP BY 1
+      ),
+      inventory_by_month AS (
+        SELECT l.month, SUM(s.total_quantity)::int AS units_on_hand
+        FROM latest_snapshot_per_month l
+        JOIN amazon_inventory_snapshots s ON s.snapshot_date = l.latest_date
+        WHERE $1::text IS NULL OR s.sku = $1
+        GROUP BY l.month
       )
       SELECT
         i.month AS snapshot_date,
