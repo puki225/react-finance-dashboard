@@ -981,6 +981,8 @@ app.get('/api/pnl', async (req, res) => {
           ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
         SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
           ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
+        SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_digital_services_refunded,
         BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
       FROM amazon_order_line_refunds olr
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
@@ -1111,6 +1113,7 @@ app.get('/api/pnl', async (req, res) => {
       refundFeesByPeriod[key] = {
         commission_refunded: parseFloat(r.fee_commission_refunded || 0),
         refund_admin_fee: parseFloat(r.fee_refund_admin || 0),
+        digital_services_refunded: parseFloat(r.fee_digital_services_refunded || 0),
       };
     }
     const returnsCogsByPeriod = {};
@@ -1189,7 +1192,7 @@ app.get('/api/pnl', async (req, res) => {
         returned: fx(returnsCogsByPeriod[periodKey] || 0),
       };
       cogs.total = cogs.standard + cogs.freight + cogs.demurrage + cogs.quality + cogs.other + cogs.returned;
-      const refundFees = refundFeesByPeriod[periodKey] || { commission_refunded: 0, refund_admin_fee: 0 };
+      const refundFees = refundFeesByPeriod[periodKey] || { commission_refunded: 0, refund_admin_fee: 0, digital_services_refunded: 0 };
       const lineFees = {
         commission: -fx(r?.fee_commission || 0),
         // Amazon reverses (credits back) its commission on a refund, but keeps ~20% of that
@@ -1200,7 +1203,9 @@ app.get('/api/pnl', async (req, res) => {
         fba_fulfillment: -fx(r?.fee_fba_fulfillment || 0),
         fixed_closing: -fx(r?.fee_fixed_closing || 0),
         variable_closing: -fx(r?.fee_variable_closing || 0),
-        digital_services: -fx(r?.fee_digital_services || 0),
+        // Digital Services Fee also gets partially reversed on refund - netted directly into
+        // this line (not a separate row like commission_refunded) since it's a small fee.
+        digital_services: -fx(r?.fee_digital_services || 0) + fx(refundFees.digital_services_refunded || 0),
         giftwrap: -fx(r?.fee_giftwrap || 0),
         shipping_chargeback: -fx(r?.fee_shipping_chargeback || 0),
         refund_admin_fee: -fx(refundFees.refund_admin_fee || 0), // negative: a charge
@@ -1413,7 +1418,9 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
             ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
           SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
-            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
+          SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+            ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_digital_services_refunded
         FROM amazon_order_line_refunds olr
         LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
         WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
@@ -1732,7 +1739,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           COALESCE(cogs.total_cogs_sold, 0)::numeric(12,2) AS total_cogs,
           -- Net commission reversal (credit) and refund admin fee (charge) into fees, both
           -- refund-date-scoped from refunds_by_sku — same reasoning as total_refunded above.
-          (COALESCE(cogs.total_fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric(12,2) AS total_fees,
+          (COALESCE(cogs.total_fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0) - COALESCE(r.fee_digital_services_refunded, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
           COALESCE(ppc.ppc_units, 0)::int AS ppc_units
@@ -1799,7 +1806,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           -- Net commission reversal (credit) and refund admin fee (charge) into fees, both
           -- refund-date-scoped from refunds_by_sku (Amazon-only) — same reasoning as
           -- total_refunded above.
-          (COALESCE(cogs.total_fees, 0) - COALESCE(ra.fee_commission_refunded, 0) + COALESCE(ra.fee_refund_admin, 0))::numeric(12,2) AS total_fees,
+          (COALESCE(cogs.total_fees, 0) - COALESCE(ra.fee_commission_refunded, 0) + COALESCE(ra.fee_refund_admin, 0) - COALESCE(ra.fee_digital_services_refunded, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
           COALESCE(ppc.ppc_units, 0)::int AS ppc_units
@@ -1945,11 +1952,13 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
           ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_commission_refunded,
         COALESCE(SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
           ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END), 0)::numeric AS fee_refund_admin,
+        COALESCE(SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_digital_services_refunded,
         BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
       FROM amazon_order_line_refunds olr
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
       WHERE olr.sku = $1 AND olr.refund_date::date BETWEEN $2 AND $3
-    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0, has_estimated: false }] };
+    `, [sku, dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0, fee_digital_services_refunded: 0, has_estimated: false }] };
 
     // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
     const ppcResult = includeAmazon ? await pool.query(`
@@ -2114,7 +2123,8 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     // total cost); refundAdminFee is Amazon's ~20% cut of that reversal (adds to total cost).
     const commissionRefunded = fx(refundFeesResult.rows[0]?.fee_commission_refunded || 0);
     const refundAdminFee     = fx(refundFeesResult.rows[0]?.fee_refund_admin || 0);
-    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee;
+    const digitalServicesRefunded = fx(refundFeesResult.rows[0]?.fee_digital_services_refunded || 0);
+    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee - digitalServicesRefunded;
     // True when any Amazon fee for this SKU/period is still an estimate (from /estimate-fees,
     // pending settlement via the Finances API) rather than a confirmed final amount.
     const hasEstimatedFees = amz.has_estimated_fees === true || refundFeesResult.rows[0]?.has_estimated === true;
@@ -2150,7 +2160,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
         fba_fulfillment:     f(-feeFBA),
         fixed_closing:       f(-feeFixedClosing),
         variable_closing:    f(-feeVariableClosing),
-        digital_services:    f(-feeDigitalServices),
+        digital_services:    f(-feeDigitalServices + digitalServicesRefunded),
         giftwrap:            f(-feeGiftwrap),
         shipping_chargeback: f(-feeShipping),
         refund_admin_fee:    f(-refundAdminFee),
