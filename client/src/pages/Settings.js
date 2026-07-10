@@ -306,10 +306,10 @@ const COMPANY_FIELDS = [
   { key: 'client_name',     label: 'Company Name',      placeholder: 'e.g. Gritty Blenders Ltd', textarea: false },
   { key: 'company_address', label: 'Address',            placeholder: 'Registered business address', textarea: true },
   { key: 'company_id',      label: 'Company ID / NIF',   placeholder: 'Company registration number / NIF', textarea: false },
-  { key: 'vat_number',      label: 'VAT Number',         placeholder: 'e.g. GB123456789', textarea: false },
+  { key: 'vat_number',      label: 'VAT Number',         placeholder: 'e.g. GB123456789 (leave blank if not VAT registered)', textarea: false },
 ];
 
-function CompanyInfoSettings({ config, onRefresh }) {
+function CompanyInfoSettings({ config, vatRates, onRefresh }) {
   const [form, setForm] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -322,6 +322,7 @@ function CompanyInfoSettings({ config, onRefresh }) {
         company_address: config.company_address || '',
         company_id: config.company_id || '',
         vat_number: config.vat_number || '',
+        company_country: config.company_country || '',
       });
     }
   }, [config, form]);
@@ -330,7 +331,8 @@ function CompanyInfoSettings({ config, onRefresh }) {
 
   const handleChange = (key, val) => { setForm(f => ({ ...f, [key]: val })); setSaved(false); };
 
-  const dirty = COMPANY_FIELDS.some(f => form[f.key] !== (config?.[f.key] || ''));
+  const allKeys = [...COMPANY_FIELDS.map(f => f.key), 'company_country'];
+  const dirty = allKeys.some(k => form[k] !== (config?.[k] || ''));
 
   const handleSave = async () => {
     setSaving(true); setError(null); setSaved(false);
@@ -346,11 +348,15 @@ function CompanyInfoSettings({ config, onRefresh }) {
     setSaving(false);
   };
 
+  const vatRegistered = !!(form.vat_number && form.vat_number.trim());
+
   return (
     <div>
       <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Company Information</h2>
       <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
-        Used to identify your business on generated reports and exports.
+        Used to identify your business on generated reports and exports. VAT-registration status
+        (below) is derived from whether a VAT number is on file — if set, all reporting switches
+        to VAT-exclusive figures using the rates configured in VAT Rates.
       </p>
 
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '24px' }}>
@@ -366,7 +372,25 @@ function CompanyInfoSettings({ config, onRefresh }) {
               )}
             </div>
           ))}
+          <div>
+            <label style={labelStyle}>Company Country</label>
+            <select value={form.company_country} onChange={e => handleChange('company_country', e.target.value)} style={{ ...inputStyle, cursor: 'pointer' }}>
+              <option value="">Select…</option>
+              {(vatRates || []).map(r => <option key={r.country_code} value={r.country_code}>{r.country_name}</option>)}
+            </select>
+          </div>
         </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, padding: '10px 14px', borderRadius: 8, background: vatRegistered ? 'var(--accent)15' : 'var(--bg3)', border: '1px solid ' + (vatRegistered ? 'var(--accent)' : 'var(--border)') }}>
+          <span style={{ width: 8, height: 8, borderRadius: '50%', background: vatRegistered ? 'var(--green)' : 'var(--muted)', flexShrink: 0 }} />
+          <span style={{ fontSize: 13, fontFamily: 'var(--mono)' }}>
+            VAT registered: <strong>{vatRegistered ? 'Yes' : 'No'}</strong>
+            {vatRegistered
+              ? ' — sales and fees are reported VAT-exclusive across the dashboard.'
+              : ' — no VAT number on file, so figures are reported VAT-inclusive (full income).'}
+          </span>
+        </div>
+
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 12 }}>
           {saved && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ Saved</span>}
           {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
@@ -374,6 +398,99 @@ function CompanyInfoSettings({ config, onRefresh }) {
             style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid ' + (dirty ? 'var(--accent)' : 'var(--border)'), background: dirty ? 'var(--accent)' : 'transparent', color: dirty ? '#fff' : 'var(--muted)', cursor: dirty ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
             {saving ? 'Saving…' : 'Save'}
           </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── VAT Rates ────────────────────────────────────────────────────────────
+function VatRatesSettings({ vatRates, onRefresh }) {
+  const [editing, setEditing] = useState({}); // { [code]: rateString }
+  const [newRow, setNewRow] = useState({ code: '', name: '', rate: '' });
+  const [savingCode, setSavingCode] = useState(null);
+  const [error, setError] = useState(null);
+
+  const rows = vatRates || [];
+
+  const saveRate = async (code, name, rate) => {
+    const r = parseFloat(rate);
+    if (!code || !name || isNaN(r)) { setError('Country code, name, and a numeric rate are required'); return; }
+    setSavingCode(code); setError(null);
+    try {
+      const resp = await fetch(`/api/settings/vat-rates/${encodeURIComponent(code)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ country_name: name, standard_rate: r }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setEditing(e => { const n = { ...e }; delete n[code]; return n; });
+        setNewRow({ code: '', name: '', rate: '' });
+        onRefresh?.();
+      } else setError(data.error || 'Save failed');
+    } catch (e) { setError(e.message); }
+    setSavingCode(null);
+  };
+
+  const removeRate = async (code) => {
+    setSavingCode(code); setError(null);
+    try {
+      const resp = await fetch(`/api/settings/vat-rates/${encodeURIComponent(code)}`, { method: 'DELETE' });
+      const data = await resp.json();
+      if (data.ok) onRefresh?.();
+      else setError(data.error || 'Delete failed');
+    } catch (e) { setError(e.message); }
+    setSavingCode(null);
+  };
+
+  return (
+    <div>
+      <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>VAT Rates</h2>
+      <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, marginBottom: 16 }}>
+        Standard VAT rate per country. For VAT-registered accounts, sales are stripped of VAT
+        using the rate for the order's destination country; fees are stripped using your own
+        Company Country's rate (Amazon/Shopify charge VAT on fees based on where you're
+        established, not the customer).
+      </p>
+
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '16px 24px' }}>
+        {error && <div style={{ fontSize: 12, color: 'var(--red)', marginBottom: 10 }}>{error}</div>}
+        <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 110px 80px', gap: 8, fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', padding: '6px 0', borderBottom: '1px solid var(--border)' }}>
+          <span>Code</span><span>Country</span><span>Rate %</span><span></span>
+        </div>
+        {rows.map(r => {
+          const isEditing = editing[r.country_code] !== undefined;
+          return (
+            <div key={r.country_code} style={{ display: 'grid', gridTemplateColumns: '70px 1fr 110px 80px', gap: 8, alignItems: 'center', padding: '8px 0', borderBottom: '1px solid var(--border)' }}>
+              <span style={{ fontFamily: 'var(--mono)', fontSize: 13 }}>{r.country_code}</span>
+              <span style={{ fontSize: 13 }}>{r.country_name}</span>
+              {isEditing ? (
+                <input type="number" step="0.01" min="0" max="100" value={editing[r.country_code]}
+                  onChange={e => setEditing(ed => ({ ...ed, [r.country_code]: e.target.value }))}
+                  style={{ ...inputStyle, padding: '5px 8px' }} />
+              ) : (
+                <span style={{ fontFamily: 'var(--mono)', fontSize: 13 }}>{parseFloat(r.standard_rate).toFixed(2)}%</span>
+              )}
+              <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                {isEditing ? (
+                  <button onClick={() => saveRate(r.country_code, r.country_name, editing[r.country_code])} disabled={savingCode === r.country_code}
+                    style={{ fontSize: 11, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer' }}>✓</button>
+                ) : (
+                  <button onClick={() => setEditing(ed => ({ ...ed, [r.country_code]: String(r.standard_rate) }))}
+                    style={{ fontSize: 11, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--muted)', cursor: 'pointer' }}>Edit</button>
+                )}
+                <button onClick={() => removeRate(r.country_code)} disabled={savingCode === r.country_code}
+                  style={{ fontSize: 11, padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border)', background: 'transparent', color: 'var(--red)', cursor: 'pointer' }}>×</button>
+              </div>
+            </div>
+          );
+        })}
+        <div style={{ display: 'grid', gridTemplateColumns: '70px 1fr 110px 80px', gap: 8, alignItems: 'center', padding: '10px 0 4px' }}>
+          <input type="text" maxLength={2} placeholder="GB" value={newRow.code} onChange={e => setNewRow(n => ({ ...n, code: e.target.value.toUpperCase() }))} style={{ ...inputStyle, padding: '5px 8px', textTransform: 'uppercase' }} />
+          <input type="text" placeholder="Country name" value={newRow.name} onChange={e => setNewRow(n => ({ ...n, name: e.target.value }))} style={{ ...inputStyle, padding: '5px 8px' }} />
+          <input type="number" step="0.01" min="0" max="100" placeholder="20.00" value={newRow.rate} onChange={e => setNewRow(n => ({ ...n, rate: e.target.value }))} style={{ ...inputStyle, padding: '5px 8px' }} />
+          <button onClick={() => saveRate(newRow.code, newRow.name, newRow.rate)} disabled={savingCode === newRow.code}
+            style={{ fontSize: 11, padding: '5px 10px', borderRadius: 6, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: 'pointer' }}>Add</button>
         </div>
       </div>
     </div>
@@ -439,6 +556,7 @@ function TimezoneSettings({ config, onRefresh }) {
 
 function ReportingSettings() {
   const { data: config, refetch } = useApi('/api/settings/config');
+  const { data: vatRates, refetch: refetchVatRates } = useApi('/api/settings/vat-rates');
   const [currency, setCurrency] = useState(null);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -500,7 +618,8 @@ function ReportingSettings() {
       </div>
 
       <TimezoneSettings config={config} onRefresh={refetch} />
-      <CompanyInfoSettings config={config} onRefresh={refetch} />
+      <CompanyInfoSettings config={config} vatRates={vatRates} onRefresh={refetch} />
+      <VatRatesSettings vatRates={vatRates} onRefresh={refetchVatRates} />
     </div>
   );
 }

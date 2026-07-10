@@ -41,6 +41,121 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, '../client/build')));
 
+// ─── VAT-EXCLUSIVE REPORTING: SCHEMA MIGRATION ──────────────────────────
+// vat_rates holds one standard rate per country, editable via Settings, used to strip VAT
+// out of revenue/fees for VAT-registered accounts (see getVatContext() below). Runs on every
+// boot - CREATE/ALTER ...IF NOT EXISTS make it a no-op once applied, same self-migrating
+// pattern amazon-spapi-proxy's /setup-db uses, just triggered automatically instead of by
+// a manual call since this app has no dedicated setup endpoint.
+(async function migrateVatSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS vat_rates (
+        country_code CHAR(2) PRIMARY KEY,
+        country_name TEXT NOT NULL,
+        standard_rate NUMERIC(5,2) NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      ALTER TABLE client_config ADD COLUMN IF NOT EXISTS company_country CHAR(2);
+    `);
+    await pool.query(`
+      INSERT INTO vat_rates (country_code, country_name, standard_rate) VALUES
+        ('GB','United Kingdom',20.00),('IE','Ireland',23.00),('DE','Germany',19.00),
+        ('FR','France',20.00),('IT','Italy',22.00),('ES','Spain',21.00),('NL','Netherlands',21.00),
+        ('BE','Belgium',21.00),('PL','Poland',23.00),('SE','Sweden',25.00),('AT','Austria',20.00),
+        ('PT','Portugal',23.00),('DK','Denmark',25.00),('FI','Finland',25.50),('LU','Luxembourg',17.00),
+        ('GR','Greece',24.00),('CZ','Czechia',21.00),('RO','Romania',19.00),('HU','Hungary',27.00),
+        ('BG','Bulgaria',20.00),('HR','Croatia',25.00),('SK','Slovakia',20.00),('SI','Slovenia',22.00),
+        ('EE','Estonia',22.00),('LV','Latvia',21.00),('LT','Lithuania',21.00),('MT','Malta',18.00),
+        ('CY','Cyprus',19.00),('NO','Norway',25.00),('CH','Switzerland',8.10),
+        ('US','United States',0.00),('CA','Canada',0.00),('AU','Australia',10.00)
+      ON CONFLICT (country_code) DO NOTHING;
+    `);
+    // vat_divisor(country) / vat_divisor_seller(): centralize the "should we strip VAT, and by
+    // how much" logic in SQL so every query (raw row-math or the v_sku_revenue/v_refunds_by_date
+    // views below) can just divide an inclusive amount by the function call instead of each
+    // reimplementing the CASE/JOIN. Both read client_config live (STABLE, not IMMUTABLE - safe
+    // to call per-row since Postgres only needs to guarantee same result within one statement),
+    // so a Settings change takes effect on the next query with no cache to invalidate.
+    // - vat_divisor(country): sales-side. Amazon/Shopify charge VAT on a SALE based on the
+    //   destination (ship-to) country, so this is per-order-line.
+    // - vat_divisor_seller(): fee-side. Amazon/Shopify charge VAT on a seller's FEES based on
+    //   the seller's own country of establishment, not the customer's - a single rate account-wide,
+    //   not per order. See client_config.company_country.
+    // Both return 1 (no-op) when not VAT-registered, or the rate's unknown.
+    await pool.query(`
+      CREATE OR REPLACE FUNCTION vat_divisor(p_country_code TEXT) RETURNS NUMERIC AS $FN$
+        SELECT CASE
+          WHEN NOT EXISTS (SELECT 1 FROM client_config WHERE vat_number IS NOT NULL AND TRIM(vat_number) <> '') THEN 1
+          ELSE 1 + COALESCE((SELECT standard_rate FROM vat_rates WHERE country_code = p_country_code), 0) / 100.0
+        END;
+      $FN$ LANGUAGE sql STABLE;
+
+      CREATE OR REPLACE FUNCTION vat_divisor_seller() RETURNS NUMERIC AS $FN$
+        SELECT CASE
+          WHEN NOT EXISTS (SELECT 1 FROM client_config WHERE vat_number IS NOT NULL AND TRIM(vat_number) <> '') THEN 1
+          ELSE 1 + COALESCE((SELECT vr.standard_rate FROM client_config cc JOIN vat_rates vr ON vr.country_code = cc.company_country), 0) / 100.0
+        END;
+      $FN$ LANGUAGE sql STABLE;
+    `);
+    // Add shipping_country to the two shared revenue/refund views so every endpoint reading from
+    // them (not just the ones with raw row-math) can apply vat_divisor(shipping_country) too.
+    // Formulas otherwise unchanged from the original views - only the country column and its
+    // upstream join are new.
+    await pool.query(`
+      CREATE OR REPLACE VIEW v_sku_revenue AS
+      SELECT 'shopify'::text AS channel, sol.shopify_order_id::text AS order_id, sol.sku, sol.order_date,
+        sol.product_title, sol.quantity, so.shipping_country,
+        (sol.unit_price * sol.quantity::numeric)::numeric(12,2) AS gross_sales,
+        (sol.discount_per_unit * sol.quantity::numeric)::numeric(12,2) AS sku_discount,
+        COALESCE(sol.amount_refunded, 0)::numeric(12,2) AS refund_amount,
+        ((sol.unit_price * sol.quantity::numeric) - (sol.discount_per_unit * sol.quantity::numeric))::numeric(12,2) AS net_revenue,
+        false AS is_estimated_price
+      FROM shopify_order_lines sol
+      LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+      UNION ALL
+      SELECT 'amazon'::text AS channel, l.amazon_order_id AS order_id, l.sku, o.order_date,
+        l.title AS product_title, l.quantity, o.shipping_country,
+        (COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric)::numeric(12,2) AS gross_sales,
+        COALESCE(l.promotion_discount, 0::numeric)::numeric(12,2) AS sku_discount,
+        COALESCE(l.amount_refunded, 0::numeric)::numeric(12,2) AS refund_amount,
+        ((COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric) - COALESCE(l.promotion_discount, 0::numeric))::numeric(12,2) AS net_revenue,
+        (l.unit_price = 0::numeric AND lp.last_price IS NOT NULL) AS is_estimated_price
+      FROM amazon_order_lines l
+      JOIN amazon_orders o ON o.amazon_order_id = l.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = l.sku
+      WHERE o.status <> 'Canceled'::text;
+
+      CREATE OR REPLACE VIEW v_refunds_by_date AS
+      SELECT 'amazon'::text AS channel, r.amazon_order_id AS order_id, r.sku, r.refund_date,
+        r.amount_refunded::numeric AS amount_refunded, r.quantity_refunded, o.shipping_country
+      FROM amazon_order_line_refunds r
+      LEFT JOIN amazon_orders o ON o.amazon_order_id = r.amazon_order_id
+      WHERE r.refund_date IS NOT NULL
+      UNION ALL
+      SELECT 'shopify'::text AS channel, t.shopify_order_id::text AS order_id, NULL::text AS sku,
+        t.transaction_date AS refund_date, t.amount::numeric AS amount_refunded, NULL::integer AS quantity_refunded,
+        so.shipping_country
+      FROM shopify_transactions t
+      LEFT JOIN shopify_orders so ON so.shopify_order_id = t.shopify_order_id
+      WHERE t.kind::text = 'refund'::text AND t.status::text = 'success'::text AND t.transaction_date IS NOT NULL;
+    `);
+  } catch (e) {
+    console.error('[db] VAT schema migration failed:', e.message);
+  }
+})();
+
+// Fetch the account's VAT-registration status once per request - true iff a VAT number is set
+// on file (per product decision: presence of a VAT number IS the registration signal, there's
+// no separate manually-set toggle). Endpoints use this to decide whether to apply vat_divisor()
+// at all; company_country feeds vat_divisor_seller() (see migration above) for fee-side stripping.
+async function getVatContext() {
+  try {
+    const r = await pool.query("SELECT (vat_number IS NOT NULL AND TRIM(vat_number) <> '') AS registered, company_country FROM client_config LIMIT 1");
+    return { registered: !!r.rows[0]?.registered, companyCountry: r.rows[0]?.company_country || null };
+  } catch { return { registered: false, companyCountry: null }; }
+}
+
 // ─── FX HELPERS ──────────────────────────────────────
 
 // Get reporting currency from client_config (cached per request)
@@ -106,9 +221,10 @@ app.get('/api/summary', async (req, res) => {
   const dateTo = to || new Date().toISOString().split('T')[0];
   // Amazon orders enriched with v_sku_revenue rollup (gross/net incl. list-price fallback for Pending orders)
   const amazonEnriched = `
-    SELECT o.amazon_order_id, o.order_date, o.status, o.promotion_discount,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
+    SELECT o.amazon_order_id, o.order_date, o.status,
+      o.promotion_discount / vat_divisor(o.shipping_country) AS promotion_discount,
+      COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue
     FROM amazon_orders o
     LEFT JOIN (
       SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
@@ -117,9 +233,10 @@ app.get('/api/summary', async (req, res) => {
   `;
   // Shopify orders enriched with v_sku_revenue rollup (list price gross, post-discount net)
   const shopifyEnriched = `
-    SELECT o.shopify_order_id, o.order_date, o.financial_status, o.discount_amount,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
+    SELECT o.shopify_order_id, o.order_date, o.financial_status,
+      o.discount_amount / vat_divisor(o.shipping_country) AS discount_amount,
+      COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue
     FROM shopify_orders o
     LEFT JOIN (
       SELECT order_id, SUM(gross_sales)::numeric(12,2) AS gross_sales, SUM(net_revenue)::numeric(12,2) AS net_revenue
@@ -163,12 +280,12 @@ app.get('/api/summary', async (req, res) => {
     let refundResult;
     if (channel === 'amazon' || channel === 'shopify') {
       refundResult = await pool.query(`
-        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
+        SELECT COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
         FROM v_refunds_by_date WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
       `, [channel, dateFrom, dateTo]);
     } else {
       refundResult = await pool.query(`
-        SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
+        SELECT COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded, COUNT(*)::int AS refund_count
         FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2
       `, [dateFrom, dateTo]);
     }
@@ -178,9 +295,9 @@ app.get('/api/summary', async (req, res) => {
     const cogsResult = await pool.query(`
       SELECT
         COALESCE(SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)), 0)::numeric AS total_cogs,
-        COALESCE(SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) +
+        COALESCE(SUM((COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) +
           COALESCE(aol.fee_fixed_closing,0) + COALESCE(aol.fee_variable_closing,0) +
-          COALESCE(aol.fee_digital_services,0)), 0)::numeric AS total_fees
+          COALESCE(aol.fee_digital_services,0)) / vat_divisor_seller()), 0)::numeric AS total_fees
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
@@ -260,8 +377,8 @@ app.get('/api/revenue-trend', async (req, res) => {
   const trunc = period === 'week' ? 'week' : period === 'month' ? 'month' : period === 'year' ? 'year' : 'day';
   const amazonEnriched = `
     SELECT o.order_date,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue,
+      COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue,
       o.status
     FROM amazon_orders o
     LEFT JOIN (
@@ -276,7 +393,7 @@ app.get('/api/revenue-trend', async (req, res) => {
         SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
           SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
         FROM (
-          SELECT order_date, gross_revenue, net_revenue FROM shopify_orders
+          SELECT order_date, gross_revenue / vat_divisor(shipping_country) AS gross_revenue, net_revenue / vat_divisor(shipping_country) AS net_revenue FROM shopify_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
           UNION ALL
           SELECT order_date, gross_revenue, net_revenue FROM (${amazonEnriched}) a
@@ -292,8 +409,8 @@ app.get('/api/revenue-trend', async (req, res) => {
       `, [trunc, dateFrom, dateTo]);
     } else {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
-          SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
+        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue / vat_divisor(shipping_country))::numeric AS gross_revenue,
+          SUM(net_revenue / vat_divisor(shipping_country))::numeric AS net_revenue, COUNT(*)::int AS orders
         FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
         GROUP BY 1 ORDER BY 1
       `, [trunc, dateFrom, dateTo]);
@@ -304,13 +421,13 @@ app.get('/api/revenue-trend', async (req, res) => {
     let refundResult;
     if (channel === 'amazon' || channel === 'shopify') {
       refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
         FROM v_refunds_by_date WHERE channel = $2 AND refund_date::date BETWEEN $3 AND $4
         GROUP BY 1
       `, [trunc, channel, dateFrom, dateTo]);
     } else {
       refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
         FROM v_refunds_by_date WHERE refund_date::date BETWEEN $2 AND $3
         GROUP BY 1
       `, [trunc, dateFrom, dateTo]);
@@ -358,10 +475,12 @@ app.get('/api/gateway-split', async (req, res) => {
     } else if (channel === 'all') {
       result = await pool.query(`
         SELECT gateway, SUM(orders)::int AS orders, SUM(revenue)::numeric AS revenue FROM (
-          SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
+          SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS revenue
           FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
           GROUP BY gateway
           UNION ALL
+          -- amazon_payouts is a settlement batch, not order-level - no shipping_country to key
+          -- VAT stripping off, so left unstripped here (known gap - see PR notes).
           SELECT 'Amazon Payout' AS gateway, COUNT(*)::int AS orders, SUM(net_transfer)::numeric AS revenue
           FROM amazon_payouts
           WHERE fund_transfer_date::date BETWEEN $1 AND $2
@@ -370,7 +489,7 @@ app.get('/api/gateway-split', async (req, res) => {
       `, [dateFrom, dateTo]);
     } else {
       result = await pool.query(`
-        SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue)::numeric AS revenue
+        SELECT gateway, COUNT(*)::int AS orders, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS revenue
         FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
         GROUP BY gateway ORDER BY revenue DESC
       `, [dateFrom, dateTo]);
@@ -402,7 +521,7 @@ app.get('/api/gateway-trend', async (req, res) => {
     } else if (channel === 'all') {
       result = await pool.query(`
         SELECT period, gateway, SUM(revenue)::numeric AS revenue FROM (
-          SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue AS revenue FROM shopify_orders
+          SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue / vat_divisor(shipping_country) AS revenue FROM shopify_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
           UNION ALL
           SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, net_transfer AS revenue
@@ -412,7 +531,7 @@ app.get('/api/gateway-trend', async (req, res) => {
       `, [trunc, dateFrom, dateTo]);
     } else {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, SUM(net_revenue)::numeric AS revenue
+        SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS revenue
         FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
         GROUP BY 1, 2 ORDER BY 1, 2
       `, [trunc, dateFrom, dateTo]);
@@ -427,13 +546,18 @@ app.get('/api/gateway-trend', async (req, res) => {
 });
 
 // Shopify fees
+// NOTE on VAT: shopify_payouts is a payout-batch summary with no order-level join, so there's
+// no shipping_country to key sales-side VAT stripping off (same structural gap as amazon_payouts
+// in /api/gateway-split above). fees IS fee-side and gets vat_divisor_seller() since that's a
+// single account-wide rate with no country dependency; gross_sales/refunds/net_payouts are left
+// unstripped pending a schema change to link payouts back to orders.
 app.get('/api/fees', async (req, res) => {
   const { from, to } = req.query;
   const dateFrom = from || '2020-01-01';
   const dateTo = to || new Date().toISOString().split('T')[0];
   try {
     const result = await pool.query(`
-      SELECT SUM(fees)::numeric AS total_fees, SUM(charges_gross)::numeric AS gross_sales,
+      SELECT SUM(fees / vat_divisor_seller())::numeric AS total_fees, SUM(charges_gross)::numeric AS gross_sales,
         SUM(refunds)::numeric AS total_refunds, SUM(amount)::numeric AS net_payouts
       FROM shopify_payouts WHERE payout_date BETWEEN $1 AND $2 AND status = 'paid'
     `, [dateFrom, dateTo]);
@@ -456,8 +580,8 @@ app.get('/api/recent-orders', async (req, res) => {
     if (channel === 'amazon') {
       result = await pool.query(`
         SELECT o.amazon_order_id AS shopify_order_number, o.order_date, o.status AS financial_status,
-          o.fulfillment_channel AS fulfillment_status, COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-          COALESCE(r.net_revenue, o.net_revenue) AS net_revenue, COALESCE(o.total_refunded, 0) AS total_refunded,
+          o.fulfillment_channel AS fulfillment_status, COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue,
+          COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue, COALESCE(o.total_refunded, 0) / vat_divisor(o.shipping_country) AS total_refunded,
           'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel, COALESCE(r.is_estimated_price, false) AS is_estimated_price
         FROM amazon_orders o
         LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
@@ -467,12 +591,13 @@ app.get('/api/recent-orders', async (req, res) => {
       result = await pool.query(`
         SELECT * FROM (
           SELECT shopify_order_number::text AS shopify_order_number, order_date, financial_status, fulfillment_status,
-            gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
+            gross_revenue / vat_divisor(shipping_country) AS gross_revenue, net_revenue / vat_divisor(shipping_country) AS net_revenue,
+            total_refunded / vat_divisor(shipping_country) AS total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
           FROM shopify_orders WHERE financial_status != 'voided'
           UNION ALL
           SELECT o.amazon_order_id, o.order_date, o.status AS financial_status, o.fulfillment_channel AS fulfillment_status,
-            COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue, COALESCE(r.net_revenue, o.net_revenue) AS net_revenue,
-            COALESCE(o.total_refunded, 0) AS total_refunded, 'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel,
+            COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue, COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue,
+            COALESCE(o.total_refunded, 0) / vat_divisor(o.shipping_country) AS total_refunded, 'Amazon' AS gateway, o.shipping_country, 'amazon' AS channel,
             COALESCE(r.is_estimated_price, false) AS is_estimated_price
           FROM amazon_orders o
           LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
@@ -482,7 +607,8 @@ app.get('/api/recent-orders', async (req, res) => {
     } else {
       result = await pool.query(`
         SELECT shopify_order_number, order_date, financial_status, fulfillment_status,
-          gross_revenue, net_revenue, total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
+          gross_revenue / vat_divisor(shipping_country) AS gross_revenue, net_revenue / vat_divisor(shipping_country) AS net_revenue,
+          total_refunded / vat_divisor(shipping_country) AS total_refunded, gateway, shipping_country, 'shopify' AS channel, false AS is_estimated_price
         FROM shopify_orders WHERE financial_status != 'voided' ORDER BY order_date DESC LIMIT $1
       `, [limit || 10]);
     }
@@ -511,14 +637,14 @@ app.get('/api/refunds-by-date', async (req, res) => {
     let result;
     if (channel === 'amazon' || channel === 'shopify') {
       result = await pool.query(`
-        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
+        SELECT channel, order_id, sku, refund_date, amount_refunded / vat_divisor(shipping_country) AS amount_refunded, quantity_refunded
         FROM v_refunds_by_date
         WHERE channel = $1 AND refund_date::date BETWEEN $2 AND $3
         ORDER BY refund_date DESC LIMIT $4
       `, [channel, dateFrom, dateTo, limit || 20]);
     } else {
       result = await pool.query(`
-        SELECT channel, order_id, sku, refund_date, amount_refunded, quantity_refunded
+        SELECT channel, order_id, sku, refund_date, amount_refunded / vat_divisor(shipping_country) AS amount_refunded, quantity_refunded
         FROM v_refunds_by_date
         WHERE refund_date::date BETWEEN $1 AND $2
         ORDER BY refund_date DESC LIMIT $3
@@ -543,8 +669,8 @@ app.get('/api/sales-by-country', async (req, res) => {
         SELECT
           COALESCE(so.shipping_country, 'Unknown') AS country,
           SUM(sol.quantity)::int AS units_sold,
-          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric(12,2) AS net_revenue,
+          SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM(((sol.unit_price - sol.discount_per_unit) * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS net_revenue,
           0::numeric AS total_fees,
           SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM shopify_order_lines sol
@@ -571,9 +697,9 @@ app.get('/api/sales-by-country', async (req, res) => {
         SELECT
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           SUM(aol.quantity)::int AS units_sold,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
-          SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS total_fees,
+          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+          SUM((COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller())::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -606,8 +732,8 @@ app.get('/api/sales-by-country', async (req, res) => {
         FROM (
           SELECT COALESCE(so.shipping_country, 'Unknown') AS country,
             sol.quantity AS units_sold,
-            (sol.unit_price * sol.quantity) AS gross_sales,
-            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) AS net_revenue,
+            (sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country) AS gross_sales,
+            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) / vat_divisor(so.shipping_country) AS net_revenue,
             0 AS total_fees,
             (sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM shopify_order_lines sol
@@ -630,9 +756,9 @@ app.get('/api/sales-by-country', async (req, res) => {
           UNION ALL
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country,
             aol.quantity AS units_sold,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) AS net_revenue,
-            (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) AS total_fees,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country) AS gross_sales,
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
+            (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller() AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -661,12 +787,12 @@ app.get('/api/sales-by-country', async (req, res) => {
     let refundResult;
     if (channel === 'amazon' || channel === 'shopify') {
       refundResult = await pool.query(channel === 'amazon' ? `
-        SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded)::numeric AS total_refunded
+        SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded / vat_divisor(ao.shipping_country))::numeric AS total_refunded
         FROM v_refunds_by_date v JOIN amazon_orders ao ON ao.amazon_order_id = v.order_id
         WHERE v.channel = 'amazon' AND v.refund_date::date BETWEEN $1 AND $2
         GROUP BY 1
       ` : `
-        SELECT COALESCE(so.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded)::numeric AS total_refunded
+        SELECT COALESCE(so.shipping_country, 'Unknown') AS country, SUM(v.amount_refunded / vat_divisor(so.shipping_country))::numeric AS total_refunded
         FROM v_refunds_by_date v JOIN shopify_orders so ON so.shopify_order_id::text = v.order_id
         WHERE v.channel = 'shopify' AND v.refund_date::date BETWEEN $1 AND $2
         GROUP BY 1
@@ -674,11 +800,11 @@ app.get('/api/sales-by-country', async (req, res) => {
     } else {
       refundResult = await pool.query(`
         SELECT country, SUM(total_refunded)::numeric AS total_refunded FROM (
-          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, v.amount_refunded AS total_refunded
+          SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, v.amount_refunded / vat_divisor(ao.shipping_country) AS total_refunded
           FROM v_refunds_by_date v JOIN amazon_orders ao ON ao.amazon_order_id = v.order_id
           WHERE v.channel = 'amazon' AND v.refund_date::date BETWEEN $1 AND $2
           UNION ALL
-          SELECT COALESCE(so.shipping_country, 'Unknown') AS country, v.amount_refunded AS total_refunded
+          SELECT COALESCE(so.shipping_country, 'Unknown') AS country, v.amount_refunded / vat_divisor(so.shipping_country) AS total_refunded
           FROM v_refunds_by_date v JOIN shopify_orders so ON so.shopify_order_id::text = v.order_id
           WHERE v.channel = 'shopify' AND v.refund_date::date BETWEEN $1 AND $2
         ) combined GROUP BY country
@@ -732,8 +858,8 @@ app.get('/api/order-breakdown', async (req, res) => {
   `;
   const amazonEnriched = `
     SELECT o.amazon_order_id, o.order_date, o.status, o.is_business_order, o.fulfillment_channel,
-      COALESCE(r.gross_sales, o.gross_revenue) AS gross_revenue,
-      COALESCE(r.net_revenue, o.net_revenue) AS net_revenue
+      COALESCE(r.gross_sales, o.gross_revenue) / vat_divisor(o.shipping_country) AS gross_revenue,
+      COALESCE(r.net_revenue, o.net_revenue) / vat_divisor(o.shipping_country) AS net_revenue
     FROM amazon_orders o
     LEFT JOIN (${amazonRevenueRollup}) r ON r.order_id = o.amazon_order_id
   `;
@@ -773,7 +899,7 @@ app.get('/api/order-breakdown', async (req, res) => {
 
     if (channel !== 'amazon') {
       const r = await pool.query(`
-        SELECT COUNT(*)::int AS orders, SUM(gross_revenue)::numeric AS gross_revenue, SUM(net_revenue)::numeric AS net_revenue
+        SELECT COUNT(*)::int AS orders, SUM(gross_revenue / vat_divisor(shipping_country))::numeric AS gross_revenue, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS net_revenue
         FROM shopify_orders WHERE order_date::date BETWEEN $1 AND $2 AND financial_status != 'voided'
       `, [dateFrom, dateTo]);
       const row = r.rows[0];
@@ -830,8 +956,8 @@ app.get('/api/pnl', async (req, res) => {
     const amazonLinesBranch = `
       SELECT
         aol.quantity AS units_sold,
-        (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-        COALESCE(aol.promotion_discount,0)::numeric(12,2) AS total_discounts,
+        ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+        (COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts,
         (aol.quantity * COALESCE(
           NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
           CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
@@ -842,13 +968,13 @@ app.get('/api/pnl', async (req, res) => {
         (aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric(12,2) AS cogs_demurrage,
         (aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric(12,2) AS cogs_quality,
         (aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric(12,2) AS cogs_other,
-        COALESCE(aol.fee_commission,0)::numeric(12,2) AS fee_commission,
-        COALESCE(aol.fee_fba_fulfillment,0)::numeric(12,2) AS fee_fba_fulfillment,
-        COALESCE(aol.fee_fixed_closing,0)::numeric(12,2) AS fee_fixed_closing,
-        COALESCE(aol.fee_variable_closing,0)::numeric(12,2) AS fee_variable_closing,
-        COALESCE(aol.fee_digital_services,0)::numeric(12,2) AS fee_digital_services,
-        COALESCE(aol.fee_giftwrap_chargeback,0)::numeric(12,2) AS fee_giftwrap,
-        COALESCE(aol.fee_shipping_chargeback,0)::numeric(12,2) AS fee_shipping_chargeback,
+        (COALESCE(aol.fee_commission,0) / vat_divisor_seller())::numeric(12,2) AS fee_commission,
+        (COALESCE(aol.fee_fba_fulfillment,0) / vat_divisor_seller())::numeric(12,2) AS fee_fba_fulfillment,
+        (COALESCE(aol.fee_fixed_closing,0) / vat_divisor_seller())::numeric(12,2) AS fee_fixed_closing,
+        (COALESCE(aol.fee_variable_closing,0) / vat_divisor_seller())::numeric(12,2) AS fee_variable_closing,
+        (COALESCE(aol.fee_digital_services,0) / vat_divisor_seller())::numeric(12,2) AS fee_digital_services,
+        (COALESCE(aol.fee_giftwrap_chargeback,0) / vat_divisor_seller())::numeric(12,2) AS fee_giftwrap,
+        (COALESCE(aol.fee_shipping_chargeback,0) / vat_divisor_seller())::numeric(12,2) AS fee_shipping_chargeback,
         DATE_TRUNC('${trunc}', ao.order_date)::date AS period
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -883,8 +1009,8 @@ app.get('/api/pnl', async (req, res) => {
     const shopifyLinesBranch = `
       SELECT
         sol.quantity AS units_sold,
-        (sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-        (sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts,
+        ((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS gross_sales,
+        ((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS total_discounts,
         (sol.quantity * COALESCE(
           NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
           CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
@@ -960,7 +1086,7 @@ app.get('/api/pnl', async (req, res) => {
     // Refunds, attributed by refund_date (independent of the order population above)
     const refundsChannelFilter = channel === 'amazon' ? `AND channel = 'amazon'` : channel === 'shopify' ? `AND channel = 'shopify'` : '';
     const refundsResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded)::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
+      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded / vat_divisor(shipping_country))::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
       FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2 ${refundsChannelFilter}
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -977,12 +1103,12 @@ app.get('/api/pnl', async (req, res) => {
     // (~20% of the reversed commission — Amazon's admin cut on refunds).
     const refundFeesResult = includeAmazon ? await pool.query(`
       SELECT DATE_TRUNC('${trunc}', olr.refund_date)::date AS period,
-        SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
-          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
-        SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
-          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
-        SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
-          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_digital_services_refunded,
+        SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller())::numeric AS fee_commission_refunded,
+        SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END) / vat_divisor_seller())::numeric AS fee_refund_admin,
+        SUM((CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller())::numeric AS fee_digital_services_refunded,
         BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
       FROM amazon_order_line_refunds olr
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
@@ -1047,7 +1173,7 @@ app.get('/api/pnl', async (req, res) => {
 
     // PPC spend, Amazon Ads only
     const ppcResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost)::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
+      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost / vat_divisor_seller())::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
       FROM amazon_ppc_product_performance WHERE report_date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1064,8 +1190,12 @@ app.get('/api/pnl', async (req, res) => {
     // excluded here — Amazon's Financial Events only carry a settlement (posted_date) for this
     // fee, not the inventory-age snapshot date it was actually calculated from, so it's sourced
     // instead from amazon_ltsf_charges (keyed by snapshot_date) below and merged back in.
+    // Adjustment-sourced rows (inventory reimbursements/disposals compensation) are NOT run
+    // through vat_divisor_seller() - they're Amazon paying the seller back, not a fee charge, so
+    // VAT-on-fees doesn't apply to them the way it does to Commission/Storage/Subscription/etc.
     const accountFeesResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type, SUM(amount)::numeric AS amount
+      SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type,
+        SUM(CASE WHEN event_source = 'Adjustment' THEN amount ELSE amount / vat_divisor_seller() END)::numeric AS amount
       FROM amazon_account_fees WHERE posted_date::date BETWEEN $1 AND $2
         AND fee_type NOT IN ('ReserveDebit', 'ReserveCredit', 'FBALongTermStorageFee')
       GROUP BY 1, 2, 3
@@ -1078,7 +1208,7 @@ app.get('/api/pnl', async (req, res) => {
     // report into amazon_ltsf_charges. Merged into accountFeesByPeriod/feeTypeTotals below so it
     // flows through the same itemized-fees display and total logic as every other fee type.
     const ltsfResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', snapshot_date)::date AS period, SUM(amount)::numeric AS amount
+      SELECT DATE_TRUNC('${trunc}', snapshot_date)::date AS period, SUM(amount / vat_divisor_seller())::numeric AS amount
       FROM amazon_ltsf_charges WHERE snapshot_date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1090,7 +1220,7 @@ app.get('/api/pnl', async (req, res) => {
     // grouped independently of the Amazon order-line filters above (fulfillment/order_type/
     // search/brand don't apply to a Shopify-side order).
     const mcfResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', fee_date)::date AS period, SUM(fee_amount)::numeric AS mcf_fees
+      SELECT DATE_TRUNC('${trunc}', fee_date)::date AS period, SUM(fee_amount / vat_divisor_seller())::numeric AS mcf_fees
       FROM amazon_mcf_fees WHERE fee_date::date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1414,15 +1544,16 @@ app.get('/api/product-breakdown', async (req, res) => {
     // monetary amount has posted but Amazon's commission-reversal fee event hasn't settled yet.
     const refundCte = `
       refunds_by_sku AS (
-        SELECT olr.sku, SUM(olr.amount_refunded)::numeric AS total_refunded, SUM(COALESCE(olr.quantity_refunded,0))::int AS units_refunded,
-          SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
-            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_commission_refunded,
-          SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
-            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)::numeric AS fee_refund_admin,
-          SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
-            ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)::numeric AS fee_digital_services_refunded
+        SELECT olr.sku, SUM(olr.amount_refunded / vat_divisor(ao.shipping_country))::numeric AS total_refunded, SUM(COALESCE(olr.quantity_refunded,0))::int AS units_refunded,
+          SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller())::numeric AS fee_commission_refunded,
+          SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+            ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END) / vat_divisor_seller())::numeric AS fee_refund_admin,
+          SUM((CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+            ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller())::numeric AS fee_digital_services_refunded
         FROM amazon_order_line_refunds olr
         LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+        LEFT JOIN amazon_orders ao ON ao.amazon_order_id = olr.amazon_order_id
         WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
         GROUP BY olr.sku
       ),
@@ -1430,11 +1561,12 @@ app.get('/api/product-breakdown', async (req, res) => {
         SELECT
           sol.sku,
           SUM(
-            st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+            (st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor(so.shipping_country)
           )::numeric AS total_refunded,
           COUNT(DISTINCT st.shopify_transaction_id)::int AS units_refunded
         FROM shopify_transactions st
         JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
+        LEFT JOIN shopify_orders so ON so.shopify_order_id = st.shopify_order_id
         JOIN (
           SELECT shopify_order_id, SUM(line_gross) AS order_gross
           FROM shopify_order_lines
@@ -1479,10 +1611,10 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(aol.quantity)::int AS cogs_units,
           -- Includes giftwrap + shipping chargebacks (previously missing here, present in the
           -- P&L panel) — that gap alone could make the table's margin look better than reality.
-          SUM(COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
+          SUM((COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
               COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
               COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0) +
-              COALESCE(aol.fee_shipping_chargeback, 0))::numeric AS total_fees
+              COALESCE(aol.fee_shipping_chargeback, 0)) / vat_divisor_seller())::numeric AS total_fees
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
@@ -1529,7 +1661,7 @@ app.get('/api/product-breakdown', async (req, res) => {
           SUM(sol.quantity)::int AS cogs_units,
           -- MCF fees allocated proportionally by line revenue share within each order
           COALESCE(SUM(
-            mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+            (mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor_seller()
           ), 0)::numeric AS total_fees
         FROM shopify_order_lines sol
         LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
@@ -1648,7 +1780,7 @@ app.get('/api/product-breakdown', async (req, res) => {
       -- can't fan out the surrounding SUMs (see MCF fee bug for why this matters).
       ppc_by_sku AS (
         SELECT sku,
-          SUM(cost)::numeric AS ppc_cost,
+          SUM(cost / vat_divisor_seller())::numeric AS ppc_cost,
           SUM(sales_14d)::numeric AS ppc_sales,
           SUM(clicks)::int AS ppc_clicks,
           SUM(impressions)::int AS ppc_impressions,
@@ -1672,10 +1804,11 @@ app.get('/api/product-breakdown', async (req, res) => {
             sol.sku,
             MAX(sol.product_title) AS product_title,
             SUM(sol.quantity)::int AS units_sold,
-            SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-            (SUM(sol.unit_price * sol.quantity) - SUM(sol.discount_per_unit * sol.quantity))::numeric(12,2) AS net_before_refunds,
-            SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts
+            SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS gross_sales,
+            (SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country)) - SUM((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country)))::numeric(12,2) AS net_before_refunds,
+            SUM((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS total_discounts
           FROM shopify_order_lines sol
+          LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
           WHERE sol.order_date::date BETWEEN $1 AND $2
           GROUP BY sol.sku
         )
@@ -1713,9 +1846,9 @@ app.get('/api/product-breakdown', async (req, res) => {
             MAX(aol.title) AS product_title,
             MAX(aol.asin) AS asin,
             SUM(aol.quantity)::int AS units_sold,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_before_refunds,
-            SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts
+            SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_before_refunds,
+            SUM(COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
           LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -1762,10 +1895,11 @@ app.get('/api/product-breakdown', async (req, res) => {
             MAX(sol.product_title) AS product_title,
             NULL AS asin,
             SUM(sol.quantity)::int AS units_sold,
-            SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-            SUM(sol.unit_price * sol.quantity - sol.discount_per_unit * sol.quantity)::numeric(12,2) AS net_revenue,
-            SUM(sol.discount_per_unit * sol.quantity)::numeric(12,2) AS total_discounts
+            SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS gross_sales,
+            SUM(((sol.unit_price * sol.quantity) - (sol.discount_per_unit * sol.quantity)) / vat_divisor(so.shipping_country))::numeric(12,2) AS net_revenue,
+            SUM((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS total_discounts
           FROM shopify_order_lines sol
+          LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
           WHERE sol.order_date::date BETWEEN $1 AND $2
           GROUP BY sol.sku
         ),
@@ -1775,9 +1909,9 @@ app.get('/api/product-breakdown', async (req, res) => {
             MAX(aol.title) AS product_title,
             MAX(aol.asin) AS asin,
             SUM(aol.quantity)::int AS units_sold,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-            SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
-            SUM(COALESCE(aol.promotion_discount,0))::numeric(12,2) AS total_discounts
+            SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+            SUM(COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
           LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -1894,15 +2028,15 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
   try {
     const amzResult = includeAmazon ? await pool.query(`
       SELECT
-        SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric AS gross_sales,
-        SUM(COALESCE(aol.promotion_discount, 0))::numeric AS discounts,
-        SUM(COALESCE(aol.fee_commission, 0))::numeric AS fee_commission,
-        SUM(COALESCE(aol.fee_fba_fulfillment, 0))::numeric AS fee_fba_fulfillment,
-        SUM(COALESCE(aol.fee_fixed_closing, 0))::numeric AS fee_fixed_closing,
-        SUM(COALESCE(aol.fee_variable_closing, 0))::numeric AS fee_variable_closing,
-        SUM(COALESCE(aol.fee_digital_services, 0))::numeric AS fee_digital_services,
-        SUM(COALESCE(aol.fee_giftwrap_chargeback, 0))::numeric AS fee_giftwrap,
-        SUM(COALESCE(aol.fee_shipping_chargeback, 0))::numeric AS fee_shipping_chargeback,
+        SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric AS gross_sales,
+        SUM(COALESCE(aol.promotion_discount, 0) / vat_divisor(ao.shipping_country))::numeric AS discounts,
+        SUM(COALESCE(aol.fee_commission, 0) / vat_divisor_seller())::numeric AS fee_commission,
+        SUM(COALESCE(aol.fee_fba_fulfillment, 0) / vat_divisor_seller())::numeric AS fee_fba_fulfillment,
+        SUM(COALESCE(aol.fee_fixed_closing, 0) / vat_divisor_seller())::numeric AS fee_fixed_closing,
+        SUM(COALESCE(aol.fee_variable_closing, 0) / vat_divisor_seller())::numeric AS fee_variable_closing,
+        SUM(COALESCE(aol.fee_digital_services, 0) / vat_divisor_seller())::numeric AS fee_digital_services,
+        SUM(COALESCE(aol.fee_giftwrap_chargeback, 0) / vat_divisor_seller())::numeric AS fee_giftwrap,
+        SUM(COALESCE(aol.fee_shipping_chargeback, 0) / vat_divisor_seller())::numeric AS fee_shipping_chargeback,
         SUM(aol.quantity)::int AS units_sold,
         BOOL_OR(aol.is_estimated_fee) AS has_estimated_fees
       FROM amazon_order_lines aol
@@ -1913,12 +2047,12 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
 
     const shpResult = includeShopify ? await pool.query(`
       SELECT
-        SUM(sol.unit_price * sol.quantity)::numeric AS gross_sales,
-        SUM(sol.discount_per_unit * sol.quantity)::numeric AS discounts,
+        SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS gross_sales,
+        SUM((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS discounts,
         SUM(sol.quantity)::int AS units_sold,
         -- MCF fees proportionally allocated by revenue share
         COALESCE(SUM(
-          mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))
+          (mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor_seller()
         ), 0)::numeric AS mcf_fees
       FROM shopify_order_lines sol
       JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
@@ -1931,7 +2065,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     `, [sku, dateFrom, dateTo]) : { rows: [{}] };
 
     const refundResult = await pool.query(`
-      SELECT COALESCE(SUM(amount_refunded), 0)::numeric AS total_refunded
+      SELECT COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
       FROM v_refunds_by_date
       WHERE sku = $1 AND refund_date::date BETWEEN $2 AND $3
         ${!includeAmazon ? `AND channel != 'amazon'` : ''}
@@ -1948,12 +2082,12 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
     // yet — flagged via has_estimated so it feeds the same EST badge as is_estimated_fee.
     const refundFeesResult = includeAmazon ? await pool.query(`
       SELECT
-        COALESCE(SUM(CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
-          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_commission_refunded,
-        COALESCE(SUM(CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
-          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END), 0)::numeric AS fee_refund_admin,
-        COALESCE(SUM(CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
-          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END), 0)::numeric AS fee_digital_services_refunded,
+        COALESCE(SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller()), 0)::numeric AS fee_commission_refunded,
+        COALESCE(SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END) / vat_divisor_seller()), 0)::numeric AS fee_refund_admin,
+        COALESCE(SUM((CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller()), 0)::numeric AS fee_digital_services_refunded,
         BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
       FROM amazon_order_line_refunds olr
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
@@ -1962,7 +2096,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
 
     // PPC spend/sales for this SKU — Amazon Ads only, single-table aggregate (no join fanout risk)
     const ppcResult = includeAmazon ? await pool.query(`
-      SELECT COALESCE(SUM(cost), 0)::numeric AS ppc_cost, COALESCE(SUM(sales_14d), 0)::numeric AS ppc_sales
+      SELECT COALESCE(SUM(cost / vat_divisor_seller()), 0)::numeric AS ppc_cost, COALESCE(SUM(sales_14d), 0)::numeric AS ppc_sales
       FROM amazon_ppc_product_performance
       WHERE sku = $1 AND report_date BETWEEN $2 AND $3
     `, [sku, dateFrom, dateTo]) : { rows: [{ ppc_cost: 0, ppc_sales: 0 }] };
@@ -2209,8 +2343,8 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           COALESCE(so.shipping_country, 'Unknown') AS country,
           'shopify' AS channel,
           SUM(sol.quantity)::int AS units_sold,
-          SUM(sol.unit_price * sol.quantity)::numeric(12,2) AS gross_sales,
-          SUM((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric(12,2) AS net_revenue,
+          SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM(((sol.unit_price - sol.discount_per_unit) * sol.quantity) / vat_divisor(so.shipping_country))::numeric(12,2) AS net_revenue,
           0::numeric AS total_fees,
           SUM(sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM shopify_order_lines sol
@@ -2238,9 +2372,9 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           'amazon' AS channel,
           SUM(aol.quantity)::int AS units_sold,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity)::numeric(12,2) AS gross_sales,
-          SUM(COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric(12,2) AS net_revenue,
-          SUM(COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0))::numeric(12,2) AS total_fees,
+          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+          SUM((COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller())::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -2272,8 +2406,8 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           SUM(total_cogs)::numeric(12,2) AS total_cogs
         FROM (
           SELECT COALESCE(so.shipping_country, 'Unknown') AS country, 'shopify' AS channel,
-            sol.quantity AS units_sold, (sol.unit_price * sol.quantity) AS gross_sales,
-            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) AS net_revenue,
+            sol.quantity AS units_sold, (sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country) AS gross_sales,
+            ((sol.unit_price - sol.discount_per_unit) * sol.quantity) / vat_divisor(so.shipping_country) AS net_revenue,
             0 AS total_fees,
             (sol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM shopify_order_lines sol
@@ -2296,9 +2430,9 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           UNION ALL
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
             aol.quantity AS units_sold,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) AS gross_sales,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0)) AS net_revenue,
-            (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) AS total_fees,
+            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country) AS gross_sales,
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
+            (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller() AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -2546,8 +2680,13 @@ app.post('/api/sync-fx', async (req, res) => {
 // Client config — get reporting currency + timezone + company details (for report headers/exports)
 app.get('/api/settings/config', async (req, res) => {
   try {
-    const result = await pool.query('SELECT reporting_currency, timezone, client_name, company_address, company_id, vat_number FROM client_config LIMIT 1');
-    res.json(result.rows[0] || { reporting_currency: 'GBP', timezone: 'UTC' });
+    const result = await pool.query('SELECT reporting_currency, timezone, client_name, company_address, company_id, vat_number, company_country FROM client_config LIMIT 1');
+    const row = result.rows[0] || { reporting_currency: 'GBP', timezone: 'UTC' };
+    // vat_registered is derived, not stored - presence of a VAT number IS the registration
+    // signal (see vat_divisor() in the migration above). Exposed here read-only so Settings can
+    // show status without a separate toggle that could drift out of sync with the VAT number.
+    row.vat_registered = !!(row.vat_number && row.vat_number.trim());
+    res.json(row);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
@@ -2556,7 +2695,7 @@ app.get('/api/settings/config', async (req, res) => {
 // as-is), so the currency selector, timezone selector, and company info form on the Settings
 // page can save independently.
 app.put('/api/settings/config', async (req, res) => {
-  const { reporting_currency, timezone, client_name, company_address, company_id, vat_number } = req.body;
+  const { reporting_currency, timezone, client_name, company_address, company_id, vat_number, company_country } = req.body;
   if (reporting_currency !== undefined && !['GBP', 'USD', 'EUR'].includes(reporting_currency)) {
     return res.status(400).json({ error: 'Invalid currency' });
   }
@@ -2564,6 +2703,9 @@ app.put('/api/settings/config', async (req, res) => {
   // this file - keep these in sync.
   if (timezone !== undefined && !/^[A-Za-z0-9_+\-]+(\/[A-Za-z0-9_+\-]+)*$/.test(timezone)) {
     return res.status(400).json({ error: 'Invalid timezone' });
+  }
+  if (company_country !== undefined && company_country !== null && company_country !== '' && !/^[A-Z]{2}$/.test(company_country)) {
+    return res.status(400).json({ error: 'company_country must be a 2-letter ISO code' });
   }
   try {
     const result = await pool.query(`
@@ -2574,10 +2716,49 @@ app.put('/api/settings/config', async (req, res) => {
         company_address = COALESCE($4, company_address),
         company_id = COALESCE($5, company_id),
         vat_number = COALESCE($6, vat_number),
+        company_country = COALESCE(NULLIF($7, ''), company_country),
         updated_at = NOW()
-      RETURNING reporting_currency, timezone, client_name, company_address, company_id, vat_number
-    `, [reporting_currency ?? null, timezone ?? null, client_name ?? null, company_address ?? null, company_id ?? null, vat_number ?? null]);
-    res.json({ ok: true, ...(result.rows[0] || {}) });
+      RETURNING reporting_currency, timezone, client_name, company_address, company_id, vat_number, company_country
+    `, [reporting_currency ?? null, timezone ?? null, client_name ?? null, company_address ?? null, company_id ?? null, vat_number ?? null, company_country ?? null]);
+    const row = result.rows[0] || {};
+    row.vat_registered = !!(row.vat_number && row.vat_number.trim());
+    res.json({ ok: true, ...row });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// VAT rates — list/add/update/remove per-country standard rates. Used by vat_divisor()/
+// vat_divisor_seller() (see migration above) to strip VAT from sales/fees for VAT-registered
+// accounts; editable here since rates do change and new countries come up as a business expands.
+app.get('/api/settings/vat-rates', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT country_code, country_name, standard_rate FROM vat_rates ORDER BY country_name');
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/settings/vat-rates/:code', async (req, res) => {
+  const code = String(req.params.code || '').toUpperCase();
+  const { country_name, standard_rate } = req.body;
+  if (!/^[A-Z]{2}$/.test(code)) return res.status(400).json({ error: 'country_code must be a 2-letter ISO code' });
+  const rate = parseFloat(standard_rate);
+  if (!country_name || isNaN(rate) || rate < 0 || rate > 100) {
+    return res.status(400).json({ error: 'country_name and a standard_rate between 0 and 100 are required' });
+  }
+  try {
+    await pool.query(`
+      INSERT INTO vat_rates (country_code, country_name, standard_rate, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (country_code) DO UPDATE SET country_name = EXCLUDED.country_name, standard_rate = EXCLUDED.standard_rate, updated_at = NOW()
+    `, [code, country_name, rate]);
+    res.json({ ok: true, country_code: code, country_name, standard_rate: rate });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+app.delete('/api/settings/vat-rates/:code', async (req, res) => {
+  const code = String(req.params.code || '').toUpperCase();
+  try {
+    await pool.query('DELETE FROM vat_rates WHERE country_code = $1', [code]);
+    res.json({ ok: true });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
