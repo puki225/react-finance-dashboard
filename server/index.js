@@ -102,30 +102,37 @@ app.use(express.static(path.join(__dirname, '../client/build')));
     // them (not just the ones with raw row-math) can apply vat_divisor(shipping_country) too.
     // Formulas otherwise unchanged from the original views - only the country column and its
     // upstream join are new.
+    // shipping_country must be appended as the LAST column in each SELECT list -
+    // CREATE OR REPLACE VIEW refuses to insert a new column in the middle of an existing
+    // view's column list (only appending at the end is allowed), and the two views are
+    // separate pool.query() calls so a mistake in one can't silently roll back the other.
     await pool.query(`
       CREATE OR REPLACE VIEW v_sku_revenue AS
       SELECT 'shopify'::text AS channel, sol.shopify_order_id::text AS order_id, sol.sku, sol.order_date,
-        sol.product_title, sol.quantity, so.shipping_country,
+        sol.product_title, sol.quantity,
         (sol.unit_price * sol.quantity::numeric)::numeric(12,2) AS gross_sales,
         (sol.discount_per_unit * sol.quantity::numeric)::numeric(12,2) AS sku_discount,
         COALESCE(sol.amount_refunded, 0)::numeric(12,2) AS refund_amount,
         ((sol.unit_price * sol.quantity::numeric) - (sol.discount_per_unit * sol.quantity::numeric))::numeric(12,2) AS net_revenue,
-        false AS is_estimated_price
+        false AS is_estimated_price,
+        so.shipping_country
       FROM shopify_order_lines sol
       LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
       UNION ALL
       SELECT 'amazon'::text AS channel, l.amazon_order_id AS order_id, l.sku, o.order_date,
-        l.title AS product_title, l.quantity, o.shipping_country,
+        l.title AS product_title, l.quantity,
         (COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric)::numeric(12,2) AS gross_sales,
         COALESCE(l.promotion_discount, 0::numeric)::numeric(12,2) AS sku_discount,
         COALESCE(l.amount_refunded, 0::numeric)::numeric(12,2) AS refund_amount,
         ((COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric) - COALESCE(l.promotion_discount, 0::numeric))::numeric(12,2) AS net_revenue,
-        (l.unit_price = 0::numeric AND lp.last_price IS NOT NULL) AS is_estimated_price
+        (l.unit_price = 0::numeric AND lp.last_price IS NOT NULL) AS is_estimated_price,
+        o.shipping_country
       FROM amazon_order_lines l
       JOIN amazon_orders o ON o.amazon_order_id = l.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = l.sku
       WHERE o.status <> 'Canceled'::text;
-
+    `);
+    await pool.query(`
       CREATE OR REPLACE VIEW v_refunds_by_date AS
       SELECT 'amazon'::text AS channel, r.amazon_order_id AS order_id, r.sku, r.refund_date,
         r.amount_refunded::numeric AS amount_refunded, r.quantity_refunded, o.shipping_country
