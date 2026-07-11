@@ -332,6 +332,71 @@ function CountryDropdown({ sku, from, to, channel, fmt, fmtPct, sym }) {
   );
 }
 
+function OrdersPanel({ sku, from, to, channel, fmt }) {
+  const { data, loading, error } = useApi('/api/product-breakdown/orders', { sku, from, to, channel });
+  const [tab, setTab] = useState('orders');
+
+  if (loading) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>;
+  if (error) return <div style={{ padding: '20px', color: 'var(--red)', fontSize: 12 }}>Error loading orders</div>;
+
+  const rows = tab === 'orders' ? (data?.orders || []) : (data?.refunds || []);
+
+  const GRID = '110px 90px minmax(140px,1fr) 100px 90px 60px 90px 90px 90px';
+  const GRID_MIN_WIDTH = 110 + 90 + 140 + 100 + 90 + 60 + 90 + 90 + 90;
+
+  const statusColor = (status) => {
+    const s = (status || '').toLowerCase();
+    if (s.includes('cancel') || s.includes('refund')) return 'var(--red)';
+    if (s.includes('ship') || s.includes('paid') || s.includes('fulfilled')) return 'var(--green)';
+    return 'var(--muted)';
+  };
+
+  return (
+    <div style={{ padding: '16px 20px' }}>
+      {/* Tabs */}
+      <div style={{ display: 'flex', gap: 4, marginBottom: 12 }}>
+        {[['orders', 'Orders', data?.orders?.length], ['refunds', 'Refunds', data?.refunds?.length]].map(([id, label, count]) => (
+          <button key={id} onClick={() => setTab(id)}
+            style={{ padding: '5px 16px', borderRadius: 6, fontSize: 12, fontWeight: 600, border: '1px solid ' + (tab === id ? 'var(--accent)' : 'var(--border)'), background: tab === id ? 'var(--accent)20' : 'transparent', color: tab === id ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s' }}>
+            {label}{count > 0 ? ` (${count})` : ''}
+          </button>
+        ))}
+      </div>
+
+      {!rows.length && <div style={{ padding: '12px 0', color: 'var(--muted)', fontSize: 12 }}>No {tab} in this period</div>}
+
+      {rows.length > 0 && (
+        <div style={{ overflowX: 'auto' }}>
+          <div style={{ minWidth: GRID_MIN_WIDTH }}>
+            <div style={{ display: 'grid', gridTemplateColumns: GRID, padding: '6px 0 4px', borderBottom: '1px solid var(--border)' }}>
+              {['Date', 'Marketplace', 'Order ID', 'Status', 'Fulfillment', 'Qty', 'Net', 'VAT/Tax', 'Total'].map((h, i) => (
+                <span key={i} style={{ fontSize: 10, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', padding: '0 8px' }}>{h}</span>
+              ))}
+            </div>
+            {rows.map((r, i) => (
+              <div key={i} style={{ display: 'grid', gridTemplateColumns: GRID, padding: '7px 0', borderBottom: '1px solid var(--border)', alignItems: 'center' }}>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--text)' }}>
+                  {r.order_date ? new Date(r.order_date).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'}
+                </div>
+                <div style={{ padding: '0 8px', display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <CountryFlag code={r.marketplace} />
+                </div>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--accent2)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{r.order_id}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, color: statusColor(r.status), fontWeight: 600 }}>{r.status || '—'}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, color: 'var(--muted)' }}>{r.fulfillment || '—'}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)' }}>{r.quantity ?? '—'}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)' }}>{fmt(r.net)}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmt(r.tax)}</div>
+                <div style={{ padding: '0 8px', fontSize: 12, fontFamily: 'var(--mono)', fontWeight: 700 }}>{fmt(r.total)}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ProductBreakdown() {
   const isMobile = useIsMobile();
   const [range, setRange] = useState(() => {
@@ -342,6 +407,7 @@ export default function ProductBreakdown() {
   const [dir, setDir] = useState(() => localStorage.getItem('gb_prod_dir') || 'desc');
   const [expandedSku, setExpandedSku] = useState(null);
   const [expandedPnl, setExpandedPnl] = useState(null);
+  const [expandedOrders, setExpandedOrders] = useState(null);
   const [hoverTip, setHoverTip] = useState(null);
   const [brandFilter, setBrandFilter] = useState('');
   const [parentFilter, setParentFilter] = useState('');
@@ -555,9 +621,14 @@ export default function ProductBreakdown() {
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', gap: 6, justifyContent: 'center' }}>
                   {channelBadge(row.channels)}
                   <button
-                    onClick={() => { setExpandedPnl(expandedPnl === row.sku ? null : row.sku); setExpandedSku(null); }}
+                    onClick={() => { setExpandedPnl(expandedPnl === row.sku ? null : row.sku); setExpandedSku(null); setExpandedOrders(null); }}
                     style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, border: '1px solid ' + (expandedPnl === row.sku ? 'var(--accent)' : 'var(--border)'), background: expandedPnl === row.sku ? 'var(--accent)20' : 'var(--bg3)', color: expandedPnl === row.sku ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', whiteSpace: 'nowrap' }}>
                     Breakdown
+                  </button>
+                  <button
+                    onClick={() => { setExpandedOrders(expandedOrders === row.sku ? null : row.sku); setExpandedSku(null); setExpandedPnl(null); }}
+                    style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, border: '1px solid ' + (expandedOrders === row.sku ? 'var(--accent)' : 'var(--border)'), background: expandedOrders === row.sku ? 'var(--accent)20' : 'var(--bg3)', color: expandedOrders === row.sku ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', whiteSpace: 'nowrap' }}>
+                    Orders
                   </button>
                 </div>
               </div>
@@ -574,6 +645,13 @@ export default function ProductBreakdown() {
               {expandedPnl === row.sku && (
                 <div style={{ borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
                   <PnlPanel sku={row.sku} from={range.from} to={range.to} sym={sym} channel={row.channels} />
+                </div>
+              )}
+
+              {/* Orders / Refunds panel */}
+              {expandedOrders === row.sku && (
+                <div style={{ borderTop: '1px solid var(--border)', background: '#ffffff03' }}>
+                  <OrdersPanel sku={row.sku} from={range.from} to={range.to} channel={channel} fmt={fmt} />
                 </div>
               )}
             </div>
