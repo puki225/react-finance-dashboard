@@ -2506,6 +2506,105 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Product Breakdown — individual orders and refunds for a single SKU, for the "Orders" panel.
+// Amazon lines carry their own item_tax as reported by SP-API, so that's used directly rather
+// than the vat_divisor() estimate the rest of the dashboard relies on; Amazon refunds and all
+// Shopify figures have no per-line tax stored, so those fall back to vat_divisor() same as
+// everywhere else. Total is the tax-inclusive amount actually charged/refunded; Net = Total - Tax.
+app.get('/api/product-breakdown/orders', async (req, res) => {
+  const { sku, from, to, channel = 'all', limit } = req.query;
+  if (!sku) return res.status(400).json({ error: 'sku required' });
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  const rowLimit = Math.min(parseInt(limit, 10) || 200, 500);
+  try {
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fx = (n) => ((parseFloat(n) || 0) * fxRate);
+
+    const includeAmazon = channel !== 'shopify';
+    const includeShopify = channel !== 'amazon';
+
+    const ordersParts = [];
+    const refundsParts = [];
+    if (includeAmazon) {
+      ordersParts.push(`
+        SELECT 'amazon' AS channel, ao.order_date, ao.shipping_country AS marketplace,
+          ao.amazon_order_id AS order_id, ao.status, ao.fulfillment_channel,
+          aol.quantity,
+          (aol.unit_price * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric AS total,
+          COALESCE(aol.item_tax,0)::numeric AS tax
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
+      `);
+      refundsParts.push(`
+        SELECT 'amazon' AS channel, olr.refund_date AS order_date, ao.shipping_country AS marketplace,
+          olr.amazon_order_id AS order_id, 'Refunded'::text AS status, ao.fulfillment_channel,
+          olr.quantity_refunded AS quantity,
+          olr.amount_refunded::numeric AS total,
+          (olr.amount_refunded * (1 - 1/vat_divisor(ao.shipping_country)))::numeric AS tax
+        FROM amazon_order_line_refunds olr
+        LEFT JOIN amazon_orders ao ON ao.amazon_order_id = olr.amazon_order_id
+        WHERE olr.sku = $1 AND olr.refund_date::date BETWEEN $2 AND $3
+      `);
+    }
+    if (includeShopify) {
+      ordersParts.push(`
+        SELECT 'shopify' AS channel, sol.order_date, so.shipping_country AS marketplace,
+          so.shopify_order_number::text AS order_id, so.financial_status AS status, so.fulfillment_status AS fulfillment_channel,
+          sol.quantity,
+          ((sol.unit_price - sol.discount_per_unit) * sol.quantity)::numeric AS total,
+          (((sol.unit_price - sol.discount_per_unit) * sol.quantity) * (1 - 1/vat_divisor(so.shipping_country)))::numeric AS tax
+        FROM shopify_order_lines sol
+        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        WHERE sol.sku = $1 AND sol.order_date::date BETWEEN $2 AND $3 AND so.financial_status != 'voided'
+      `);
+      refundsParts.push(`
+        SELECT 'shopify' AS channel, st.transaction_date AS order_date, so.shipping_country AS marketplace,
+          so.shopify_order_number::text AS order_id, 'Refunded'::text AS status, so.fulfillment_status AS fulfillment_channel,
+          NULL::int AS quantity,
+          (st.amount * (sol.line_gross / NULLIF(ot.order_gross,0)))::numeric AS total,
+          ((st.amount * (sol.line_gross / NULLIF(ot.order_gross,0))) * (1 - 1/vat_divisor(so.shipping_country)))::numeric AS tax
+        FROM shopify_transactions st
+        JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id AND sol.sku = $1
+        LEFT JOIN shopify_orders so ON so.shopify_order_id = st.shopify_order_id
+        JOIN (SELECT shopify_order_id, SUM(line_gross) AS order_gross FROM shopify_order_lines GROUP BY shopify_order_id) ot
+          ON ot.shopify_order_id = st.shopify_order_id
+        WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $2 AND $3
+      `);
+    }
+
+    const [ordersResult, refundsResult] = await Promise.all([
+      pool.query(`${ordersParts.join(' UNION ALL ')} ORDER BY order_date DESC LIMIT $4`, [sku, dateFrom, dateTo, rowLimit]),
+      pool.query(`${refundsParts.join(' UNION ALL ')} ORDER BY order_date DESC LIMIT $4`, [sku, dateFrom, dateTo, rowLimit]),
+    ]);
+
+    const mapRow = (r) => {
+      const total = fx(r.total);
+      const tax = fx(r.tax);
+      return {
+        channel: r.channel,
+        order_date: r.order_date,
+        marketplace: r.marketplace,
+        order_id: r.order_id,
+        status: r.status,
+        fulfillment: r.fulfillment_channel === 'AFN' ? 'FBA' : r.fulfillment_channel === 'MFN' ? 'FBM' : (r.fulfillment_channel || null),
+        quantity: r.quantity,
+        net: (total - tax).toFixed(2),
+        tax: tax.toFixed(2),
+        total: total.toFixed(2),
+      };
+    };
+
+    res.json({
+      currency_symbol: currencySymbol(reportingCurrency),
+      orders: ordersResult.rows.map(mapRow),
+      refunds: refundsResult.rows.map(mapRow),
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Settings — COGS: get all SKUs with current COGS and entry count
 app.get('/api/settings/cogs', async (req, res) => {
   try {
