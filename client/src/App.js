@@ -13,7 +13,8 @@ const NAV = [
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
-  { id: 'cashflow',  label: 'Cash Flow',            icon: '◒', active: true },
+  { id: 'cashrecon', label: 'Cash Reconciliation',  icon: '◒', active: true },
+  { id: 'cashflow',  label: 'Cash Flow',            icon: '◔', active: false },
   { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
 
@@ -149,7 +150,8 @@ export default function App() {
         {active === 'pnl'       && <PnL />}
         {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
         {active === 'inventory' && <Inventory />}
-        {active === 'cashflow'  && <CashFlow />}
+        {active === 'cashrecon' && <CashFlow />}
+        {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
         {active === 'settings'  && <Settings />}
       </div>
     </div>
