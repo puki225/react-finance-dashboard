@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useEffect, useMemo } from 'react';
+import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
 
@@ -179,6 +179,61 @@ function HistoryPopup({ sku, productName, onClose, onRefresh }) {
           })}
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── COGS CSV Download / Upload ───────────────────────────────────────────────
+function CogsCsvTools({ onRefresh }) {
+  const fileInputRef = useRef(null);
+  const [uploading, setUploading] = useState(false);
+  const [result, setResult] = useState(null);
+  const [error, setError] = useState(null);
+
+  const handleFile = async (e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setUploading(true); setError(null); setResult(null);
+    try {
+      const text = await file.text();
+      const resp = await fetch('/api/settings/cogs/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/csv' },
+        body: text,
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Import failed');
+      setResult(data);
+      onRefresh?.();
+    } catch (e) { setError(e.message); }
+    setUploading(false);
+  };
+
+  const btnStyle = { padding: '7px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600, background: 'var(--bg2)', border: '1px solid var(--border)', color: 'var(--text)', fontFamily: 'var(--font)', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 6 }}>
+      <div style={{ display: 'flex', gap: 8 }}>
+        <a href="/api/settings/cogs/export" style={btnStyle}>↓ Download CSV</a>
+        <button onClick={() => fileInputRef.current?.click()} disabled={uploading} style={{ ...btnStyle, cursor: uploading ? 'not-allowed' : 'pointer', opacity: uploading ? 0.6 : 1 }}>
+          {uploading ? 'Uploading…' : '↑ Upload CSV'}
+        </button>
+        <input ref={fileInputRef} type="file" accept=".csv,text/csv" onChange={handleFile} style={{ display: 'none' }} />
+      </div>
+      {error && <div style={{ fontSize: 12, color: 'var(--red)' }}>{error}</div>}
+      {result && (
+        <div style={{ fontSize: 12, color: 'var(--green)', textAlign: 'right' }}>
+          ✓ {result.inserted} added, {result.updated} updated{result.skipped ? `, ${result.skipped} skipped` : ''}
+          {result.errors?.length > 0 && <span style={{ color: 'var(--red)' }}> · {result.errors.length} error{result.errors.length > 1 ? 's' : ''}</span>}
+        </div>
+      )}
+      {result?.errors?.length > 0 && (
+        <div style={{ fontSize: 11, color: 'var(--red)', maxWidth: 340, textAlign: 'right' }}>
+          {result.errors.slice(0, 5).map((e, i) => <div key={i}>Row {e.row} ({e.sku}): {e.error}</div>)}
+          {result.errors.length > 5 && <div>…and {result.errors.length - 5} more</div>}
+        </div>
+      )}
     </div>
   );
 }
@@ -664,23 +719,27 @@ export default function Settings() {
               <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
                 Enter landed cost per unit for each SKU. Each entry has an effective date range — COGS for an order is matched to the range covering its order date.
                 Refunds are credited at the COGS of the original order date, not the refund date.
+                Need to enter a lot of costs at once? Download the CSV, fill it in Excel, and upload it back.
               </p>
             </div>
-            <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
-              {brandsData?.brands?.length > 0 && (
-                <select value={brandFilter} onChange={e => setBrandFilter(e.target.value)}
-                  style={{ background: 'var(--bg2)', border: '1px solid ' + (brandFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: brandFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
-                  <option value="">All Brands</option>
-                  {brandsData.brands.map(b => <option key={b} value={b}>{b}</option>)}
-                </select>
-              )}
-              {brandsData?.parent_asins?.length > 0 && (
-                <select value={parentFilter} onChange={e => setParentFilter(e.target.value)}
-                  style={{ background: 'var(--bg2)', border: '1px solid ' + (parentFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: parentFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
-                  <option value="">All Parent ASINs</option>
-                  {brandsData.parent_asins.map(p => <option key={p} value={p}>{p}</option>)}
-                </select>
-              )}
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 10, flexShrink: 0 }}>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {brandsData?.brands?.length > 0 && (
+                  <select value={brandFilter} onChange={e => setBrandFilter(e.target.value)}
+                    style={{ background: 'var(--bg2)', border: '1px solid ' + (brandFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: brandFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+                    <option value="">All Brands</option>
+                    {brandsData.brands.map(b => <option key={b} value={b}>{b}</option>)}
+                  </select>
+                )}
+                {brandsData?.parent_asins?.length > 0 && (
+                  <select value={parentFilter} onChange={e => setParentFilter(e.target.value)}
+                    style={{ background: 'var(--bg2)', border: '1px solid ' + (parentFilter ? 'var(--accent)' : 'var(--border)'), borderRadius: 8, padding: '7px 12px', color: parentFilter ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)', cursor: 'pointer', fontWeight: 600 }}>
+                    <option value="">All Parent ASINs</option>
+                    {brandsData.parent_asins.map(p => <option key={p} value={p}>{p}</option>)}
+                  </select>
+                )}
+              </div>
+              <CogsCsvTools onRefresh={refetch} />
             </div>
           </div>
           {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading SKUs…</div>}
