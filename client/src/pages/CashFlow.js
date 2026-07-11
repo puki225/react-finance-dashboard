@@ -25,6 +25,26 @@ function isMaterial(gap, gapPct) {
   return true;
 }
 
+// Refunds and Fees join to Amazon's own settlement event IDs exactly - a gap there is a real
+// data problem worth flagging. Sales only joins by date-range approximation (amazon_order_lines
+// has no financial_event_group_id column), so it naturally jitters period-to-period as orders
+// near a boundary shift between periods depending on shipment lag - that's expected noise, not
+// a signal, so it's deliberately excluded from the materiality check driving the page's flagging.
+function feeGap(o) {
+  const gap = parseFloat(o.ours.fees) - parseFloat(o.amazon.fees);
+  const base = Math.abs(parseFloat(o.amazon.fees));
+  return { gap, pct: base !== 0 ? (gap / base) * 100 : null };
+}
+function refundGap(o) {
+  const gap = parseFloat(o.ours.refunds) - parseFloat(o.amazon.refunds);
+  const base = Math.abs(parseFloat(o.amazon.refunds));
+  return { gap, pct: base !== 0 ? (gap / base) * 100 : null };
+}
+function isMaterialRow(o) {
+  const f = feeGap(o), r = refundGap(o);
+  return isMaterial(f.gap, f.pct) || isMaterial(r.gap, r.pct);
+}
+
 const cardStyle = {
   background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '18px 20px',
   flex: 1, minWidth: 220,
@@ -43,8 +63,10 @@ export default function CashFlow() {
   const rows = data?.rows || [];
   const summary = data?.summary || null;
 
-  const materialCount = useMemo(() => rows.filter(r => isMaterial(r.gap, r.gap_pct)).length, [rows]);
-  const summaryMaterial = summary ? isMaterial(summary.gap, summary.gap_pct) : false;
+  const materialCount = useMemo(() => rows.filter(isMaterialRow).length, [rows]);
+  const summaryFeeGap = summary ? feeGap(summary) : null;
+  const summaryRefundGap = summary ? refundGap(summary) : null;
+  const summaryMaterial = summary ? isMaterialRow(summary) : false;
 
   return (
     <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 20 }}>
@@ -72,49 +94,62 @@ export default function CashFlow() {
         </div>
       ) : (
         <>
-          {/* Summary cards - the cumulative gap across the range is more trustworthy than any
-              single period's Sales figure, which is only date-approximated (see note below). */}
+          {/* Fees and Refunds join to Amazon's exact settlement event IDs - these are the real
+              signal. Sales/Net are shown separately below as informational, since Sales is only
+              date-approximated and its natural noise would otherwise swamp a genuine fee problem. */}
           {summary && (
             <div style={{ display: 'flex', gap: 16, flexWrap: 'wrap' }}>
-              <div style={cardStyle}>
-                <div style={cardLabel}>Amazon Reported (Net)</div>
-                <div style={cardValue}>{fmtMoney(summary.amazon.net, sym)}</div>
-                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>{summary.periods} settlement periods</div>
-              </div>
-              <div style={cardStyle}>
-                <div style={cardLabel}>Ours (Net)</div>
-                <div style={cardValue}>{fmtMoney(summary.ours.net, sym)}</div>
-              </div>
-              <div style={{ ...cardStyle, borderColor: summaryMaterial ? 'var(--red)' : 'var(--green)' }}>
-                <div style={cardLabel}>Gap</div>
-                <div style={{ ...cardValue, color: summaryMaterial ? 'var(--red)' : 'var(--green)' }}>
-                  {fmtMoney(summary.gap, sym)} {summary.gap_pct !== null && <span style={{ fontSize: 14, fontWeight: 600 }}>({summary.gap_pct}%)</span>}
+              <div style={{ ...cardStyle, borderColor: isMaterial(summaryFeeGap.gap, summaryFeeGap.pct) ? 'var(--red)' : 'var(--green)' }}>
+                <div style={cardLabel}>Fees Gap (precise)</div>
+                <div style={{ ...cardValue, color: isMaterial(summaryFeeGap.gap, summaryFeeGap.pct) ? 'var(--red)' : 'var(--green)' }}>
+                  {fmtMoney(summaryFeeGap.gap, sym)} {summaryFeeGap.pct !== null && <span style={{ fontSize: 14, fontWeight: 600 }}>({summaryFeeGap.pct.toFixed(2)}%)</span>}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
-                  {summaryMaterial ? `No material gap over ${summary.periods} periods` : 'Within normal timing/rounding noise'}
+                  Amazon {fmtMoney(summary.amazon.fees, sym)} vs ours {fmtMoney(summary.ours.fees, sym)}, over {summary.periods} settled periods
+                </div>
+              </div>
+              <div style={{ ...cardStyle, borderColor: isMaterial(summaryRefundGap.gap, summaryRefundGap.pct) ? 'var(--red)' : 'var(--green)' }}>
+                <div style={cardLabel}>Refunds Gap (precise)</div>
+                <div style={{ ...cardValue, color: isMaterial(summaryRefundGap.gap, summaryRefundGap.pct) ? 'var(--red)' : 'var(--green)' }}>
+                  {fmtMoney(summaryRefundGap.gap, sym)} {summaryRefundGap.pct !== null && <span style={{ fontSize: 14, fontWeight: 600 }}>({summaryRefundGap.pct.toFixed(2)}%)</span>}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                  Amazon {fmtMoney(summary.amazon.refunds, sym)} vs ours {fmtMoney(summary.ours.refunds, sym)}
+                </div>
+              </div>
+              <div style={cardStyle}>
+                <div style={cardLabel}>Sales Gap (approximate)</div>
+                <div style={cardValue}>
+                  {fmtMoney((parseFloat(summary.ours.sales) - parseFloat(summary.amazon.sales)).toFixed(2), sym)}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+                  Date-approximated, not exact — see note below. Not used for flagging.
                 </div>
               </div>
             </div>
           )}
 
-          {materialCount > 0 && (
-            <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--red)15', border: '1px solid var(--red)', fontSize: 13, color: 'var(--red)' }}>
-              {materialCount} of {rows.length} periods show a gap over the £{GAP_ABS_THRESHOLD}/{GAP_PCT_THRESHOLD}% materiality threshold — see flagged rows below.
-            </div>
-          )}
+          <div style={{ padding: '10px 14px', borderRadius: 8, background: summaryMaterial ? 'var(--red)15' : 'var(--green)15', border: '1px solid ' + (summaryMaterial ? 'var(--red)' : 'var(--green)'), fontSize: 13, color: summaryMaterial ? 'var(--red)' : 'var(--green)' }}>
+            {summaryMaterial
+              ? `${materialCount} of ${rows.length} periods show a Fees or Refunds gap over the £${GAP_ABS_THRESHOLD}/${GAP_PCT_THRESHOLD}% materiality threshold — see flagged rows below.`
+              : `No material gap in Fees or Refunds across ${rows.length} settled periods — our data matches what Amazon actually paid out.`}
+          </div>
 
           <div style={{ overflowX: 'auto', border: '1px solid var(--border)', borderRadius: 12 }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 900 }}>
               <thead>
                 <tr style={{ background: 'var(--bg2)', borderBottom: '1px solid var(--border)' }}>
-                  {['Period', 'Paid', 'Amazon Sales', 'Amazon Refunds', 'Amazon Fees', 'Amazon Net', 'Our Sales', 'Our Refunds', 'Our Fees', 'Our Net', 'Gap'].map((h, i) => (
+                  {['Period', 'Paid', 'Amazon Sales', 'Amazon Refunds', 'Amazon Fees', 'Our Sales', 'Our Refunds', 'Our Fees', 'Fees Gap', 'Refunds Gap'].map((h, i) => (
                     <th key={h} style={{ padding: '10px 12px', textAlign: i === 0 || i === 1 ? 'left' : 'right', fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
                 {rows.map(r => {
-                  const material = isMaterial(r.gap, r.gap_pct);
+                  const fg = feeGap(r), rg = refundGap(r);
+                  const feeMaterial = isMaterial(fg.gap, fg.pct);
+                  const refundMaterial = isMaterial(rg.gap, rg.pct);
+                  const material = feeMaterial || refundMaterial;
                   return (
                     <tr key={r.financial_event_group_id} style={{ borderBottom: '1px solid var(--border)', background: material ? 'var(--red)08' : 'transparent' }}>
                       <td style={{ padding: '9px 12px', fontSize: 12 }}>
@@ -125,13 +160,14 @@ export default function CashFlow() {
                       <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.amazon.sales, sym)}</td>
                       <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.amazon.refunds, sym)}</td>
                       <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.amazon.fees, sym)}</td>
-                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 600 }}>{fmtMoney(r.amazon.net, sym)}</td>
-                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.ours.sales, sym)}</td>
+                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', color: 'var(--muted)' }}>{fmtMoney(r.ours.sales, sym)}</td>
                       <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.ours.refunds, sym)}</td>
                       <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(r.ours.fees, sym)}</td>
-                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 600 }}>{fmtMoney(r.ours.net, sym)}</td>
-                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 700, color: material ? 'var(--red)' : 'var(--green)' }}>
-                        {fmtMoney(r.gap, sym)}{r.gap_pct !== null && ` (${r.gap_pct}%)`}
+                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 700, color: feeMaterial ? 'var(--red)' : 'var(--green)' }}>
+                        {fmtMoney(fg.gap.toFixed(2), sym)}{fg.pct !== null && ` (${fg.pct.toFixed(1)}%)`}
+                      </td>
+                      <td style={{ padding: '9px 12px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 700, color: refundMaterial ? 'var(--red)' : 'var(--green)' }}>
+                        {fmtMoney(rg.gap.toFixed(2), sym)}{rg.pct !== null && ` (${rg.pct.toFixed(1)}%)`}
                       </td>
                     </tr>
                   );
