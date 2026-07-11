@@ -2556,92 +2556,6 @@ app.get('/api/settings/cogs', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Settings — COGS: get history for a single SKU
-app.get('/api/settings/cogs/:sku/history', async (req, res) => {
-  const { sku } = req.params;
-  try {
-    const result = await pool.query(`
-      SELECT id, sku, effective_from, effective_to,
-        cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other,
-        cogs_currency, unit_cogs, notes, created_at, updated_at
-      FROM cogs_entries WHERE sku = $1
-      ORDER BY effective_from DESC
-    `, [sku]);
-    res.json(result.rows);
-  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
-});
-
-// Settings — COGS: add new entry (auto-closes previous open entry)
-app.post('/api/settings/cogs/:sku', async (req, res) => {
-  const { sku } = req.params;
-  const { effective_from, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency = 'GBP', notes = null } = req.body;
-  if (!effective_from) return res.status(400).json({ error: 'effective_from is required' });
-  const toNum = (v) => parseFloat(v || 0) || 0;
-  const unit_cogs = [cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other].reduce((s, v) => s + toNum(v), 0);
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    // Close previous open entry (set effective_to = effective_from - 1 day)
-    await client.query(`
-      UPDATE cogs_entries SET effective_to = $1::date - INTERVAL '1 day', updated_at = NOW()
-      WHERE sku = $2 AND effective_to IS NULL AND effective_from < $1::date
-    `, [effective_from, sku]);
-    // Insert new entry
-    const result = await client.query(`
-      INSERT INTO cogs_entries (sku, effective_from, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency, unit_cogs, notes)
-      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-      RETURNING *
-    `, [sku, effective_from, toNum(cogs_standard), toNum(cogs_freight), toNum(cogs_demurrage), toNum(cogs_quality), toNum(cogs_other), cogs_currency, unit_cogs, notes]);
-    // Update sku_parameters.unit_cogs with latest value
-    await client.query(`
-      INSERT INTO sku_parameters (sku, unit_cogs, is_active, updated_at)
-      VALUES ($1, $2, true, NOW())
-      ON CONFLICT (sku) DO UPDATE SET unit_cogs = $2, updated_at = NOW()
-    `, [sku, unit_cogs]);
-    await client.query('COMMIT');
-    res.json({ ok: true, entry: result.rows[0] });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err);
-    res.status(500).json({ error: err.message });
-  } finally { client.release(); }
-});
-
-// Settings — COGS: update an existing entry (inline edit)
-app.put('/api/settings/cogs/entry/:id', async (req, res) => {
-  const { id } = req.params;
-  const { effective_from, effective_to, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency = 'GBP', notes = null } = req.body;
-  // Coerce empty strings to 0 to avoid numeric cast errors
-  const toNum = (v) => parseFloat(v || 0) || 0;
-  const std = toNum(cogs_standard), frt = toNum(cogs_freight), dem = toNum(cogs_demurrage), qty = toNum(cogs_quality), oth = toNum(cogs_other);
-  const unit_cogs = std + frt + dem + qty + oth;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const result = await client.query(`
-      UPDATE cogs_entries SET
-        effective_from = $1, effective_to = $2,
-        cogs_standard = $3, cogs_freight = $4, cogs_demurrage = $5,
-        cogs_quality = $6, cogs_other = $7, cogs_currency = $8,
-        unit_cogs = $9, notes = $10, updated_at = NOW()
-      WHERE id = $11 RETURNING *, effective_to IS NULL AS is_current
-    `, [effective_from, effective_to || null, std, frt, dem, qty, oth, cogs_currency, unit_cogs, notes, id]);
-    if (!result.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Entry not found' }); }
-    const entry = result.rows[0];
-    // If this is the current (open) entry, update sku_parameters.unit_cogs too
-    if (!entry.effective_to) {
-      await client.query(`
-        UPDATE sku_parameters SET unit_cogs = $1, updated_at = NOW() WHERE sku = $2
-      `, [unit_cogs, entry.sku]);
-    }
-    await client.query('COMMIT');
-    res.json({ ok: true, entry });
-  } catch (err) {
-    await client.query('ROLLBACK');
-    console.error(err); res.status(500).json({ error: err.message });
-  } finally { client.release(); }
-});
-
 // CSV helpers for the COGS bulk export/import round-trip below.
 function csvEscape(v) {
   const s = v === null || v === undefined ? '' : String(v);
@@ -2667,6 +2581,8 @@ function parseCsv(text) {
 
 // Settings — COGS: export all SKUs (with full entry history, one row per entry; SKUs with
 // no entries yet get a single blank template row) as CSV, for bulk editing in Excel.
+// NOTE: registered before the /:sku-parameterized routes below — otherwise Express would
+// match "export"/"import" as a :sku value on those routes and this would be unreachable.
 app.get('/api/settings/cogs/export', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -2784,6 +2700,92 @@ app.post('/api/settings/cogs/import', async (req, res) => {
     } finally { client.release(); }
   }
   res.json({ ok: true, ...results });
+});
+
+// Settings — COGS: get history for a single SKU
+app.get('/api/settings/cogs/:sku/history', async (req, res) => {
+  const { sku } = req.params;
+  try {
+    const result = await pool.query(`
+      SELECT id, sku, effective_from, effective_to,
+        cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other,
+        cogs_currency, unit_cogs, notes, created_at, updated_at
+      FROM cogs_entries WHERE sku = $1
+      ORDER BY effective_from DESC
+    `, [sku]);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Settings — COGS: add new entry (auto-closes previous open entry)
+app.post('/api/settings/cogs/:sku', async (req, res) => {
+  const { sku } = req.params;
+  const { effective_from, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency = 'GBP', notes = null } = req.body;
+  if (!effective_from) return res.status(400).json({ error: 'effective_from is required' });
+  const toNum = (v) => parseFloat(v || 0) || 0;
+  const unit_cogs = [cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other].reduce((s, v) => s + toNum(v), 0);
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    // Close previous open entry (set effective_to = effective_from - 1 day)
+    await client.query(`
+      UPDATE cogs_entries SET effective_to = $1::date - INTERVAL '1 day', updated_at = NOW()
+      WHERE sku = $2 AND effective_to IS NULL AND effective_from < $1::date
+    `, [effective_from, sku]);
+    // Insert new entry
+    const result = await client.query(`
+      INSERT INTO cogs_entries (sku, effective_from, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency, unit_cogs, notes)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+      RETURNING *
+    `, [sku, effective_from, toNum(cogs_standard), toNum(cogs_freight), toNum(cogs_demurrage), toNum(cogs_quality), toNum(cogs_other), cogs_currency, unit_cogs, notes]);
+    // Update sku_parameters.unit_cogs with latest value
+    await client.query(`
+      INSERT INTO sku_parameters (sku, unit_cogs, is_active, updated_at)
+      VALUES ($1, $2, true, NOW())
+      ON CONFLICT (sku) DO UPDATE SET unit_cogs = $2, updated_at = NOW()
+    `, [sku, unit_cogs]);
+    await client.query('COMMIT');
+    res.json({ ok: true, entry: result.rows[0] });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  } finally { client.release(); }
+});
+
+// Settings — COGS: update an existing entry (inline edit)
+app.put('/api/settings/cogs/entry/:id', async (req, res) => {
+  const { id } = req.params;
+  const { effective_from, effective_to, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency = 'GBP', notes = null } = req.body;
+  // Coerce empty strings to 0 to avoid numeric cast errors
+  const toNum = (v) => parseFloat(v || 0) || 0;
+  const std = toNum(cogs_standard), frt = toNum(cogs_freight), dem = toNum(cogs_demurrage), qty = toNum(cogs_quality), oth = toNum(cogs_other);
+  const unit_cogs = std + frt + dem + qty + oth;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const result = await client.query(`
+      UPDATE cogs_entries SET
+        effective_from = $1, effective_to = $2,
+        cogs_standard = $3, cogs_freight = $4, cogs_demurrage = $5,
+        cogs_quality = $6, cogs_other = $7, cogs_currency = $8,
+        unit_cogs = $9, notes = $10, updated_at = NOW()
+      WHERE id = $11 RETURNING *, effective_to IS NULL AS is_current
+    `, [effective_from, effective_to || null, std, frt, dem, qty, oth, cogs_currency, unit_cogs, notes, id]);
+    if (!result.rows.length) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Entry not found' }); }
+    const entry = result.rows[0];
+    // If this is the current (open) entry, update sku_parameters.unit_cogs too
+    if (!entry.effective_to) {
+      await client.query(`
+        UPDATE sku_parameters SET unit_cogs = $1, updated_at = NOW() WHERE sku = $2
+      `, [unit_cogs, entry.sku]);
+    }
+    await client.query('COMMIT');
+    res.json({ ok: true, entry });
+  } catch (err) {
+    await client.query('ROLLBACK');
+    console.error(err); res.status(500).json({ error: err.message });
+  } finally { client.release(); }
 });
 
 // FX Rates — sync all pairs between GBP, USD, EUR from Frankfurter API (ECB data).
