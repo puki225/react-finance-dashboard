@@ -1517,6 +1517,7 @@ app.get('/api/pnl', async (req, res) => {
     refundFeesByPeriod['__total__'] = {
       commission_refunded: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.commission_refunded || 0), 0),
       refund_admin_fee: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.refund_admin_fee || 0), 0),
+      digital_services_refunded: Object.values(refundFeesByPeriod).reduce((s, v) => s + (v.digital_services_refunded || 0), 0),
     };
     returnsCogsByPeriod['__total__'] = sumMap(returnsCogsByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
