@@ -3177,7 +3177,8 @@ app.get('/api/cash-reconciliation', async (req, res) => {
       // Total fee cost as a positive magnitude (matching amz_fees) is our_line_fees minus the
       // (already-negative) account fees, i.e. our_line_fees - our_account_fees, not their sum -
       // summing them was silently netting a charge against a cost instead of adding both costs.
-      const ourFeesTotal = fx(r.our_line_fees) - fx(r.our_account_fees);
+      const ourAccountFeesMagnitude = -fx(r.our_account_fees); // sign-flip to a positive cost, matching our_line_fees
+      const ourFeesTotal = fx(r.our_line_fees) + ourAccountFeesMagnitude;
       const ourNet = fx(r.our_sales) - fx(r.our_refunds) - ourFeesTotal;
       const gap = ourNet - amazonNet;
       const gapPct = amazonNet !== 0 ? (gap / Math.abs(amazonNet)) * 100 : null;
@@ -3198,6 +3199,13 @@ app.get('/api/cash-reconciliation', async (req, res) => {
           sales: fx(r.our_sales).toFixed(2),
           refunds: fx(r.our_refunds).toFixed(2),
           fees: ourFeesTotal.toFixed(2),
+          // account_fees_only is the one genuinely precise fee sub-total (exact join via
+          // financial_event_group_id, unlike line_fees which - like Sales - is only date-range
+          // approximated since amazon_order_lines carries no settlement-group link). Exposed
+          // separately so the UI doesn't present the whole (partly-approximate) Fees figure as
+          // if it were as trustworthy as Refunds.
+          account_fees_only: ourAccountFeesMagnitude.toFixed(2),
+          line_fees_only: fx(r.our_line_fees).toFixed(2),
           net: ourNet.toFixed(2),
         },
         gap: gap.toFixed(2),
