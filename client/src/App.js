@@ -3,6 +3,7 @@ import SalesSummary from './pages/SalesSummary';
 import ProductBreakdown from './pages/ProductBreakdown';
 import PnL from './pages/PnL';
 import Inventory from './pages/Inventory';
+import CashFlow from './pages/CashFlow';
 import Settings from './pages/Settings';
 import { useIsMobile } from './hooks/useIsMobile';
 
@@ -12,7 +13,7 @@ const NAV = [
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
-  { id: 'cashflow',  label: 'Cash Flow',            icon: '◒', active: false },
+  { id: 'cashflow',  label: 'Cash Flow',            icon: '◒', active: true },
   { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
 
@@ -148,7 +149,7 @@ export default function App() {
         {active === 'pnl'       && <PnL />}
         {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
         {active === 'inventory' && <Inventory />}
-        {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
+        {active === 'cashflow'  && <CashFlow />}
         {active === 'settings'  && <Settings />}
       </div>
     </div>

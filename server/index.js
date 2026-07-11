@@ -3091,6 +3091,151 @@ app.get('/api/inventory/sell-through', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Cash reconciliation — Amazon-only, one row per settled bi-weekly payout period, comparing
+// what Amazon actually reported for that settlement (from amazon_payouts, straight from their
+// FinancialEventGroupList) against what our own synced data says happened over the same window.
+// Deliberately narrow in scope per the actual ask: no COGS, no Shopify, no reserve/carry-over
+// balance bridging (beginning_balance/net_transfer) - just "is our number close to Amazon's
+// number for this settlement period," using only settled fees (is_estimated_fee = false) and
+// non-cancelled orders, so a real data gap isn't masked by orders/fees that haven't settled yet.
+// Deliberately RAW/VAT-inclusive on both sides (no vat_divisor/vat_divisor_seller applied) -
+// this compares against literal cash Amazon moved, not the VAT-exclusive figures the rest of
+// the app may show a VAT-registered client for reporting purposes.
+app.get('/api/cash-reconciliation', async (req, res) => {
+  const { from, to } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  try {
+    const result = await pool.query(`
+      WITH periods AS (
+        SELECT
+          financial_event_group_id,
+          ledger_close_date::date AS period_end,
+          fund_transfer_date::date AS fund_transfer_date,
+          total_sales AS amz_sales,
+          total_refunds AS amz_refunds,
+          total_fees AS amz_fees,
+          total_other AS amz_other,
+          LAG(ledger_close_date::date) OVER (ORDER BY ledger_close_date) AS period_start
+        FROM amazon_payouts
+        WHERE fund_transfer_date IS NOT NULL AND ledger_close_date IS NOT NULL
+      ),
+      bounded_periods AS (
+        -- Drops the very first settlement period on record - it has no prior period to bound
+        -- its start date, so we can't know which orders/fees belong to it without guessing.
+        SELECT * FROM periods
+        WHERE period_start IS NOT NULL AND period_end BETWEEN $1 AND $2
+      ),
+      our_refunds AS (
+        SELECT financial_event_group_id, SUM(amount_refunded) AS refunds
+        FROM amazon_order_line_refunds
+        GROUP BY 1
+      ),
+      our_account_fees AS (
+        -- Unlike the P&L page, FBALongTermStorageFee is NOT excluded here - this is a cash-basis
+        -- reconciliation, so the settlement-dated fee from Financial Events (what actually got
+        -- deducted this period) is the right number, not the accrual-dated snapshot report P&L uses.
+        SELECT financial_event_group_id, SUM(amount) AS fees
+        FROM amazon_account_fees
+        WHERE fee_type NOT IN ('ReserveDebit', 'ReserveCredit') AND event_source != 'Adjustment'
+        GROUP BY 1
+      )
+      SELECT
+        bp.financial_event_group_id, bp.period_start, bp.period_end, bp.fund_transfer_date,
+        bp.amz_sales, bp.amz_refunds, bp.amz_fees, bp.amz_other,
+        COALESCE(orl.our_sales, 0) AS our_sales,
+        COALESCE(orl.our_line_fees, 0) AS our_line_fees,
+        COALESCE(orl.has_unsettled, false) AS has_unsettled_fees,
+        COALESCE(rf.refunds, 0) AS our_refunds,
+        COALESCE(af.fees, 0) AS our_account_fees
+      FROM bounded_periods bp
+      LEFT JOIN LATERAL (
+        SELECT
+          SUM(aol.unit_price * aol.quantity) AS our_sales,
+          SUM(COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_fixed_closing,0) +
+              COALESCE(aol.fee_variable_closing,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_giftwrap_chargeback,0) +
+              COALESCE(aol.fee_shipping_chargeback,0)) FILTER (WHERE COALESCE(aol.is_estimated_fee, false) = false) AS our_line_fees,
+          BOOL_OR(COALESCE(aol.is_estimated_fee, false)) AS has_unsettled
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.order_date::date > bp.period_start AND ao.order_date::date <= bp.period_end
+          AND ao.status != 'Canceled'
+      ) orl ON true
+      LEFT JOIN our_refunds rf ON rf.financial_event_group_id = bp.financial_event_group_id
+      LEFT JOIN our_account_fees af ON af.financial_event_group_id = bp.financial_event_group_id
+      ORDER BY bp.period_end DESC
+    `, [dateFrom, dateTo]);
+
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const fx = (n) => (parseFloat(n) || 0) * fxRate;
+
+    const rows = result.rows.map(r => {
+      const amazonNet = fx(r.amz_sales) - fx(r.amz_refunds) - fx(r.amz_fees) + fx(r.amz_other);
+      // our_line_fees (from amazon_order_lines columns) is a POSITIVE magnitude; our_account_fees
+      // (from amazon_account_fees.amount) is NEGATIVE-signed for costs - opposite conventions.
+      // Total fee cost as a positive magnitude (matching amz_fees) is our_line_fees minus the
+      // (already-negative) account fees, i.e. our_line_fees - our_account_fees, not their sum -
+      // summing them was silently netting a charge against a cost instead of adding both costs.
+      const ourFeesTotal = fx(r.our_line_fees) - fx(r.our_account_fees);
+      const ourNet = fx(r.our_sales) - fx(r.our_refunds) - ourFeesTotal;
+      const gap = ourNet - amazonNet;
+      const gapPct = amazonNet !== 0 ? (gap / Math.abs(amazonNet)) * 100 : null;
+      return {
+        financial_event_group_id: r.financial_event_group_id,
+        period_start: r.period_start,
+        period_end: r.period_end,
+        fund_transfer_date: r.fund_transfer_date,
+        has_unsettled_fees: r.has_unsettled_fees,
+        amazon: {
+          sales: fx(r.amz_sales).toFixed(2),
+          refunds: fx(r.amz_refunds).toFixed(2),
+          fees: fx(r.amz_fees).toFixed(2),
+          other: fx(r.amz_other).toFixed(2),
+          net: amazonNet.toFixed(2),
+        },
+        ours: {
+          sales: fx(r.our_sales).toFixed(2),
+          refunds: fx(r.our_refunds).toFixed(2),
+          fees: ourFeesTotal.toFixed(2),
+          net: ourNet.toFixed(2),
+        },
+        gap: gap.toFixed(2),
+        gap_pct: gapPct === null ? null : gapPct.toFixed(2),
+      };
+    });
+
+    // Cumulative summary across all returned periods — Sales specifically is only date-range
+    // approximated per period (amazon_order_lines has no financial_event_group_id to join
+    // exactly, unlike refunds/account fees), so an individual period's Sales gap can look noisy
+    // (orders near a period boundary shifting between periods depending on shipment lag) even
+    // when the underlying data is fine. That noise mostly cancels out in aggregate, so the
+    // summed total across the selected range is the more trustworthy "is there a real gap" signal
+    // than any single period row.
+    const sum = (key) => rows.reduce((s, r) => s + parseFloat(r[key] || 0), 0);
+    const sumPath = (obj, key) => rows.reduce((s, r) => s + parseFloat(obj(r)[key] || 0), 0);
+    const summary = {
+      periods: rows.length,
+      amazon: {
+        sales: sumPath(r => r.amazon, 'sales').toFixed(2),
+        refunds: sumPath(r => r.amazon, 'refunds').toFixed(2),
+        fees: sumPath(r => r.amazon, 'fees').toFixed(2),
+        net: sumPath(r => r.amazon, 'net').toFixed(2),
+      },
+      ours: {
+        sales: sumPath(r => r.ours, 'sales').toFixed(2),
+        refunds: sumPath(r => r.ours, 'refunds').toFixed(2),
+        fees: sumPath(r => r.ours, 'fees').toFixed(2),
+        net: sumPath(r => r.ours, 'net').toFixed(2),
+      },
+      gap: sum('gap').toFixed(2),
+    };
+    const summaryAmazonNet = parseFloat(summary.amazon.net);
+    summary.gap_pct = summaryAmazonNet !== 0 ? ((parseFloat(summary.gap) / Math.abs(summaryAmazonNet)) * 100).toFixed(2) : null;
+
+    res.json({ rows, summary, currency_symbol: currencySymbol(reportingCurrency) });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
 
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
