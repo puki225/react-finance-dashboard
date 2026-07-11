@@ -2532,10 +2532,11 @@ app.get('/api/product-breakdown/orders', async (req, res) => {
         SELECT 'amazon' AS channel, ao.order_date, ao.shipping_country AS marketplace,
           ao.amazon_order_id AS order_id, ao.status, ao.fulfillment_channel,
           aol.quantity,
-          (aol.unit_price * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric AS total,
+          (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric AS total,
           COALESCE(aol.item_tax,0)::numeric AS tax
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
         WHERE aol.sku = $1 AND ao.order_date::date BETWEEN $2 AND $3 AND ao.status != 'Canceled'
       `);
       refundsParts.push(`
