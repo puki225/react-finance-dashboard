@@ -94,8 +94,24 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       CREATE OR REPLACE FUNCTION vat_divisor_seller() RETURNS NUMERIC AS $FN$
         SELECT CASE
           WHEN NOT EXISTS (SELECT 1 FROM client_config WHERE vat_number IS NOT NULL AND TRIM(vat_number) <> '') THEN 1
-          ELSE 1 + COALESCE((SELECT vr.standard_rate FROM client_config cc JOIN vat_rates vr ON vr.country_code = cc.company_country), 0) / 100.0
+          ELSE 1 + COALESCE((SELECT vr.standard_rate FROM client_config cc JOIN vat_rates vr ON vr.country_code = cc.company_country LIMIT 1), 0) / 100.0
         END;
+      $FN$ LANGUAGE sql STABLE;
+
+      -- Same rate lookup as vat_divisor_seller() above, but NOT gated on vat_registered.
+      -- Amazon charges VAT on seller fees based on the seller's own country of establishment
+      -- regardless of whether that seller happens to be VAT-registered (confirmed: this
+      -- account's settled Commission is VAT-inclusive even though it isn't registered) - so
+      -- this one always applies. Used to correct data (estimated fees, which come from a
+      -- different Amazon API that returns VAT-exclusive amounts, to match the VAT-inclusive
+      -- convention settled fees use), not to decide reporting presentation, which is what
+      -- vat_divisor_seller() is for.
+      -- LIMIT 1 on the subquery: client_config is meant to be single-row (see the LIMIT 1 used
+      -- everywhere else this table is read), but isn't enforced by a constraint - without this,
+      -- any duplicate row makes the whole query error with "more than one row returned by a
+      -- subquery" instead of silently returning a wrong number.
+      CREATE OR REPLACE FUNCTION seller_fee_vat_multiplier() RETURNS NUMERIC AS $FN$
+        SELECT 1 + COALESCE((SELECT vr.standard_rate FROM client_config cc JOIN vat_rates vr ON vr.country_code = cc.company_country LIMIT 1), 0) / 100.0;
       $FN$ LANGUAGE sql STABLE;
     `);
     // Add shipping_country to the two shared revenue/refund views so every endpoint reading from
