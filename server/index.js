@@ -2556,6 +2556,152 @@ app.get('/api/settings/cogs', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// CSV helpers for the COGS bulk export/import round-trip below.
+function csvEscape(v) {
+  const s = v === null || v === undefined ? '' : String(v);
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function parseCsv(text) {
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') { if (text[i + 1] === '"') { field += '"'; i++; } else inQuotes = false; }
+      else field += c;
+    } else if (c === '"') inQuotes = true;
+    else if (c === ',') { row.push(field); field = ''; }
+    else if (c === '\n') { row.push(field); rows.push(row); row = []; field = ''; }
+    else if (c === '\r') { /* skip, \n handles the line break */ }
+    else field += c;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(v => v.trim() !== ''));
+}
+
+// Settings — COGS: export all SKUs (with full entry history, one row per entry; SKUs with
+// no entries yet get a single blank template row) as CSV, for bulk editing in Excel.
+// NOTE: registered before the /:sku-parameterized routes below — otherwise Express would
+// match "export"/"import" as a :sku value on those routes and this would be unreachable.
+app.get('/api/settings/cogs/export', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        all_skus.sku,
+        COALESCE(sp.product_name, aol.title, sol.product_title) AS product_name,
+        ce.id, ce.effective_from, ce.effective_to,
+        ce.cogs_standard, ce.cogs_freight, ce.cogs_demurrage, ce.cogs_quality, ce.cogs_other,
+        COALESCE(ce.cogs_currency, 'GBP') AS cogs_currency,
+        ce.notes
+      FROM (
+        SELECT DISTINCT sku FROM (
+          SELECT sku FROM amazon_order_lines WHERE sku IS NOT NULL
+          UNION
+          SELECT sku FROM shopify_order_lines WHERE sku IS NOT NULL
+        ) s
+      ) all_skus
+      LEFT JOIN sku_parameters sp ON sp.sku = all_skus.sku
+      LEFT JOIN LATERAL (SELECT title FROM amazon_order_lines WHERE sku = all_skus.sku LIMIT 1) aol ON true
+      LEFT JOIN LATERAL (SELECT product_title FROM shopify_order_lines WHERE sku = all_skus.sku LIMIT 1) sol ON true
+      LEFT JOIN cogs_entries ce ON ce.sku = all_skus.sku
+      ORDER BY COALESCE(sp.product_name, aol.title, sol.product_title), all_skus.sku, ce.effective_from DESC NULLS LAST
+    `);
+
+    const header = ['id', 'sku', 'product_name', 'effective_from', 'effective_to', 'cogs_standard', 'cogs_freight', 'cogs_demurrage', 'cogs_quality', 'cogs_other', 'cogs_currency', 'notes'];
+    const toDate = (d) => d ? new Date(d).toISOString().split('T')[0] : '';
+    const lines = [header.join(',')];
+    for (const r of result.rows) {
+      lines.push([
+        r.id ?? '', csvEscape(r.sku), csvEscape(r.product_name || ''),
+        toDate(r.effective_from), toDate(r.effective_to),
+        r.cogs_standard ?? '', r.cogs_freight ?? '', r.cogs_demurrage ?? '', r.cogs_quality ?? '', r.cogs_other ?? '',
+        r.cogs_currency || 'GBP', csvEscape(r.notes || ''),
+      ].join(','));
+    }
+    res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="cogs_export_${new Date().toISOString().split('T')[0]}.csv"`);
+    res.send(lines.join('\r\n'));
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Settings — COGS: bulk import from the CSV produced by /export. Rows with an `id` update
+// that entry in place; rows without one insert a new entry (auto-closing the previous open
+// entry for that SKU, same as the single-entry POST). Blank template rows (no effective_from
+// and no id) are skipped. Each row succeeds/fails independently so one bad row in a large
+// sheet doesn't roll back the rest of the import.
+app.post('/api/settings/cogs/import', async (req, res) => {
+  const text = typeof req.body === 'string' ? req.body : '';
+  if (!text.trim()) return res.status(400).json({ error: 'Empty CSV body' });
+  const rows = parseCsv(text);
+  if (!rows.length) return res.status(400).json({ error: 'No rows found' });
+  const header = rows[0].map(h => h.trim().toLowerCase());
+  if (!header.includes('sku')) return res.status(400).json({ error: 'Missing required column: sku' });
+  const col = (cols, name) => { const i = header.indexOf(name); return i === -1 ? '' : (cols[i] || '').trim(); };
+  const toNum = (v) => { const n = parseFloat(v); return isNaN(n) ? 0 : n; };
+
+  const results = { inserted: 0, updated: 0, skipped: 0, errors: [] };
+  for (let i = 1; i < rows.length; i++) {
+    const cols = rows[i];
+    const sku = col(cols, 'sku');
+    const idVal = col(cols, 'id');
+    const effective_from = col(cols, 'effective_from') || null;
+    const effective_to = col(cols, 'effective_to') || null;
+    if (!sku || (!idVal && !effective_from)) { results.skipped++; continue; }
+
+    const cogs_standard = toNum(col(cols, 'cogs_standard'));
+    const cogs_freight = toNum(col(cols, 'cogs_freight'));
+    const cogs_demurrage = toNum(col(cols, 'cogs_demurrage'));
+    const cogs_quality = toNum(col(cols, 'cogs_quality'));
+    const cogs_other = toNum(col(cols, 'cogs_other'));
+    const cogs_currency = col(cols, 'cogs_currency') || 'GBP';
+    const notes = col(cols, 'notes') || null;
+    const unit_cogs = cogs_standard + cogs_freight + cogs_demurrage + cogs_quality + cogs_other;
+
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      if (idVal) {
+        const r = await client.query(`
+          UPDATE cogs_entries SET
+            effective_from = COALESCE($1::date, effective_from), effective_to = $2::date,
+            cogs_standard = $3, cogs_freight = $4, cogs_demurrage = $5,
+            cogs_quality = $6, cogs_other = $7, cogs_currency = $8,
+            unit_cogs = $9, notes = $10, updated_at = NOW()
+          WHERE id = $11 RETURNING sku, effective_to IS NULL AS is_current
+        `, [effective_from, effective_to, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency, unit_cogs, notes, idVal]);
+        if (!r.rows.length) { await client.query('ROLLBACK'); results.errors.push({ row: i + 1, sku, error: `Entry id ${idVal} not found` }); continue; }
+        if (r.rows[0].is_current) {
+          await client.query(`UPDATE sku_parameters SET unit_cogs = $1, updated_at = NOW() WHERE sku = $2`, [unit_cogs, r.rows[0].sku]);
+        }
+        await client.query('COMMIT');
+        results.updated++;
+      } else {
+        await client.query(`
+          UPDATE cogs_entries SET effective_to = $1::date - INTERVAL '1 day', updated_at = NOW()
+          WHERE sku = $2 AND effective_to IS NULL AND effective_from < $1::date
+        `, [effective_from, sku]);
+        await client.query(`
+          INSERT INTO cogs_entries (sku, effective_from, effective_to, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency, unit_cogs, notes)
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        `, [sku, effective_from, effective_to, cogs_standard, cogs_freight, cogs_demurrage, cogs_quality, cogs_other, cogs_currency, unit_cogs, notes]);
+        if (!effective_to) {
+          await client.query(`
+            INSERT INTO sku_parameters (sku, unit_cogs, is_active, updated_at)
+            VALUES ($1, $2, true, NOW())
+            ON CONFLICT (sku) DO UPDATE SET unit_cogs = $2, updated_at = NOW()
+          `, [sku, unit_cogs]);
+        }
+        await client.query('COMMIT');
+        results.inserted++;
+      }
+    } catch (e) {
+      await client.query('ROLLBACK');
+      results.errors.push({ row: i + 1, sku, error: e.message });
+    } finally { client.release(); }
+  }
+  res.json({ ok: true, ...results });
+});
+
 // Settings — COGS: get history for a single SKU
 app.get('/api/settings/cogs/:sku/history', async (req, res) => {
   const { sku } = req.params;
