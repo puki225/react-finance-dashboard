@@ -138,10 +138,10 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       UNION ALL
       SELECT 'amazon'::text AS channel, l.amazon_order_id AS order_id, l.sku, o.order_date,
         l.title AS product_title, l.quantity,
-        (COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric)::numeric(12,2) AS gross_sales,
+        ((COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric) + COALESCE(l.shipping_price, 0::numeric))::numeric(12,2) AS gross_sales,
         COALESCE(l.promotion_discount, 0::numeric)::numeric(12,2) AS sku_discount,
         COALESCE(l.amount_refunded, 0::numeric)::numeric(12,2) AS refund_amount,
-        ((COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric) - COALESCE(l.promotion_discount, 0::numeric))::numeric(12,2) AS net_revenue,
+        ((COALESCE(NULLIF(l.unit_price, 0::numeric), lp.last_price, 0::numeric) * l.quantity::numeric) + COALESCE(l.shipping_price, 0::numeric) - COALESCE(l.promotion_discount, 0::numeric))::numeric(12,2) AS net_revenue,
         (l.unit_price = 0::numeric AND lp.last_price IS NOT NULL) AS is_estimated_price,
         o.shipping_country
       FROM amazon_order_lines l
@@ -721,8 +721,8 @@ app.get('/api/sales-by-country', async (req, res) => {
         SELECT
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           SUM(aol.quantity)::int AS units_sold,
-          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
-          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
           SUM((COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller())::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
@@ -780,8 +780,8 @@ app.get('/api/sales-by-country', async (req, res) => {
           UNION ALL
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country,
             aol.quantity AS units_sold,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country) AS gross_sales,
-            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country) AS gross_sales,
+            (((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
             (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller() AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
@@ -980,7 +980,7 @@ app.get('/api/pnl', async (req, res) => {
     const amazonLinesBranch = `
       SELECT
         aol.quantity AS units_sold,
-        ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+        (((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
         (COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts,
         (aol.quantity * COALESCE(
           NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
@@ -1871,8 +1871,8 @@ app.get('/api/product-breakdown', async (req, res) => {
             MAX(aol.title) AS product_title,
             MAX(aol.asin) AS asin,
             SUM(aol.quantity)::int AS units_sold,
-            SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
-            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_before_refunds,
+            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+            SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_before_refunds,
             SUM(COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -1934,8 +1934,8 @@ app.get('/api/product-breakdown', async (req, res) => {
             MAX(aol.title) AS product_title,
             MAX(aol.asin) AS asin,
             SUM(aol.quantity)::int AS units_sold,
-            SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
-            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+            SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+            SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
             SUM(COALESCE(aol.promotion_discount,0) / vat_divisor(ao.shipping_country))::numeric(12,2) AS total_discounts
           FROM amazon_order_lines aol
           JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
@@ -2053,7 +2053,7 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
   try {
     const amzResult = includeAmazon ? await pool.query(`
       SELECT
-        SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric AS gross_sales,
+        SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric AS gross_sales,
         SUM(COALESCE(aol.promotion_discount, 0) / vat_divisor(ao.shipping_country))::numeric AS discounts,
         SUM(COALESCE(aol.fee_commission, 0) / vat_divisor_seller())::numeric AS fee_commission,
         SUM(COALESCE(aol.fee_fba_fulfillment, 0) / vat_divisor_seller())::numeric AS fee_fba_fulfillment,
@@ -2397,8 +2397,8 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           COALESCE(ao.shipping_country, 'Unknown') AS country,
           'amazon' AS channel,
           SUM(aol.quantity)::int AS units_sold,
-          SUM((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
-          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
+          SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS gross_sales,
+          SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric(12,2) AS net_revenue,
           SUM((COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller())::numeric(12,2) AS total_fees,
           SUM(aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0))::numeric(12,2) AS total_cogs
         FROM amazon_order_lines aol
@@ -2455,8 +2455,8 @@ app.get('/api/product-breakdown/countries', async (req, res) => {
           UNION ALL
           SELECT COALESCE(ao.shipping_country, 'Unknown') AS country, 'amazon' AS channel,
             aol.quantity AS units_sold,
-            (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) / vat_divisor(ao.shipping_country) AS gross_sales,
-            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
+            ((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country) AS gross_sales,
+            (((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country) AS net_revenue,
             (COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_fixed_closing,0)) / vat_divisor_seller() AS total_fees,
             (aol.quantity * COALESCE(ce.unit_cogs, sp.unit_cogs, 0)) AS total_cogs
           FROM amazon_order_lines aol
@@ -2532,8 +2532,8 @@ app.get('/api/product-breakdown/orders', async (req, res) => {
         SELECT 'amazon' AS channel, ao.order_date, ao.shipping_country AS marketplace,
           ao.amazon_order_id AS order_id, ao.status, ao.fulfillment_channel,
           aol.quantity,
-          (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity - COALESCE(aol.promotion_discount,0))::numeric AS total,
-          COALESCE(aol.item_tax,0)::numeric AS tax
+          (COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity + COALESCE(aol.shipping_price,0) - COALESCE(aol.promotion_discount,0))::numeric AS total,
+          (COALESCE(aol.item_tax,0) + COALESCE(aol.shipping_tax,0))::numeric AS tax
         FROM amazon_order_lines aol
         JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
         LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -3398,7 +3398,7 @@ app.get('/api/cash-reconciliation', async (req, res) => {
       FROM bounded_periods bp
       LEFT JOIN LATERAL (
         SELECT
-          SUM(aol.unit_price * aol.quantity) AS our_sales,
+          SUM(aol.unit_price * aol.quantity + COALESCE(aol.shipping_price,0)) AS our_sales,
           SUM(COALESCE(aol.fee_commission,0) + COALESCE(aol.fee_fba_fulfillment,0) + COALESCE(aol.fee_fixed_closing,0) +
               COALESCE(aol.fee_variable_closing,0) + COALESCE(aol.fee_digital_services,0) + COALESCE(aol.fee_giftwrap_chargeback,0) +
               COALESCE(aol.fee_shipping_chargeback,0)) FILTER (WHERE COALESCE(aol.is_estimated_fee, false) = false) AS our_line_fees,
