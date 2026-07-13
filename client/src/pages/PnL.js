@@ -45,7 +45,7 @@ const toggleBtn = (active) => ({
 // "−" and red colour for negative, plain text for zero/positive.
 const makeSignedFmt = (symbol = '£') => (n) => {
   const v = parseFloat(n || 0);
-  const abs = Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
+  const abs = Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   return (v < 0 ? '−' : '') + symbol + abs;
 };
 const fmtNum = (n) => parseInt(n || 0, 10).toLocaleString('en-GB');
