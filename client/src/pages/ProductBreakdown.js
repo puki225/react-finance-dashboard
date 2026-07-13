@@ -89,11 +89,16 @@ const COLS = [
 const TABLE_GRID = '36px minmax(100px,1fr) 100px 110px 90px 110px 80px 120px 110px';
 const TABLE_MIN_WIDTH = 36 + 100 + 100 + 110 + 90 + 110 + 80 + 120 + 110;
 
-function PnlPanel({ sku, from, to, sym, country, channel }) {
+function PnlPanel({ sku, from, to, sym, country, channel, blended, brand, parentAsin }) {
   // Normalise channel: 'both' and undefined → 'all'
   const ch = (!channel || channel === 'both') ? 'all' : channel;
-  const params = { from, to, channel: ch, ...(country ? { country } : {}) };
-  const { data, loading, error } = useApi(`/api/product-breakdown/pnl/${encodeURIComponent(sku || '')}`, params);
+  const endpoint = blended
+    ? '/api/product-breakdown/pnl-blended'
+    : `/api/product-breakdown/pnl/${encodeURIComponent(sku || '')}`;
+  const params = blended
+    ? { from, to, channel: ch, ...(brand ? { brand } : {}), ...(parentAsin ? { parent_asin: parentAsin } : {}) }
+    : { from, to, channel: ch, ...(country ? { country } : {}) };
+  const { data, loading, error } = useApi(endpoint, params);
   const [view, setView] = useState('total');
 
   if (loading) return <div style={{ padding: '20px', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>;
@@ -408,6 +413,7 @@ export default function ProductBreakdown() {
   const [expandedSku, setExpandedSku] = useState(null);
   const [expandedPnl, setExpandedPnl] = useState(null);
   const [expandedOrders, setExpandedOrders] = useState(null);
+  const [blendedPnlOpen, setBlendedPnlOpen] = useState(false);
   const [hoverTip, setHoverTip] = useState(null);
   const [brandFilter, setBrandFilter] = useState('');
   const [parentFilter, setParentFilter] = useState('');
@@ -591,8 +597,21 @@ export default function ProductBreakdown() {
               ) : <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>}
             </div>
 
-            {/* Channel (blank for the aggregate row) */}
-            <div />
+            {/* Breakdown button - blended P&L across every row shown below */}
+            <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+              <button
+                onClick={() => setBlendedPnlOpen(o => !o)}
+                style={{ padding: '3px 8px', borderRadius: 5, fontSize: 10, fontWeight: 600, border: '1px solid ' + (blendedPnlOpen ? 'var(--accent)' : 'var(--border)'), background: blendedPnlOpen ? 'var(--accent)20' : 'var(--bg3)', color: blendedPnlOpen ? 'var(--accent2)' : 'var(--muted)', cursor: 'pointer', fontFamily: 'var(--font)', transition: 'all 0.15s', whiteSpace: 'nowrap' }}>
+                Breakdown
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Blended P&L panel - same shape as the per-SKU one, aggregated across every row above */}
+        {!loading && blendedPnlOpen && (
+          <div style={{ borderBottom: '1px solid var(--border)', background: '#ffffff03' }}>
+            <PnlPanel blended from={range.from} to={range.to} sym={sym} channel={channel} brand={brandFilter} parentAsin={parentFilter} />
           </div>
         )}
 

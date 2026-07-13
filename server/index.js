@@ -2351,6 +2351,297 @@ app.get('/api/product-breakdown/pnl/:sku', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Blended P&L across every SKU currently visible in Product Breakdown (respecting whatever
+// brand/parent_asin/channel/date filters are active) - same Gross Sales -> Discounts -> Refunds
+// -> Net Sales -> COGS -> Fees -> Gross Margin -> PPC -> Product Contribution structure as the
+// per-SKU breakdown panel above, just without a sku filter and with brand/parent_asin instead.
+app.get('/api/product-breakdown/pnl-blended', async (req, res) => {
+  const { from, to, channel = 'all', brand, parent_asin } = req.query;
+  const dateFrom = from || '2020-01-01';
+  const dateTo = to || new Date().toISOString().split('T')[0];
+  const esc = (s) => s.replace(/'/g, "''");
+  const brandFilter = brand ? `AND sp.brand = '${esc(brand)}'` : '';
+  const parentFilter = parent_asin ? `AND sp.parent_asin = '${esc(parent_asin)}'` : '';
+
+  const includeAmazon  = channel !== 'shopify';
+  const includeShopify = channel !== 'amazon';
+  try {
+    const amzResult = includeAmazon ? await pool.query(`
+      SELECT
+        SUM(((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0)) / vat_divisor(ao.shipping_country))::numeric AS gross_sales,
+        SUM(COALESCE(aol.promotion_discount, 0) / vat_divisor(ao.shipping_country))::numeric AS discounts,
+        SUM(COALESCE(aol.fee_commission, 0) / vat_divisor_seller())::numeric AS fee_commission,
+        SUM(COALESCE(aol.fee_fba_fulfillment, 0) / vat_divisor_seller())::numeric AS fee_fba_fulfillment,
+        SUM(COALESCE(aol.fee_fixed_closing, 0) / vat_divisor_seller())::numeric AS fee_fixed_closing,
+        SUM(COALESCE(aol.fee_variable_closing, 0) / vat_divisor_seller())::numeric AS fee_variable_closing,
+        SUM(COALESCE(aol.fee_digital_services, 0) / vat_divisor_seller())::numeric AS fee_digital_services,
+        SUM(COALESCE(aol.fee_giftwrap_chargeback, 0) / vat_divisor_seller())::numeric AS fee_giftwrap,
+        SUM(COALESCE(aol.fee_shipping_chargeback, 0) / vat_divisor_seller())::numeric AS fee_shipping_chargeback,
+        SUM(aol.quantity)::int AS units_sold,
+        BOOL_OR(aol.is_estimated_fee) AS has_estimated_fees
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
+    `, [dateFrom, dateTo]) : { rows: [{}] };
+
+    const shpResult = includeShopify ? await pool.query(`
+      SELECT
+        SUM((sol.unit_price * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS gross_sales,
+        SUM((sol.discount_per_unit * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS discounts,
+        SUM(sol.quantity)::int AS units_sold,
+        COALESCE(SUM(
+          (mcf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor_seller()
+        ), 0)::numeric AS mcf_fees
+      FROM shopify_order_lines sol
+      JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+      LEFT JOIN amazon_mcf_fees mcf ON mcf.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN (
+        SELECT shopify_order_id, SUM(line_gross) AS order_gross
+        FROM shopify_order_lines GROUP BY shopify_order_id
+      ) order_totals ON order_totals.shopify_order_id = sol.shopify_order_id
+      WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+    `, [dateFrom, dateTo]) : { rows: [{}] };
+
+    const refundResult = await pool.query(`
+      SELECT COALESCE(SUM(v.amount_refunded / vat_divisor(v.shipping_country)), 0)::numeric AS total_refunded
+      FROM v_refunds_by_date v
+      LEFT JOIN sku_parameters sp ON sp.sku = v.sku
+      WHERE v.refund_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+        ${!includeAmazon ? `AND v.channel != 'amazon'` : ''}
+        ${!includeShopify ? `AND v.channel != 'shopify'` : ''}
+    `, [dateFrom, dateTo]);
+
+    const refundFeesResult = includeAmazon ? await pool.query(`
+      SELECT
+        COALESCE(SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller()), 0)::numeric AS fee_commission_refunded,
+        COALESCE(SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+          ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END) / vat_divisor_seller()), 0)::numeric AS fee_refund_admin,
+        COALESCE(SUM((CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+          ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller()), 0)::numeric AS fee_digital_services_refunded,
+        BOOL_OR(olr.amount_refunded > 0 AND COALESCE(olr.fee_commission_refunded, 0) = 0) AS has_estimated
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = olr.sku
+      WHERE olr.refund_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+    `, [dateFrom, dateTo]) : { rows: [{ fee_commission_refunded: 0, fee_refund_admin: 0, fee_digital_services_refunded: 0, has_estimated: false }] };
+
+    const ppcResult = includeAmazon ? await pool.query(`
+      SELECT COALESCE(SUM(p.cost / vat_divisor_seller()), 0)::numeric AS ppc_cost, COALESCE(SUM(p.sales_14d), 0)::numeric AS ppc_sales
+      FROM amazon_ppc_product_performance p
+      LEFT JOIN sku_parameters sp ON sp.sku = p.sku
+      WHERE p.report_date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+    `, [dateFrom, dateTo]) : { rows: [{ ppc_cost: 0, ppc_sales: 0 }] };
+
+    const cogsRows = [];
+    if (includeAmazon) {
+      const r = await pool.query(`
+        SELECT
+          SUM(aol.quantity * COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0))::numeric AS cogs_standard,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric AS cogs_freight,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric AS cogs_demurrage,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric AS cogs_quality,
+          SUM(aol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric AS cogs_other
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+        LEFT JOIN LATERAL (
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= ao.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = aol.sku AND ce0.effective_from <= ao.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${brandFilter} ${parentFilter}
+      `, [dateFrom, dateTo]);
+      if (r.rows[0]) cogsRows.push(r.rows[0]);
+    }
+    if (includeShopify) {
+      const r = await pool.query(`
+        SELECT
+          SUM(sol.quantity * COALESCE(
+            NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+            CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+              AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+              THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0))::numeric AS cogs_standard,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0))::numeric AS cogs_freight,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0))::numeric AS cogs_demurrage,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0))::numeric AS cogs_quality,
+          SUM(sol.quantity * COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0))::numeric AS cogs_other
+        FROM shopify_order_lines sol
+        JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+        LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+        LEFT JOIN LATERAL (
+          SELECT
+            ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+            ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+            ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+            ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+            ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+            ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= sol.order_date::date
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sol.sku AND ce0.effective_from <= sol.order_date::date
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= sol.order_date::date)
+          ORDER BY ce0.effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE sol.order_date::date BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+      `, [dateFrom, dateTo]);
+      if (r.rows[0]) cogsRows.push(r.rows[0]);
+    }
+    const cogsResult = { rows: cogsRows };
+
+    const returnsCogsResult = includeAmazon ? await pool.query(`
+      SELECT COALESCE(SUM(acr.quantity * (
+        COALESCE(
+          NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+          CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+            AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+            THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+        + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+        + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+        + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+        + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+      )), 0)::numeric AS total_cogs_returned
+      FROM amazon_customer_returns acr
+      JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT olr.refund_date FROM amazon_order_line_refunds olr
+        WHERE olr.amazon_order_id = acr.amazon_order_id AND olr.sku = acr.sku
+        ORDER BY ABS(EXTRACT(EPOCH FROM (olr.refund_date - acr.return_date::timestamptz))) ASC
+        LIMIT 1
+      ) rf ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = acr.sku AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE COALESCE(rf.refund_date::date, acr.return_date) BETWEEN $1 AND $2 ${brandFilter} ${parentFilter}
+    `, [dateFrom, dateTo]) : { rows: [{ total_cogs_returned: 0 }] };
+
+    const reportingCurrency = await getReportingCurrency();
+    const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+    const fx = (n) => ((parseFloat(n) || 0) * fxRate);
+
+    const amz = amzResult.rows[0] || {};
+    const shp = shpResult.rows[0] || {};
+    const totalRefunded = fx(refundResult.rows[0]?.total_refunded || 0);
+    const netUnits = parseInt(amz.units_sold || 0) + parseInt(shp.units_sold || 0);
+
+    const grossSales = fx(amz.gross_sales || 0) + fx(shp.gross_sales || 0);
+    const discounts  = fx(amz.discounts || 0) + fx(shp.discounts || 0);
+    const netRevenue = grossSales - discounts - totalRefunded;
+
+    const feeCommission      = fx(amz.fee_commission || 0);
+    const feeFBA             = fx(amz.fee_fba_fulfillment || 0);
+    const feeFixedClosing    = fx(amz.fee_fixed_closing || 0);
+    const feeVariableClosing = fx(amz.fee_variable_closing || 0);
+    const feeDigitalServices = fx(amz.fee_digital_services || 0);
+    const feeGiftwrap        = fx(amz.fee_giftwrap || 0);
+    const feeShipping        = fx(amz.fee_shipping_chargeback || 0);
+    const feeMCF             = fx(shp.mcf_fees || 0);
+    const commissionRefunded = fx(refundFeesResult.rows[0]?.fee_commission_refunded || 0);
+    const refundAdminFee     = fx(refundFeesResult.rows[0]?.fee_refund_admin || 0);
+    const digitalServicesRefunded = fx(refundFeesResult.rows[0]?.fee_digital_services_refunded || 0);
+    const totalFees = feeCommission + feeFBA + feeFixedClosing + feeVariableClosing + feeDigitalServices + feeGiftwrap + feeShipping + feeMCF - commissionRefunded + refundAdminFee - digitalServicesRefunded;
+    const hasEstimatedFees = amz.has_estimated_fees === true || refundFeesResult.rows[0]?.has_estimated === true;
+
+    const cogsSt  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_standard  || 0), 0);
+    const cogsFr  = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_freight   || 0), 0);
+    const cogsDem = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_demurrage || 0), 0);
+    const cogsQty = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_quality   || 0), 0);
+    const cogsOth = cogsResult.rows.reduce((s, r) => s + fx(r.cogs_other     || 0), 0);
+    const cogsReturned = fx(returnsCogsResult.rows[0]?.total_cogs_returned || 0);
+    const totalCogs = cogsSt + cogsFr + cogsDem + cogsQty + cogsOth - cogsReturned;
+
+    const grossMargin = netRevenue - totalFees - totalCogs;
+    const f = (n) => n.toFixed(2);
+
+    const ppcCost = fx(ppcResult.rows[0]?.ppc_cost || 0);
+    const productContribution = grossMargin - ppcCost;
+
+    res.json({
+      currency_symbol: sym,
+      units: netUnits,
+      revenue: {
+        gross_sales: f(grossSales), discounts: f(-discounts),
+        refunds: f(-totalRefunded), net_revenue: f(netRevenue),
+      },
+      fees: {
+        commission:          f(-feeCommission),
+        commission_refunded: f(commissionRefunded),
+        fba_fulfillment:     f(-feeFBA),
+        fixed_closing:       f(-feeFixedClosing),
+        variable_closing:    f(-feeVariableClosing),
+        digital_services:    f(-feeDigitalServices + digitalServicesRefunded),
+        giftwrap:            f(-feeGiftwrap),
+        shipping_chargeback: f(-feeShipping),
+        refund_admin_fee:    f(-refundAdminFee),
+        mcf_fulfillment:     f(-feeMCF),
+        total:               f(-totalFees),
+        has_estimated:       hasEstimatedFees,
+      },
+      cogs: {
+        standard:  f(-cogsSt),
+        freight:   f(-cogsFr),
+        demurrage: f(-cogsDem),
+        quality:   f(-cogsQty),
+        other:     f(-cogsOth),
+        returned:  f(cogsReturned),
+        total:     f(-totalCogs),
+      },
+      gross_margin: f(grossMargin),
+      ppc: {
+        spend: f(-ppcCost),
+      },
+      product_contribution: f(productContribution),
+      has_cogs: totalCogs > 0 || cogsReturned > 0,
+      has_fees: totalFees > 0 || commissionRefunded > 0 || refundAdminFee > 0,
+      has_ppc: ppcCost > 0,
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 app.get('/api/product-breakdown/countries', async (req, res) => {
   const { sku, from, to, channel = 'all' } = req.query;
   if (!sku) return res.status(400).json({ error: 'sku required' });
