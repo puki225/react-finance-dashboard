@@ -414,7 +414,7 @@ app.get('/api/revenue-trend', async (req, res) => {
     let result;
     if (channel === 'all') {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
+        SELECT GREATEST(DATE_TRUNC($1, order_date), $2::date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
           SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
         FROM (
           SELECT order_date, gross_revenue / vat_divisor(shipping_country) AS gross_revenue, net_revenue / vat_divisor(shipping_country) AS net_revenue FROM shopify_orders
@@ -426,14 +426,14 @@ app.get('/api/revenue-trend', async (req, res) => {
       `, [trunc, dateFrom, dateTo]);
     } else if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
+        SELECT GREATEST(DATE_TRUNC($1, order_date), $2::date)::date AS period, SUM(gross_revenue)::numeric AS gross_revenue,
           SUM(net_revenue)::numeric AS net_revenue, COUNT(*)::int AS orders
         FROM (${amazonEnriched}) a WHERE order_date::date BETWEEN $2 AND $3 AND status != 'Canceled'
         GROUP BY 1 ORDER BY 1
       `, [trunc, dateFrom, dateTo]);
     } else {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, SUM(gross_revenue / vat_divisor(shipping_country))::numeric AS gross_revenue,
+        SELECT GREATEST(DATE_TRUNC($1, order_date), $2::date)::date AS period, SUM(gross_revenue / vat_divisor(shipping_country))::numeric AS gross_revenue,
           SUM(net_revenue / vat_divisor(shipping_country))::numeric AS net_revenue, COUNT(*)::int AS orders
         FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
         GROUP BY 1 ORDER BY 1
@@ -445,13 +445,13 @@ app.get('/api/revenue-trend', async (req, res) => {
     let refundResult;
     if (channel === 'amazon' || channel === 'shopify') {
       refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
+        SELECT GREATEST(DATE_TRUNC($1, refund_date), $3::date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
         FROM v_refunds_by_date WHERE channel = $2 AND refund_date::date BETWEEN $3 AND $4
         GROUP BY 1
       `, [trunc, channel, dateFrom, dateTo]);
     } else {
       refundResult = await pool.query(`
-        SELECT DATE_TRUNC($1, refund_date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
+        SELECT GREATEST(DATE_TRUNC($1, refund_date), $2::date)::date AS period, COALESCE(SUM(amount_refunded / vat_divisor(shipping_country)), 0)::numeric AS total_refunded
         FROM v_refunds_by_date WHERE refund_date::date BETWEEN $2 AND $3
         GROUP BY 1
       `, [trunc, dateFrom, dateTo]);
@@ -537,7 +537,7 @@ app.get('/api/gateway-trend', async (req, res) => {
     let result;
     if (channel === 'amazon') {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, SUM(net_transfer)::numeric AS revenue
+        SELECT GREATEST(DATE_TRUNC($1, fund_transfer_date), $2::date)::date AS period, 'Amazon Payout' AS gateway, SUM(net_transfer)::numeric AS revenue
         FROM amazon_payouts
         WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
         GROUP BY 1 ORDER BY 1
@@ -545,17 +545,17 @@ app.get('/api/gateway-trend', async (req, res) => {
     } else if (channel === 'all') {
       result = await pool.query(`
         SELECT period, gateway, SUM(revenue)::numeric AS revenue FROM (
-          SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, net_revenue / vat_divisor(shipping_country) AS revenue FROM shopify_orders
+          SELECT GREATEST(DATE_TRUNC($1, order_date), $2::date)::date AS period, gateway, net_revenue / vat_divisor(shipping_country) AS revenue FROM shopify_orders
           WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
           UNION ALL
-          SELECT DATE_TRUNC($1, fund_transfer_date)::date AS period, 'Amazon Payout' AS gateway, net_transfer AS revenue
+          SELECT GREATEST(DATE_TRUNC($1, fund_transfer_date), $2::date)::date AS period, 'Amazon Payout' AS gateway, net_transfer AS revenue
           FROM amazon_payouts
           WHERE fund_transfer_date::date BETWEEN $2 AND $3 AND net_transfer != 0
         ) combined GROUP BY 1, 2 ORDER BY 1, 2
       `, [trunc, dateFrom, dateTo]);
     } else {
       result = await pool.query(`
-        SELECT DATE_TRUNC($1, order_date)::date AS period, gateway, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS revenue
+        SELECT GREATEST(DATE_TRUNC($1, order_date), $2::date)::date AS period, gateway, SUM(net_revenue / vat_divisor(shipping_country))::numeric AS revenue
         FROM shopify_orders WHERE order_date::date BETWEEN $2 AND $3 AND financial_status != 'voided'
         GROUP BY 1, 2 ORDER BY 1, 2
       `, [trunc, dateFrom, dateTo]);
@@ -999,7 +999,7 @@ app.get('/api/pnl', async (req, res) => {
         (COALESCE(aol.fee_digital_services,0) / vat_divisor_seller())::numeric(12,2) AS fee_digital_services,
         (COALESCE(aol.fee_giftwrap_chargeback,0) / vat_divisor_seller())::numeric(12,2) AS fee_giftwrap,
         (COALESCE(aol.fee_shipping_chargeback,0) / vat_divisor_seller())::numeric(12,2) AS fee_shipping_chargeback,
-        DATE_TRUNC('${trunc}', ao.order_date)::date AS period
+        GREATEST(DATE_TRUNC('${trunc}', ao.order_date), $1::date)::date AS period
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -1052,7 +1052,7 @@ app.get('/api/pnl', async (req, res) => {
         0::numeric(12,2) AS fee_digital_services,
         0::numeric(12,2) AS fee_giftwrap,
         0::numeric(12,2) AS fee_shipping_chargeback,
-        DATE_TRUNC('${trunc}', sol.order_date)::date AS period
+        GREATEST(DATE_TRUNC('${trunc}', sol.order_date), $1::date)::date AS period
       FROM shopify_order_lines sol
       JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
@@ -1110,7 +1110,7 @@ app.get('/api/pnl', async (req, res) => {
     // Refunds, attributed by refund_date (independent of the order population above)
     const refundsChannelFilter = channel === 'amazon' ? `AND channel = 'amazon'` : channel === 'shopify' ? `AND channel = 'shopify'` : '';
     const refundsResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', refund_date)::date AS period, SUM(amount_refunded / vat_divisor(shipping_country))::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
+      SELECT GREATEST(DATE_TRUNC('${trunc}', refund_date), $1::date)::date AS period, SUM(amount_refunded / vat_divisor(shipping_country))::numeric AS total_refunded, SUM(quantity_refunded)::int AS units_refunded
       FROM v_refunds_by_date WHERE refund_date::date BETWEEN $1 AND $2 ${refundsChannelFilter}
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1126,7 +1126,7 @@ app.get('/api/pnl', async (req, res) => {
     // by quantity refunded, with the admin fee at this account's own observed settled ratio
     // (~20% of the reversed commission — Amazon's admin cut on refunds).
     const refundFeesResult = includeAmazon ? await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', olr.refund_date)::date AS period,
+      SELECT GREATEST(DATE_TRUNC('${trunc}', olr.refund_date), $1::date)::date AS period,
         SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
           ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END) / vat_divisor_seller())::numeric AS fee_commission_refunded,
         SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
@@ -1150,7 +1150,7 @@ app.get('/api/pnl', async (req, res) => {
     // only a matching row in amazon_customer_returns (Amazon's FBA Customer Returns report)
     // does, since a refund only reverses revenue and doesn't mean the unit physically came back.
     const returnsCogsResult = includeAmazon ? await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', COALESCE(rf.refund_date, acr.return_date))::date AS period,
+      SELECT GREATEST(DATE_TRUNC('${trunc}', COALESCE(rf.refund_date, acr.return_date)), $1::date)::date AS period,
         SUM(acr.quantity * (
           COALESCE(
             NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
@@ -1197,7 +1197,7 @@ app.get('/api/pnl', async (req, res) => {
 
     // PPC spend, Amazon Ads only
     const ppcResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', report_date)::date AS period, SUM(cost / vat_divisor_seller())::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
+      SELECT GREATEST(DATE_TRUNC('${trunc}', report_date), $1::date)::date AS period, SUM(cost / vat_divisor_seller())::numeric AS ppc_cost, SUM(units_sold_clicks_14d)::int AS ppc_units
       FROM amazon_ppc_product_performance WHERE report_date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1218,7 +1218,7 @@ app.get('/api/pnl', async (req, res) => {
     // through vat_divisor_seller() - they're Amazon paying the seller back, not a fee charge, so
     // VAT-on-fees doesn't apply to them the way it does to Commission/Storage/Subscription/etc.
     const accountFeesResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', posted_date)::date AS period, event_source, fee_type,
+      SELECT GREATEST(DATE_TRUNC('${trunc}', posted_date), $1::date)::date AS period, event_source, fee_type,
         SUM(CASE WHEN event_source = 'Adjustment' THEN amount ELSE amount / vat_divisor_seller() END)::numeric AS amount
       FROM amazon_account_fees WHERE posted_date::date BETWEEN $1 AND $2
         AND fee_type NOT IN ('ReserveDebit', 'ReserveCredit', 'FBALongTermStorageFee')
@@ -1232,7 +1232,7 @@ app.get('/api/pnl', async (req, res) => {
     // report into amazon_ltsf_charges. Merged into accountFeesByPeriod/feeTypeTotals below so it
     // flows through the same itemized-fees display and total logic as every other fee type.
     const ltsfResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', snapshot_date)::date AS period, SUM(amount / vat_divisor_seller())::numeric AS amount
+      SELECT GREATEST(DATE_TRUNC('${trunc}', snapshot_date), $1::date)::date AS period, SUM(amount / vat_divisor_seller())::numeric AS amount
       FROM amazon_ltsf_charges WHERE snapshot_date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
@@ -1244,7 +1244,7 @@ app.get('/api/pnl', async (req, res) => {
     // grouped independently of the Amazon order-line filters above (fulfillment/order_type/
     // search/brand don't apply to a Shopify-side order).
     const mcfResult = await pool.query(`
-      SELECT DATE_TRUNC('${trunc}', fee_date)::date AS period, SUM(fee_amount / vat_divisor_seller())::numeric AS mcf_fees
+      SELECT GREATEST(DATE_TRUNC('${trunc}', fee_date), $1::date)::date AS period, SUM(fee_amount / vat_divisor_seller())::numeric AS mcf_fees
       FROM amazon_mcf_fees WHERE fee_date::date BETWEEN $1 AND $2
       GROUP BY 1
     `, [dateFrom, dateTo]);
