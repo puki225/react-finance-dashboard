@@ -425,19 +425,42 @@ export default function ProductBreakdown() {
 
   const totals = useMemo(() => {
     if (!rows?.length) return {};
+    // ACOS/ROAS aren't summable directly (they're ratios) - reconstruct each row's implied
+    // ad-attributed sales from its own ppc_cost/acos, then take spend-weighted totals across
+    // rows that actually have PPC. TACOS (spend as % of ALL revenue) is a straight sum-ratio,
+    // no reconstruction needed.
+    let ppcCost = 0, adSales = 0;
+    for (const r of rows) {
+      const cost = parseFloat(r.ppc_cost || 0);
+      const acos = parseFloat(r.acos || 0);
+      if (cost > 0) {
+        ppcCost += cost;
+        if (acos > 0) adSales += cost / (acos / 100);
+      }
+    }
     return {
       units_sold:      rows.reduce((s, r) => s + parseInt(r.units_sold || 0), 0),
+      ppc_units:       rows.reduce((s, r) => s + parseInt(r.ppc_units || 0), 0),
       gross_sales:     rows.reduce((s, r) => s + parseFloat(r.gross_sales || 0), 0),
       total_discounts: rows.reduce((s, r) => s + parseFloat(r.total_discounts || 0), 0),
       total_refunded:  rows.reduce((s, r) => s + parseFloat(r.total_refunded || 0), 0),
       net_revenue:     rows.reduce((s, r) => s + parseFloat(r.net_revenue || 0), 0),
       gross_profit:    rows.reduce((s, r) => s + parseFloat(r.gross_profit || 0), 0),
       product_contribution: rows.reduce((s, r) => s + parseFloat(r.product_contribution ?? r.gross_profit ?? 0), 0),
+      total_cogs:      rows.reduce((s, r) => s + parseFloat(r.total_cogs || 0), 0),
+      ppc_cost:        ppcCost,
+      ad_sales:        adSales,
       skus:            rows.length,
     };
   }, [rows]);
 
   const totalMargin = totals.net_revenue > 0 ? (totals.gross_profit / totals.net_revenue * 100) : 0;
+  const totalRoi = totals.total_cogs > 0 ? (totals.product_contribution / totals.total_cogs * 100) : 0;
+  const totalHasPpc = totals.ppc_cost > 0;
+  const totalAcos = totalHasPpc && totals.ad_sales > 0 ? (totals.ppc_cost / totals.ad_sales * 100) : 0;
+  const totalTacos = totalHasPpc && totals.gross_sales > 0 ? (totals.ppc_cost / totals.gross_sales * 100) : 0;
+  const totalRoas = totalHasPpc && totals.ppc_cost > 0 ? (totals.ad_sales / totals.ppc_cost) : 0;
+  const totalOrganicUnits = Math.max(totals.units_sold - totals.ppc_units, 0);
 
   const handleSort = (key) => {
     if (sort === key) {
@@ -514,6 +537,64 @@ export default function ProductBreakdown() {
 
         {loading && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>}
         {!loading && !rows?.length && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>No products found for this period</div>}
+
+        {/* Total row - summarises every row below for the current filters/period */}
+        {!loading && rows?.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: TABLE_GRID, background: 'var(--bg3)', borderBottom: '2px solid var(--border)' }}>
+            <div />
+            <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)' }}>Total</div>
+                <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>{totals.skus} SKU{totals.skus === 1 ? '' : 's'}</div>
+              </div>
+            </div>
+
+            {/* Units */}
+            <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.units_sold)}</span>
+              <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totalOrganicUnits)} organic</span>
+              <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totals.ppc_units)} ppc</span>
+            </div>
+
+            {/* Revenue */}
+            <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 3 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmt(totals.gross_sales)}</span>
+              <span style={{ fontSize: 12, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmt(totals.net_revenue)}</span>
+            </div>
+
+            {/* Margin % */}
+            <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: totalMargin >= 20 ? 'var(--green)' : totalMargin >= 10 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(totalMargin)}</span>
+              <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>gross</span>
+            </div>
+
+            {/* Contribution £ */}
+            <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+              <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: totals.product_contribution >= 0 ? 'var(--text)' : 'var(--red)' }}>{fmt(totals.product_contribution)}</span>
+            </div>
+
+            {/* ROI */}
+            <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+              {totals.total_cogs > 0 ? (
+                <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: totalRoi >= 100 ? 'var(--green)' : totalRoi >= 40 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(totalRoi)}</span>
+              ) : <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>}
+            </div>
+
+            {/* ACOS */}
+            <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
+              {totalHasPpc ? (
+                <>
+                  <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: totalAcos <= 15 ? 'var(--green)' : totalAcos <= 30 ? 'var(--amber)' : 'var(--red)' }}>{fmtPct(totalAcos)}</span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>TACOS: {fmtPct(totalTacos)}</span>
+                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>ROAS: {totalRoas.toFixed(1)}x</span>
+                </>
+              ) : <span style={{ fontSize: 12, color: 'var(--muted)' }}>—</span>}
+            </div>
+
+            {/* Channel (blank for the aggregate row) */}
+            <div />
+          </div>
+        )}
 
         {!loading && rows?.map((row, i) => {
           const expanded = expandedSku === row.sku;
