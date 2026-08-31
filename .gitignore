@@ -1,0 +1,16 @@
+# Dependencies — reinstalled from package.json on deploy (see the root build script)
+node_modules/
+
+# Client production bundle — Railway regenerates this during `npm run build`,
+# so the committed tree stays source-only.
+client/build/
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Logs and editor/OS noise
+*.log
+npm-debug.log*
+.DS_Store

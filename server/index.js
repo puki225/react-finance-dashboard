@@ -3783,6 +3783,326 @@ app.get('/api/cash-reconciliation', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// ─── PVM (Price / Volume / Mix) ───────────────────────────────────────────
+// Decomposes the change in Revenue or Margin between two scenario periods into
+// price, volume and mix effects.
+//
+//   Price  = Σ over members of (price2ₘ − price1ₘ) × volume2ₘ   ← per member
+//   Volume = (volume2 − volume1) × blendedPrice1                ← on the blend
+//   Mix    = totalDelta − Price − Volume                        (balancing figure)
+//
+// The two terms are deliberately evaluated at DIFFERENT granularities, and that is
+// the whole point. Evaluate both on the same blended average and the algebra
+// collapses — (avgP2−avgP1)V2 + (V2−V1)avgP1 == Value2 − Value1 identically — so
+// the residual would always be exactly zero and there would be no mix to report.
+// Pricing the volume term at the blended average instead leaves precisely the
+// cross-member effect behind: each member's mix works out to
+//   (volume2ₘ − volume1ₘ) × (price1ₘ − blendedPrice1)
+// i.e. growth in members priced above the blend lifts mix, growth in members below
+// it drags mix down. Members' price/volume/mix therefore sum exactly to the totals.
+//
+// "Price" generalises to "value per unit": net revenue per unit in revenue mode,
+// gross profit per unit in margin mode.
+//
+// Value definitions deliberately match /api/product-breakdown so PVM ties back to
+// the rest of the dashboard: net_revenue is VAT-excluded gross less discounts less
+// refunds (refunds attributed by refund_date, per the dashboard's convention), and
+// gross profit is net_revenue − COGS − Amazon fees.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Base rows for one period at (country, sku) granularity — the finest grain any of
+// the three hierarchy levels needs, so both scenarios and every level roll up from
+// the same numbers.
+async function pvmBaseRows(dateFrom, dateTo, channel) {
+  // Itemised per-unit COGS, converted to GBP at the order-date rate. Same expression
+  // used by /api/product-breakdown — kept identical so margins agree across pages.
+  const cogsExpr = `(
+    COALESCE(
+      NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
+      CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
+        AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
+        THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
+    + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
+    + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
+    + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
+    + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
+  )`;
+  const cogsLateral = (dateCol) => `
+    LEFT JOIN LATERAL (
+      SELECT
+        ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+        ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+        ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+        ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+        ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+        ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+      FROM cogs_entries ce0
+      LEFT JOIN LATERAL (
+        SELECT rate FROM exchange_rates
+        WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+          AND date <= ${dateCol}
+        ORDER BY date DESC LIMIT 1
+      ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+      WHERE ce0.sku = ${dateCol === 'ao.order_date::date' ? 'aol.sku' : 'sol.sku'}
+        AND ce0.effective_from <= ${dateCol}
+        AND (ce0.effective_to IS NULL OR ce0.effective_to >= ${dateCol})
+      ORDER BY ce0.effective_from DESC LIMIT 1
+    ) ce ON true`;
+
+  // Amazon: orders in period, plus refunds landing in period (joined back to the
+  // original order for its country, so refunds land in the same bucket as the sale).
+  const amazonSql = `
+    amazon_sales AS (
+      SELECT
+        COALESCE(ao.shipping_country, 'Unknown') AS country,
+        aol.sku,
+        SUM(aol.quantity)::int AS units,
+        SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0))
+             - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric AS net_before_refunds,
+        SUM((COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
+             COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
+             COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0) +
+             COALESCE(aol.fee_shipping_chargeback, 0)) / vat_divisor_seller())::numeric AS fees,
+        SUM(aol.quantity * ${cogsExpr})::numeric AS cogs
+      FROM amazon_order_lines aol
+      JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+      LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
+      ${cogsLateral('ao.order_date::date')}
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+      GROUP BY 1, 2
+    ),
+    amazon_refunds AS (
+      SELECT
+        COALESCE(ao.shipping_country, 'Unknown') AS country,
+        olr.sku,
+        SUM(COALESCE(olr.quantity_refunded, 0))::int AS units_refunded,
+        SUM(olr.amount_refunded / vat_divisor(ao.shipping_country))::numeric AS refunded,
+        SUM((CASE WHEN olr.fee_commission_refunded > 0 THEN olr.fee_commission_refunded
+              ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)
+            / vat_divisor_seller())::numeric AS fee_commission_refunded,
+        SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
+              ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)
+            / vat_divisor_seller())::numeric AS fee_refund_admin
+      FROM amazon_order_line_refunds olr
+      LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
+      LEFT JOIN amazon_orders ao ON ao.amazon_order_id = olr.amazon_order_id
+      WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
+      GROUP BY 1, 2
+    )`;
+
+  const shopifySql = `
+    shopify_sales AS (
+      SELECT
+        COALESCE(so.shipping_country, 'Unknown') AS country,
+        sol.sku,
+        SUM(sol.quantity)::int AS units,
+        SUM(((sol.unit_price - COALESCE(sol.discount_per_unit,0)) * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS net_before_refunds,
+        0::numeric AS fees,
+        SUM(sol.quantity * ${cogsExpr})::numeric AS cogs
+      FROM shopify_order_lines sol
+      LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
+      ${cogsLateral('sol.order_date::date')}
+      WHERE sol.order_date::date BETWEEN $1 AND $2
+      GROUP BY 1, 2
+    ),
+    shopify_refunds AS (
+      SELECT
+        COALESCE(so.shipping_country, 'Unknown') AS country,
+        sol.sku,
+        0::int AS units_refunded,
+        SUM((st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor(so.shipping_country))::numeric AS refunded,
+        0::numeric AS fee_commission_refunded,
+        0::numeric AS fee_refund_admin
+      FROM shopify_transactions st
+      JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
+      LEFT JOIN shopify_orders so ON so.shopify_order_id = st.shopify_order_id
+      JOIN (
+        SELECT shopify_order_id, SUM(line_gross) AS order_gross
+        FROM shopify_order_lines GROUP BY shopify_order_id
+      ) order_totals ON order_totals.shopify_order_id = st.shopify_order_id
+      WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
+      GROUP BY 1, 2
+    )`;
+
+  // Which channel CTEs feed the union — 'all' stacks both.
+  const parts = [];
+  if (channel !== 'shopify') parts.push(amazonSql);
+  if (channel !== 'amazon') parts.push(shopifySql);
+  const salesUnion = [
+    channel !== 'shopify' ? 'SELECT country, sku, units, net_before_refunds, fees, cogs FROM amazon_sales' : null,
+    channel !== 'amazon' ? 'SELECT country, sku, units, net_before_refunds, fees, cogs FROM shopify_sales' : null,
+  ].filter(Boolean).join(' UNION ALL ');
+  const refundUnion = [
+    channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
+    channel !== 'amazon' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM shopify_refunds' : null,
+  ].filter(Boolean).join(' UNION ALL ');
+
+  const result = await pool.query(`
+    WITH ${parts.join(',\n')},
+    sales AS (
+      SELECT country, sku, SUM(units)::int AS units, SUM(net_before_refunds)::numeric AS net_before_refunds,
+             SUM(fees)::numeric AS fees, SUM(cogs)::numeric AS cogs
+      FROM (${salesUnion}) s GROUP BY 1, 2
+    ),
+    refunds AS (
+      SELECT country, sku, SUM(units_refunded)::int AS units_refunded, SUM(refunded)::numeric AS refunded,
+             SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
+             SUM(fee_refund_admin)::numeric AS fee_refund_admin
+      FROM (${refundUnion}) r GROUP BY 1, 2
+    )
+    SELECT
+      COALESCE(s.country, r.country) AS country,
+      COALESCE(s.sku, r.sku) AS sku,
+      sp.asin,
+      sp.brand,
+      sp.product_name,
+      COALESCE(s.units, 0)::int AS units,
+      -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
+      (COALESCE(s.net_before_refunds, 0) - COALESCE(r.refunded, 0))::numeric AS net_revenue,
+      COALESCE(s.cogs, 0)::numeric AS cogs,
+      (COALESCE(s.fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fees
+    FROM sales s
+    FULL OUTER JOIN refunds r ON r.country = s.country AND r.sku = s.sku
+    LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, r.sku)
+  `, [dateFrom, dateTo]);
+  return result.rows;
+}
+
+app.get('/api/pvm', async (req, res) => {
+  const {
+    s1_from, s1_to, s2_from, s2_to,
+    metric = 'revenue', level = 'asin', channel = 'all',
+    country, brand, asin,
+  } = req.query;
+  if (!s1_from || !s1_to || !s2_from || !s2_to) {
+    return res.status(400).json({ error: 's1_from, s1_to, s2_from and s2_to are required' });
+  }
+  const validLevels = ['country', 'brand', 'asin'];
+  const groupLevel = validLevels.includes(level) ? level : 'asin';
+  const isMargin = metric === 'margin';
+
+  try {
+    const [rows1, rows2] = await Promise.all([
+      pvmBaseRows(s1_from, s1_to, channel),
+      pvmBaseRows(s2_from, s2_to, channel),
+    ]);
+
+    // Each scenario is converted at its OWN period-average rate, so the bridge compares
+    // each period at the rate that actually applied to it rather than restating history.
+    const reportingCurrency = await getReportingCurrency();
+    const [fx1, fx2] = await Promise.all([
+      getPeriodRate('GBP', reportingCurrency, s1_from, s1_to),
+      getPeriodRate('GBP', reportingCurrency, s2_from, s2_to),
+    ]);
+
+    // Filter options come from the UNFILTERED union of both periods, so narrowing one
+    // dimension never empties the dropdowns for the others.
+    const allRows = [...rows1, ...rows2];
+    const uniqSorted = (vals) => [...new Set(vals.filter(Boolean))].sort();
+    const options = {
+      countries: uniqSorted(allRows.map(r => r.country)),
+      brands:    uniqSorted(allRows.map(r => r.brand)),
+      asins:     uniqSorted(allRows.map(r => r.asin)),
+    };
+
+    const matchesFilters = (r) =>
+      (!country || r.country === country) &&
+      (!brand   || r.brand === brand) &&
+      (!asin    || r.asin === asin);
+
+    const keyOf = (r) => {
+      if (groupLevel === 'country') return r.country || 'Unknown';
+      if (groupLevel === 'brand')   return r.brand || 'Unassigned';
+      return r.asin || r.sku || 'Unknown';
+    };
+    const labelOf = (r) => {
+      if (groupLevel === 'country') return r.country || 'Unknown';
+      if (groupLevel === 'brand')   return r.brand || 'Unassigned';
+      return r.product_name || r.asin || r.sku;
+    };
+
+    // value = the metric being bridged; volume = units sold.
+    const valueOf = (r, fx) => {
+      const netRevenue = parseFloat(r.net_revenue || 0) * fx;
+      if (!isMargin) return netRevenue;
+      return netRevenue - (parseFloat(r.cogs || 0) * fx) - (parseFloat(r.fees || 0) * fx);
+    };
+
+    const accumulate = (rows, fx) => {
+      const acc = new Map();
+      for (const r of rows) {
+        if (!matchesFilters(r)) continue;
+        const key = keyOf(r);
+        if (!acc.has(key)) acc.set(key, { key, label: labelOf(r), value: 0, units: 0 });
+        const m = acc.get(key);
+        m.value += valueOf(r, fx);
+        m.units += parseInt(r.units || 0, 10);
+      }
+      return acc;
+    };
+
+    const acc1 = accumulate(rows1, fx1);
+    const acc2 = accumulate(rows2, fx2);
+
+    const memberKeys = [...new Set([...acc1.keys(), ...acc2.keys()])];
+
+    // Blended scenario-1 price across the whole selection — the reference the volume
+    // term is priced at, and the yardstick each member's mix is measured against.
+    const sumOver = (acc, f) => [...acc.values()].reduce((t, m) => t + f(m), 0);
+    const s1Value = sumOver(acc1, m => m.value);
+    const s1Units = sumOver(acc1, m => m.units);
+    const s2Value = sumOver(acc2, m => m.value);
+    const s2Units = sumOver(acc2, m => m.units);
+    const avg1 = s1Units > 0 ? s1Value / s1Units : 0;
+    const avg2 = s2Units > 0 ? s2Value / s2Units : 0;
+
+    // Per-member bridge. Volume is priced at the blended avg1 (not the member's own
+    // price) so that what the member's own price premium/discount contributes lands
+    // in mix instead of being absorbed into volume — and so members sum to the totals.
+    const members = memberKeys.map(key => {
+      const a = acc1.get(key) || { value: 0, units: 0 };
+      const b = acc2.get(key) || { value: 0, units: 0 };
+      const p1 = a.units > 0 ? a.value / a.units : 0;
+      const p2 = b.units > 0 ? b.value / b.units : 0;
+      const delta  = b.value - a.value;
+      // A member with no scenario-1 units has no price to compare against, so its
+      // entire movement is new volume rather than a price change out of nowhere.
+      const price  = a.units > 0 && b.units > 0 ? (p2 - p1) * b.units : 0;
+      const volume = (b.units - a.units) * avg1;
+      return {
+        key,
+        label: (acc2.get(key) || acc1.get(key)).label,
+        s1_value: a.value, s1_units: a.units, s1_price: p1,
+        s2_value: b.value, s2_units: b.units, s2_price: p2,
+        price, volume,
+        mix: delta - price - volume,
+        delta,
+      };
+    }).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
+
+    const sum = (arr, f) => arr.reduce((t, x) => t + f(x), 0);
+    const totalDelta   = s2Value - s1Value;
+    const priceEffect  = sum(members, m => m.price);
+    const volumeEffect = sum(members, m => m.volume);
+    const mixEffect    = totalDelta - priceEffect - volumeEffect;
+
+    res.json({
+      metric: isMargin ? 'margin' : 'revenue',
+      level: groupLevel,
+      channel,
+      filters: { country: country || null, brand: brand || null, asin: asin || null },
+      options,
+      currency_symbol: currencySymbol(reportingCurrency),
+      scenario1: { from: s1_from, to: s1_to, value: s1Value, units: s1Units, avg_price: avg1 },
+      scenario2: { from: s2_from, to: s2_to, value: s2Value, units: s2Units, avg_price: avg2 },
+      bridge: { price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta },
+      members,
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Sync status
 app.get('/api/sync-status', async (req, res) => {
   try {
