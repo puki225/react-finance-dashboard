@@ -130,6 +130,12 @@ const LEVELS = [
   { id: 'asin', label: 'ASIN' },
 ];
 
+const CHANNELS = [
+  { id: 'all', label: 'All' },
+  { id: 'shopify', label: 'Shopify' },
+  { id: 'amazon', label: 'Amazon' },
+];
+
 // ─── Formatting ────────────────────────────────────────────────────────────
 const fmtMoney = (n, sym = '£') => {
   const v = parseFloat(n || 0);
@@ -206,8 +212,9 @@ function GrowthArrow({ text, color, isMobile, columns }) {
 
 // ─── Bridge chart engine ───────────────────────────────────────────────────
 // Shared bar-rendering for both the £ bridge (5 columns: Scenario1/Price/Volume/
-// Mix/Scenario2) and the margin-% bridge (4 columns: Scenario1/Rate/Mix/Scenario2)
-// — a bar is just {label, sub, start, end, kind: 'total'|'effect', value, display}
+// Mix/Scenario2) and the margin-% bridge (8 columns: Scenario1/Price/Std COGS/
+// Freight/Amazon Fees/FBA Fees/Mix/Scenario2) — a bar is just
+// {label, sub, start, end, kind: 'total'|'effect', value, display}
 // with `display` pre-formatted by the caller, so this component has no £-or-%
 // specific logic at all. Bars are positioned against a shared scale that always
 // includes 0 so a negative effect reads as genuinely below the axis, not just shorter.
@@ -292,20 +299,29 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
   );
 }
 
-// ─── Margin-rate (%) bridge — Rate / Mix, no Volume term ───────────────────
+// ─── Margin-rate (%) bridge — Price/Std COGS/Freight/Amazon fees/FBA fees/Mix ──────
 // A margin RATE (profit ÷ revenue) is a ratio, not an additive £ amount, so unlike
 // the £ bridge there is no independent "volume" effect — scaling volume uniformly
-// doesn't move a ratio at all. See the server's /api/pvm margin_pct_bridge comment
-// for the full derivation of the two terms this decomposes into instead.
+// doesn't move a ratio at all. What used to be one lumped "Rate" bar is exploded into
+// its 5 underlying drivers (they telescope exactly to the old Rate figure — see the
+// server's /api/pvm margin_pct_bridge comment for the derivation); Mix is unchanged.
 function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
   const c1 = pctBridge.scenario1_pct;
-  const c2 = c1 + pctBridge.rate_effect;
-  const c3 = c2 + pctBridge.mix_effect; // == scenario2_pct, bar the balancing rounding
+  const c2 = c1 + pctBridge.price_effect;
+  const c3 = c2 + pctBridge.cogs_effect;
+  const c4 = c3 + pctBridge.freight_effect;
+  const c5 = c4 + pctBridge.amz_fee_effect;
+  const c6 = c5 + pctBridge.fba_fee_effect; // == c1 + rate_effect
+  const c7 = c6 + pctBridge.mix_effect; // == scenario2_pct, bar the balancing rounding
 
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtPct(c1) },
-    { label: 'Rate', sub: 'Δmember rate × S1 revenue share', start: c1, end: c2, kind: 'effect', value: pctBridge.rate_effect, display: fmtSignedPct(pctBridge.rate_effect) },
-    { label: 'Mix', sub: 'balancing figure', start: c2, end: c3, kind: 'effect', value: pctBridge.mix_effect, display: fmtSignedPct(pctBridge.mix_effect) },
+    { label: 'Price', sub: 'ASP per unit', start: c1, end: c2, kind: 'effect', value: pctBridge.price_effect, display: fmtSignedPct(pctBridge.price_effect) },
+    { label: 'Std COGS', sub: 'unit cost of goods', start: c2, end: c3, kind: 'effect', value: pctBridge.cogs_effect, display: fmtSignedPct(pctBridge.cogs_effect) },
+    { label: 'Freight', sub: 'inbound freight/unit', start: c3, end: c4, kind: 'effect', value: pctBridge.freight_effect, display: fmtSignedPct(pctBridge.freight_effect) },
+    { label: 'Amazon Fees', sub: 'referral + closing fees', start: c4, end: c5, kind: 'effect', value: pctBridge.amz_fee_effect, display: fmtSignedPct(pctBridge.amz_fee_effect) },
+    { label: 'FBA Fees', sub: 'fulfillment fee/unit', start: c5, end: c6, kind: 'effect', value: pctBridge.fba_fee_effect, display: fmtSignedPct(pctBridge.fba_fee_effect) },
+    { label: 'Mix', sub: 'balancing figure', start: c6, end: c7, kind: 'effect', value: pctBridge.mix_effect, display: fmtSignedPct(pctBridge.mix_effect) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: pctBridge.scenario2_pct, kind: 'total', display: fmtPct(pctBridge.scenario2_pct) },
   ];
 
@@ -339,6 +355,7 @@ export default function PVM() {
   // (revenue ÷ revenue is trivially 100%), so this is simply ignored outside Margin.
   const [marginView, setMarginView] = useState('currency');
   const [level, setLevel] = useState(() => localStorage.getItem('gb_pvm_level') || 'asin');
+  const [channel, setChannel] = useState(() => localStorage.getItem('gb_pvm_channel') || 'all');
   const [presetId, setPresetId] = useState('lq');
   const [periods, setPeriods] = useState(() => PRESETS[0].build());
   const [filters, setFilters] = useState({ country: '', brand: '', asin: '' });
@@ -350,6 +367,11 @@ export default function PVM() {
   };
   const chooseMetric = (m) => { setMetric(m); localStorage.setItem('gb_pvm_metric', m); };
   const chooseLevel = (l) => { setLevel(l); localStorage.setItem('gb_pvm_level', l); };
+  // Switching channel changes which SKUs/ASINs/brands are even in scope, so a filter
+  // selected under the old channel (e.g. a Shopify-only SKU with no ASIN, filtered
+  // while on "All") can silently zero out the whole result under "Amazon" — clear
+  // filters on every channel switch rather than leave a stale, invisible-cause filter.
+  const chooseChannel = (c) => { setChannel(c); localStorage.setItem('gb_pvm_channel', c); setFilters({ country: '', brand: '', asin: '' }); };
 
   // Empty filter values must be omitted entirely — URLSearchParams would otherwise
   // serialise them as literal "undefined"/"" and the server would filter on that.
@@ -357,13 +379,13 @@ export default function PVM() {
     const p = {
       s1_from: periods.s1.from, s1_to: periods.s1.to,
       s2_from: periods.s2.from, s2_to: periods.s2.to,
-      metric, level,
+      metric, level, channel,
     };
     if (filters.country) p.country = filters.country;
     if (filters.brand) p.brand = filters.brand;
     if (filters.asin) p.asin = filters.asin;
     return p;
-  }, [periods, metric, level, filters]);
+  }, [periods, metric, level, channel, filters]);
 
   const { data, loading, error } = useApi('/api/pvm', params);
   const sym = data?.currency_symbol || '£';
@@ -453,6 +475,14 @@ export default function PVM() {
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span style={groupLabel}>Channel</span>
+          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+            {CHANNELS.map(c => (
+              <button key={c.id} style={chip(channel === c.id)} onClick={() => chooseChannel(c.id)}>{c.label}</button>
+            ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <span style={groupLabel}>Filter</span>
           <div style={{ display: 'flex', gap: 6, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4, flexWrap: 'wrap' }}>
             <select style={selectStyle} value={filters.country} onChange={e => setFilters(f => ({ ...f, country: e.target.value }))}>
@@ -521,7 +551,7 @@ export default function PVM() {
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 20 }}>
               {showPct ? 'Margin Rate Bridge' : `${metricLabel} Bridge`}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
-                {showPct ? '— mix is the residual after rate' : '— mix is the residual after price and volume'}
+                {showPct ? '— mix is the residual after the rate drivers' : '— mix is the residual after price and volume'}
               </span>
             </div>
             {showPct
@@ -539,14 +569,18 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 640 : 940) : (showPct ? 560 : 860), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 980 : 940) : (showPct ? 900 : 860), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {(showPct ? [
                       { label: '' },
                       { label: 'S1 Margin %', key: 's1_margin_pct' },
                       { label: 'S2 Margin %', key: 's2_margin_pct' },
-                      { label: 'Rate', key: 'rate_effect' },
+                      { label: 'Price', key: 'price_effect' },
+                      { label: 'Std COGS', key: 'cogs_effect' },
+                      { label: 'Freight', key: 'freight_effect' },
+                      { label: 'Amazon Fees', key: 'amz_fee_effect' },
+                      { label: 'FBA Fees', key: 'fba_fee_effect' },
                       { label: 'Mix', key: 'mix_effect_pct' },
                       { label: 'Δ Total', key: 'delta_pct' },
                     ] : [
@@ -580,7 +614,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {members.length === 0 && (
-                    <tr><td colSpan={showPct ? 6 : 11} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={showPct ? 10 : 11} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {members.map(m => {
                     const cell = (v, color) => (
@@ -617,7 +651,11 @@ export default function PVM() {
                           <>
                             {cell(fmtPct(m.s1_margin_pct), 'var(--muted)')}
                             {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
-                            {cell(fmtSignedPct(m.rate_effect), effColor(m.rate_effect))}
+                            {cell(fmtSignedPct(m.price_effect), effColor(m.price_effect))}
+                            {cell(fmtSignedPct(m.cogs_effect), effColor(m.cogs_effect))}
+                            {cell(fmtSignedPct(m.freight_effect), effColor(m.freight_effect))}
+                            {cell(fmtSignedPct(m.amz_fee_effect), effColor(m.amz_fee_effect))}
+                            {cell(fmtSignedPct(m.fba_fee_effect), effColor(m.fba_fee_effect))}
                             {cell(fmtSignedPct(m.mix_effect_pct), effColor(m.mix_effect_pct))}
                             {cell(fmtSignedPct(m.delta_pct), effColor(m.delta_pct))}
                           </>
@@ -647,7 +685,11 @@ export default function PVM() {
                         <>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario1_pct)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario2_pct)}</td>
-                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.rate_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.price_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.cogs_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.freight_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.amz_fee_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.fba_fee_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.mix_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSignedPct(data.margin_pct_bridge.total_delta_pct)}</td>
                         </>
