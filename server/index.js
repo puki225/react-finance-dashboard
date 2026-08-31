@@ -4042,6 +4042,10 @@ app.get('/api/pvm', async (req, res) => {
       if (!isMargin) return netRevenue;
       return netRevenue - (parseFloat(r.cogs || 0) * fx) - (parseFloat(r.fees || 0) * fx);
     };
+    // revenue is tracked unconditionally (not just when metric=revenue) — the margin-%
+    // bridge below needs both revenue AND profit per member regardless of which one the
+    // £ bridge above happens to be showing, since a margin RATE is profit ÷ revenue.
+    const revenueOf = (r, fx) => parseFloat(r.net_revenue || 0) * fx;
 
     const accumulate = (rows, fx) => {
       const acc = new Map();
@@ -4054,12 +4058,13 @@ app.get('/api/pvm', async (req, res) => {
         if (!acc.has(key)) {
           acc.set(key, {
             key, label: labelOf(r), asin: r.asin, sku: r.sku,
-            product_name: r.product_name, image_url: r.image_url, value: 0, units: 0,
+            product_name: r.product_name, image_url: r.image_url, value: 0, units: 0, revenue: 0,
           });
         }
         const m = acc.get(key);
         m.value += valueOf(r, fx);
         m.units += parseInt(r.units || 0, 10);
+        m.revenue += revenueOf(r, fx);
       }
       return acc;
     };
@@ -4089,10 +4094,15 @@ app.get('/api/pvm', async (req, res) => {
       const p1 = a.units > 0 ? a.value / a.units : 0;
       const p2 = b.units > 0 ? b.value / b.units : 0;
       const delta  = b.value - a.value;
-      // A member with no scenario-1 units has no price to compare against, so its
-      // entire movement is new volume rather than a price change out of nowhere.
-      const price  = a.units > 0 && b.units > 0 ? (p2 - p1) * b.units : 0;
-      const volume = (b.units - a.units) * avg1;
+      // A member missing from either scenario (newly listed, delisted, or simply not sold
+      // in that period) has no price to compare against — its entire movement is new/lost
+      // volume, not a price or mix story. Forcing volume = delta (and price/mix = 0) here
+      // is required, not just price = 0: leaving volume as (Δunits × blended avg1) would
+      // otherwise dump the gap between that and delta into mix, even though there's no
+      // second data point for this member to actually be "mixing" against.
+      const bothPresent = a.units > 0 && b.units > 0;
+      const price  = bothPresent ? (p2 - p1) * b.units : 0;
+      const volume = bothPresent ? (b.units - a.units) * avg1 : delta;
       return {
         key, label: meta.label, asin: meta.asin, sku: meta.sku, product_name: meta.product_name, image_url: meta.image_url,
         s1_value: a.value, s1_units: a.units, s1_price: p1,
@@ -4109,6 +4119,65 @@ app.get('/api/pvm', async (req, res) => {
     const volumeEffect = sum(members, m => m.volume);
     const mixEffect    = totalDelta - priceEffect - volumeEffect;
 
+    // ─── Margin-rate (percentage-point) bridge — Margin mode only ──────────────────
+    // A margin RATE (profit ÷ revenue) is a ratio, not an additive £ amount, so it can't
+    // be decomposed with the same Price/Volume/Mix formulas above (there's no "volume"
+    // term — a ratio is unchanged by uniformly scaling volume). The standard weighted-
+    // average decomposition instead has two terms:
+    //
+    //   Rate = Σ over members of s1RevShareₘ × (rate2ₘ − rate1ₘ)   ← existing revenue
+    //          mix held at its scenario-1 shares; only each member's OWN rate moves
+    //   Mix  = totalRateDelta − Rate                                (balancing figure)
+    //
+    // Mix here absorbs both the pure revenue-mix shift (selling more/less of a given
+    // member) AND the interaction between a member's rate and share moving together —
+    // same "whatever Rate didn't explain" convention as Mix in the £ bridge above.
+    // A member missing revenue in either scenario has no rate to compare (mirrors the
+    // £ bridge's bothPresent guard): its entire contribution to the rate delta is
+    // priced as Mix (its revenue share simply appeared/disappeared), not a Rate move.
+    let marginPctBridge = null;
+    if (isMargin) {
+      const s1Revenue = sumOver(acc1, m => m.revenue);
+      const s2Revenue = sumOver(acc2, m => m.revenue);
+      const s1MarginPct = s1Revenue !== 0 ? (s1Value / s1Revenue) * 100 : 0;
+      const s2MarginPct = s2Revenue !== 0 ? (s2Value / s2Revenue) * 100 : 0;
+
+      const pctByKey = new Map();
+      for (const key of memberKeys) {
+        const a = acc1.get(key) || { value: 0, revenue: 0 };
+        const b = acc2.get(key) || { value: 0, revenue: 0 };
+        const rev1 = a.revenue, rev2 = b.revenue;
+        const rate1 = rev1 !== 0 ? (a.value / rev1) * 100 : 0;
+        const rate2 = rev2 !== 0 ? (b.value / rev2) * 100 : 0;
+        const w1 = s1Revenue !== 0 ? rev1 / s1Revenue : 0;
+        const w2 = s2Revenue !== 0 ? rev2 / s2Revenue : 0;
+        const deltaContribution = (w2 * rate2) - (w1 * rate1);
+        const bothPresent = rev1 !== 0 && rev2 !== 0;
+        const rateEffect = bothPresent ? w1 * (rate2 - rate1) : 0;
+        pctByKey.set(key, {
+          s1_margin_pct: rate1, s2_margin_pct: rate2,
+          rate_effect: rateEffect,
+          mix_effect_pct: deltaContribution - rateEffect,
+          delta_pct: deltaContribution,
+        });
+      }
+      // Merged onto the same member rows the £ bridge already returns, so the table
+      // has one row per member regardless of which mode is active client-side.
+      for (const m of members) Object.assign(m, pctByKey.get(m.key));
+
+      const totalPctDelta = s2MarginPct - s1MarginPct;
+      const pctRateEffect = sum(members, m => m.rate_effect);
+      const pctMixEffect  = totalPctDelta - pctRateEffect;
+
+      marginPctBridge = {
+        scenario1_pct: s1MarginPct,
+        scenario2_pct: s2MarginPct,
+        rate_effect: pctRateEffect,
+        mix_effect: pctMixEffect,
+        total_delta_pct: totalPctDelta,
+      };
+    }
+
     res.json({
       metric: isMargin ? 'margin' : 'revenue',
       level: groupLevel,
@@ -4119,6 +4188,7 @@ app.get('/api/pvm', async (req, res) => {
       scenario1: { from: s1_from, to: s1_to, value: s1Value, units: s1Units, avg_price: avg1 },
       scenario2: { from: s2_from, to: s2_to, value: s2Value, units: s2Units, avg_price: avg2 },
       bridge: { price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta },
+      margin_pct_bridge: marginPctBridge,
       members,
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
