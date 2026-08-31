@@ -1,6 +1,50 @@
 import React, { useState, useMemo } from 'react';
+import { createPortal } from 'react-dom';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
+
+// Same fast custom tooltip as Product Breakdown (native `title` has a fixed ~1s OS delay) —
+// portalled to document.body so it can't get clipped by the table's own scroll container.
+function HoverTooltip({ tip }) {
+  if (!tip) return null;
+  return createPortal(
+    <div style={{
+      position: 'fixed', top: tip.top, left: tip.left, zIndex: 9999, maxWidth: 320,
+      background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 6,
+      padding: '6px 10px', fontSize: 12, color: 'var(--text)', fontFamily: 'var(--font)',
+      boxShadow: '0 4px 16px rgba(0,0,0,0.35)', pointerEvents: 'none',
+    }}>
+      {tip.text}
+    </div>,
+    document.body
+  );
+}
+
+// Amazon is the account's UK marketplace throughout this dashboard, matching Product Breakdown.
+const amazonUrl = (asin) => asin ? `https://www.amazon.co.uk/dp/${asin}` : null;
+
+function ProductImage({ imageUrl, asin, sku, onEnter, onLeave }) {
+  const url = amazonUrl(asin);
+  const Tag = url ? 'a' : 'div';
+  const linkProps = url ? { href: url, target: '_blank', rel: 'noopener noreferrer' } : {};
+  return (
+    <Tag
+      {...linkProps}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      style={{ width: 40, height: 40, flexShrink: 0, borderRadius: 8, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: url ? 'pointer' : 'help', textDecoration: 'none' }}
+    >
+      {imageUrl ? <img src={imageUrl} alt={sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 15, opacity: 0.2 }}>◉</span>}
+    </Tag>
+  );
+}
+
+// Flag emoji from a 2-letter ISO country code (regional indicator symbols) — no image
+// asset needed. shipping_country is already stored as alpha-2 throughout this dashboard.
+function countryFlag(code) {
+  if (!code || code.length !== 2) return '';
+  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt(0)));
+}
 
 // ─── Period presets ────────────────────────────────────────────────────────
 // Every preset pairs a current period (scenario 2) with the same period a year
@@ -72,10 +116,15 @@ const PRESETS = [
   })),
 ];
 
+// Each level prices its own Volume term against ITS OWN blended price₁ (not one global
+// reference), so Price/Volume/Mix are level-dependent by design — an ASIN pools its
+// countries together and shows their mix; sku_country pins both dimensions, leaving no
+// mix possible, so a row's own mix is guaranteed exactly zero only there.
 const LEVELS = [
   { id: 'country', label: 'Country' },
   { id: 'brand', label: 'Brand' },
   { id: 'asin', label: 'ASIN' },
+  { id: 'sku_country', label: 'SKU × Country' },
 ];
 
 // ─── Formatting ────────────────────────────────────────────────────────────
@@ -127,6 +176,11 @@ const selectStyle = {
 // a negative effect reads as genuinely below the axis rather than just shorter.
 function Waterfall({ bridge, s1, s2, sym, isMobile }) {
   const H = isMobile ? 220 : 300;
+  // Reserved space below the bar canvas purely for a value label that lands there — a bar
+  // reaching (near) the container's own top has nowhere "above" to put its label, so it
+  // always renders below instead; without a dedicated gap that label sits right at H and
+  // collides with the bar's own name/subtitle immediately underneath it.
+  const LABEL_GAP = 26;
   const c1 = s1.value;
   const c2 = c1 + bridge.price;
   const c3 = c2 + bridge.volume;
@@ -135,7 +189,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total' },
     { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price },
-    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume },
+    { label: 'Volume', sub: 'Δvol × own-group price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume },
     { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total' },
   ];
@@ -158,7 +212,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
         const labelAbove = top > 22;
         return (
           <div key={i} style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-            <div style={{ position: 'relative', height: H }}>
+            <div style={{ position: 'relative', height: H, marginBottom: LABEL_GAP }}>
               <div style={{
                 position: 'absolute', top, height, left: '10%', width: '80%',
                 background: color, opacity: b.kind === 'total' ? 1 : 0.85,
@@ -175,7 +229,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
                 <div style={{ position: 'absolute', top: y(0), left: 0, right: 0, borderTop: '1px dashed var(--border)' }} />
               )}
             </div>
-            <div style={{ marginTop: 10, textAlign: 'center', minWidth: 0 }}>
+            <div style={{ textAlign: 'center', minWidth: 0 }}>
               <div style={{ fontSize: isMobile ? 11 : 13, fontWeight: 600, color: 'var(--text)' }}>{b.label}</div>
               <div style={{ fontSize: isMobile ? 8 : 10, color: 'var(--muted)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis' }}>{b.sub}</div>
             </div>
@@ -233,6 +287,8 @@ export default function PVM() {
 
   const members = data?.members || [];
   const opts = data?.options || { countries: [], brands: [], asins: [] };
+  const [hoverTip, setHoverTip] = useState(null);
+  const showProduct = level === 'asin' || level === 'sku_country';
 
   return (
     <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 16 : 22 }}>
@@ -361,7 +417,7 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: 860, borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: showProduct ? 940 : 860, borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {['', 'S1 Units', `S1 ${unitLabel}`, 'S1 Value', 'S2 Units', `S2 ${unitLabel}`, 'S2 Value', 'Price', 'Volume', 'Mix', 'Δ Total'].map((h, i) => (
@@ -384,7 +440,30 @@ export default function PVM() {
                     const effColor = (v) => v > 0 ? 'var(--green)' : v < 0 ? 'var(--red)' : 'var(--muted)';
                     return (
                       <tr key={m.key} style={{ borderTop: '1px solid var(--border)' }}>
-                        <td style={{ padding: '9px 10px', maxWidth: 260, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={m.label}>{m.label}</td>
+                        <td style={{ padding: showProduct ? '8px 10px' : '9px 10px', maxWidth: 300, overflow: 'hidden' }}>
+                          {showProduct ? (
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                              <ProductImage
+                                imageUrl={m.image_url} asin={m.asin} sku={m.sku}
+                                onEnter={e => {
+                                  const r = e.currentTarget.getBoundingClientRect();
+                                  setHoverTip({ text: m.product_name || m.sku || m.label, top: r.bottom + 6, left: r.left });
+                                }}
+                                onLeave={() => setHoverTip(null)}
+                              />
+                              <div style={{ minWidth: 0, overflow: 'hidden' }}>
+                                <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.sku || '—'}</div>
+                                <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {m.asin || '—'}{level === 'sku_country' && m.country ? ` · ${countryFlag(m.country)} ${m.country}` : ''}
+                                </div>
+                              </div>
+                            </div>
+                          ) : (
+                            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }} title={m.label}>
+                              {level === 'country' ? `${countryFlag(m.key)} ${m.label}` : m.label}
+                            </span>
+                          )}
+                        </td>
                         {cell(fmtNum(m.s1_units))}
                         {cell(fmtMoney2(m.s1_price, sym), 'var(--muted)')}
                         {cell(fmtMoney(m.s1_value, sym))}
@@ -419,13 +498,17 @@ export default function PVM() {
               </table>
             </div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--muted)' }}>
-              Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
-              priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
-              mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
+              Each row's Volume is priced against ITS OWN blended {unitLabel} — never a company-wide
+              average — so a row's mix reflects only genuine structure inside it (e.g. a shifting country
+              split within an ASIN), not some unrelated product's price level. That also means Price/Volume/Mix
+              here are level-dependent by design: switching level or narrowing a filter changes what's being
+              blended together. Only at the SKU × Country level, where nothing is left to mix across, is a
+              row's own mix necessarily zero. Rows always sum exactly to the Total.
             </div>
           </div>
         </>
       )}
+      <HoverTooltip tip={hoverTip} />
     </div>
   );
 }
