@@ -39,11 +39,19 @@ function ProductImage({ imageUrl, asin, sku, onEnter, onLeave }) {
   );
 }
 
-// Flag emoji from a 2-letter ISO country code (regional indicator symbols) — no image
-// asset needed. shipping_country is already stored as alpha-2 throughout this dashboard.
-function countryFlag(code) {
-  if (!code || code.length !== 2) return '';
-  return String.fromCodePoint(...[...code.toUpperCase()].map(c => 127397 + c.charCodeAt(0)));
+// Unicode regional-indicator flag emoji render inconsistently across platforms — Windows
+// in particular falls back to a plain two-letter pill instead of the pictographic flag.
+// Same flagcdn.com image approach WorldMap.js already uses for the same reason, so
+// flags render identically everywhere regardless of the viewer's OS/font support.
+function CountryFlag({ code }) {
+  if (!code || code.length !== 2) return null;
+  return (
+    <img
+      src={`https://flagcdn.com/20x15/${code.toLowerCase()}.png`} alt={code}
+      style={{ width: 16, height: 12, borderRadius: 2, objectFit: 'cover', verticalAlign: 'middle', marginRight: 6 }}
+      onError={e => { e.target.style.display = 'none'; }}
+    />
+  );
 }
 
 // ─── Period presets ────────────────────────────────────────────────────────
@@ -116,15 +124,10 @@ const PRESETS = [
   })),
 ];
 
-// Each level prices its own Volume term against ITS OWN blended price₁ (not one global
-// reference), so Price/Volume/Mix are level-dependent by design — an ASIN pools its
-// countries together and shows their mix; sku_country pins both dimensions, leaving no
-// mix possible, so a row's own mix is guaranteed exactly zero only there.
 const LEVELS = [
   { id: 'country', label: 'Country' },
   { id: 'brand', label: 'Brand' },
   { id: 'asin', label: 'ASIN' },
-  { id: 'sku_country', label: 'SKU × Country' },
 ];
 
 // ─── Formatting ────────────────────────────────────────────────────────────
@@ -189,7 +192,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total' },
     { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price },
-    { label: 'Volume', sub: 'Δvol × own-group price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume },
+    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume },
     { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total' },
   ];
@@ -285,10 +288,23 @@ export default function PVM() {
   const metricLabel = metric === 'margin' ? 'Gross Profit' : 'Net Revenue';
   const unitLabel = metric === 'margin' ? 'margin/unit' : 'price/unit';
 
-  const members = data?.members || [];
+  const rawMembers = data?.members || [];
   const opts = data?.options || { countries: [], brands: [], asins: [] };
   const [hoverTip, setHoverTip] = useState(null);
-  const showProduct = level === 'asin' || level === 'sku_country';
+  const showProduct = level === 'asin';
+
+  // null = the server's own order (largest absolute movement first). Once a column is
+  // clicked, sort by its raw signed value instead — a plain numeric sort is what a click
+  // on "Price"/"Volume"/"Mix"/"Δ Total" actually implies, not another abs-magnitude sort.
+  const [sort, setSort] = useState({ key: null, dir: 'desc' });
+  const toggleSort = (key) => {
+    setSort(prev => prev.key === key ? { key, dir: prev.dir === 'desc' ? 'asc' : 'desc' } : { key, dir: 'desc' });
+  };
+  const members = useMemo(() => {
+    if (!sort.key) return rawMembers;
+    const mult = sort.dir === 'asc' ? 1 : -1;
+    return [...rawMembers].sort((a, b) => (parseFloat(a[sort.key] || 0) - parseFloat(b[sort.key] || 0)) * mult);
+  }, [rawMembers, sort]);
 
   return (
     <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 16 : 22 }}>
@@ -413,19 +429,40 @@ export default function PVM() {
             <div style={{ padding: '14px 16px', borderBottom: '1px solid var(--border)', fontSize: 13, fontWeight: 600 }}>
               By {LEVELS.find(l => l.id === level)?.label}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
-                {members.length} {members.length === 1 ? 'row' : 'rows'}, largest movement first
+                {members.length} {members.length === 1 ? 'row' : 'rows'}
+                {sort.key ? ` — sorted by ${sort.key.replace('_', ' ')} (${sort.dir === 'asc' ? 'low→high' : 'high→low'})` : ', largest movement first'}
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
               <table style={{ width: '100%', minWidth: showProduct ? 940 : 860, borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
-                    {['', 'S1 Units', `S1 ${unitLabel}`, 'S1 Value', 'S2 Units', `S2 ${unitLabel}`, 'S2 Value', 'Price', 'Volume', 'Mix', 'Δ Total'].map((h, i) => (
-                      <th key={i} style={{
-                        padding: '10px 10px', textAlign: i === 0 ? 'left' : 'right',
-                        fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase',
-                        color: 'var(--muted)', whiteSpace: 'nowrap',
-                      }}>{h}</th>
+                    {[
+                      { label: '' },
+                      { label: 'S1 Units', key: 's1_units' },
+                      { label: `S1 ${unitLabel}`, key: 's1_price' },
+                      { label: 'S1 Value', key: 's1_value' },
+                      { label: 'S2 Units', key: 's2_units' },
+                      { label: `S2 ${unitLabel}`, key: 's2_price' },
+                      { label: 'S2 Value', key: 's2_value' },
+                      { label: 'Price', key: 'price' },
+                      { label: 'Volume', key: 'volume' },
+                      { label: 'Mix', key: 'mix' },
+                      { label: 'Δ Total', key: 'delta' },
+                    ].map((h, i) => (
+                      <th
+                        key={i}
+                        onClick={h.key ? () => toggleSort(h.key) : undefined}
+                        style={{
+                          padding: '10px 10px', textAlign: i === 0 ? 'left' : 'right',
+                          fontSize: 10, fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase',
+                          color: sort.key === h.key ? 'var(--accent2)' : 'var(--muted)', whiteSpace: 'nowrap',
+                          cursor: h.key ? 'pointer' : 'default', userSelect: 'none',
+                        }}
+                      >
+                        {h.label}
+                        {h.key && <span style={{ marginLeft: 4, opacity: sort.key === h.key ? 1 : 0.25 }}>{sort.key === h.key && sort.dir === 'asc' ? '▲' : '▼'}</span>}
+                      </th>
                     ))}
                   </tr>
                 </thead>
@@ -454,13 +491,13 @@ export default function PVM() {
                               <div style={{ minWidth: 0, overflow: 'hidden' }}>
                                 <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.sku || '—'}</div>
                                 <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {m.asin || '—'}{level === 'sku_country' && m.country ? ` · ${countryFlag(m.country)} ${m.country}` : ''}
+                                  {m.asin || '—'}
                                 </div>
                               </div>
                             </div>
                           ) : (
                             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', display: 'block' }} title={m.label}>
-                              {level === 'country' ? `${countryFlag(m.key)} ${m.label}` : m.label}
+                              {level === 'country' && <CountryFlag code={m.key} />}{m.label}
                             </span>
                           )}
                         </td>
@@ -498,12 +535,9 @@ export default function PVM() {
               </table>
             </div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--muted)' }}>
-              Each row's Volume is priced against ITS OWN blended {unitLabel} — never a company-wide
-              average — so a row's mix reflects only genuine structure inside it (e.g. a shifting country
-              split within an ASIN), not some unrelated product's price level. That also means Price/Volume/Mix
-              here are level-dependent by design: switching level or narrowing a filter changes what's being
-              blended together. Only at the SKU × Country level, where nothing is left to mix across, is a
-              row's own mix necessarily zero. Rows always sum exactly to the Total.
+              Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
+              priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
+              mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
             </div>
           </div>
         </>
