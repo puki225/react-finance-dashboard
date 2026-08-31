@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import SalesSummary from './pages/SalesSummary';
 import ProductBreakdown from './pages/ProductBreakdown';
 import PnL from './pages/PnL';
+import PVM from './pages/PVM';
 import Inventory from './pages/Inventory';
 import CashFlow from './pages/CashFlow';
 import Settings from './pages/Settings';
@@ -11,7 +12,7 @@ const NAV = [
   { id: 'sales',     label: 'Sales Summary',      icon: '◈', active: true },
   { id: 'products',  label: 'Product Breakdown',   icon: '◉', active: true },
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
-  { id: 'pvm',       label: 'PVM',                 icon: '◐', active: false },
+  { id: 'pvm',       label: 'PVM',                 icon: '◐', active: true },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
   { id: 'cashrecon', label: 'Cash Reconciliation',  icon: '◒', active: true },
   { id: 'cashflow',  label: 'Cash Flow',            icon: '◔', active: false },
@@ -148,7 +149,7 @@ export default function App() {
         {active === 'sales'     && <SalesSummary />}
         {active === 'products'  && <ProductBreakdown />}
         {active === 'pnl'       && <PnL />}
-        {active === 'pvm'       && <Placeholder label="PVM Analysis" />}
+        {active === 'pvm'       && <PVM />}
         {active === 'inventory' && <Inventory />}
         {active === 'cashrecon' && <CashFlow />}
         {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
