@@ -3822,17 +3822,20 @@ app.get('/api/cash-reconciliation', async (req, res) => {
 async function pvmBaseRows(dateFrom, dateTo, channel) {
   // Itemised per-unit COGS, converted to GBP at the order-date rate. Same expression
   // used by /api/product-breakdown — kept identical so margins agree across pages.
-  const cogsExpr = `(
+  // Split into a "standard" bucket (base unit cost + demurrage/quality/other, which are
+  // rare and not worth their own PVM driver) and freight, since the margin-rate bridge
+  // decomposes Std COGS and Freight as separate drivers.
+  const cogsStdExpr = `(
     COALESCE(
       NULLIF(ce.cogs_standard, 0), NULLIF(sp.cogs_standard, 0),
       CASE WHEN COALESCE(ce.cogs_standard,0)+COALESCE(ce.cogs_freight,0)+COALESCE(ce.cogs_demurrage,0)+COALESCE(ce.cogs_quality,0)+COALESCE(ce.cogs_other,0) = 0
         AND COALESCE(sp.cogs_standard,0)+COALESCE(sp.cogs_freight,0)+COALESCE(sp.cogs_demurrage,0)+COALESCE(sp.cogs_quality,0)+COALESCE(sp.cogs_other,0) = 0
         THEN COALESCE(ce.unit_cogs, sp.unit_cogs, 0) ELSE 0 END, 0)
-    + COALESCE(NULLIF(ce.cogs_freight,   0), NULLIF(sp.cogs_freight,   0), 0)
     + COALESCE(NULLIF(ce.cogs_demurrage, 0), NULLIF(sp.cogs_demurrage, 0), 0)
     + COALESCE(NULLIF(ce.cogs_quality,   0), NULLIF(sp.cogs_quality,   0), 0)
     + COALESCE(NULLIF(ce.cogs_other,     0), NULLIF(sp.cogs_other,     0), 0)
   )`;
+  const cogsFreightExpr = `COALESCE(NULLIF(ce.cogs_freight, 0), NULLIF(sp.cogs_freight, 0), 0)`;
   const cogsLateral = (dateCol) => `
     LEFT JOIN LATERAL (
       SELECT
@@ -3869,11 +3872,15 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
         SUM(aol.quantity)::int AS units,
         SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0))
              - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric AS net_before_refunds,
-        SUM((COALESCE(aol.fee_fba_fulfillment, 0) + COALESCE(aol.fee_commission, 0) +
+        -- Amazon "listing" fees (referral/commission + closing fees) kept separate from
+        -- FBA fulfillment, since the margin-rate bridge decomposes them as separate drivers.
+        SUM((COALESCE(aol.fee_commission, 0) +
              COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
              COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0) +
-             COALESCE(aol.fee_shipping_chargeback, 0)) / vat_divisor_seller())::numeric AS fees,
-        SUM(aol.quantity * ${cogsExpr})::numeric AS cogs
+             COALESCE(aol.fee_shipping_chargeback, 0)) / vat_divisor_seller())::numeric AS fee_amz,
+        SUM(COALESCE(aol.fee_fba_fulfillment, 0) / vat_divisor_seller())::numeric AS fee_fba,
+        SUM(aol.quantity * ${cogsStdExpr})::numeric AS cogs_std,
+        SUM(aol.quantity * ${cogsFreightExpr})::numeric AS cogs_freight
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
@@ -3909,8 +3916,10 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
         MAX(sol.product_title) AS product_title,
         SUM(sol.quantity)::int AS units,
         SUM(((sol.unit_price - COALESCE(sol.discount_per_unit,0)) * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS net_before_refunds,
-        0::numeric AS fees,
-        SUM(sol.quantity * ${cogsExpr})::numeric AS cogs
+        0::numeric AS fee_amz,
+        0::numeric AS fee_fba,
+        SUM(sol.quantity * ${cogsStdExpr})::numeric AS cogs_std,
+        SUM(sol.quantity * ${cogsFreightExpr})::numeric AS cogs_freight
       FROM shopify_order_lines sol
       LEFT JOIN shopify_orders so ON so.shopify_order_id = sol.shopify_order_id
       LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
@@ -3942,8 +3951,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
   if (channel !== 'shopify') parts.push(amazonSql);
   if (channel !== 'amazon') parts.push(shopifySql);
   const salesUnion = [
-    channel !== 'shopify' ? 'SELECT country, sku, product_title, units, net_before_refunds, fees, cogs FROM amazon_sales' : null,
-    channel !== 'amazon' ? 'SELECT country, sku, product_title, units, net_before_refunds, fees, cogs FROM shopify_sales' : null,
+    channel !== 'shopify' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM amazon_sales' : null,
+    channel !== 'amazon' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM shopify_sales' : null,
   ].filter(Boolean).join(' UNION ALL ');
   const refundUnion = [
     channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
@@ -3955,7 +3964,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
     sales AS (
       SELECT country, sku, MAX(product_title) AS product_title, SUM(units)::int AS units,
              SUM(net_before_refunds)::numeric AS net_before_refunds,
-             SUM(fees)::numeric AS fees, SUM(cogs)::numeric AS cogs
+             SUM(fee_amz)::numeric AS fee_amz, SUM(fee_fba)::numeric AS fee_fba,
+             SUM(cogs_std)::numeric AS cogs_std, SUM(cogs_freight)::numeric AS cogs_freight
       FROM (${salesUnion}) s GROUP BY 1, 2
     ),
     refunds AS (
@@ -3974,8 +3984,14 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       COALESCE(s.units, 0)::int AS units,
       -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
       (COALESCE(s.net_before_refunds, 0) - COALESCE(r.refunded, 0))::numeric AS net_revenue,
-      COALESCE(s.cogs, 0)::numeric AS cogs,
-      (COALESCE(s.fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fees
+      COALESCE(s.cogs_std, 0)::numeric AS cogs_std,
+      COALESCE(s.cogs_freight, 0)::numeric AS cogs_freight,
+      (COALESCE(s.cogs_std, 0) + COALESCE(s.cogs_freight, 0))::numeric AS cogs,
+      -- Commission refunds (and the admin fee refunds charge on top) are Amazon-fee
+      -- adjustments, so they net against fee_amz; FBA fulfillment fees aren't refunded.
+      (COALESCE(s.fee_amz, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fee_amz,
+      COALESCE(s.fee_fba, 0)::numeric AS fee_fba,
+      (COALESCE(s.fee_amz, 0) + COALESCE(s.fee_fba, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fees
     FROM sales s
     FULL OUTER JOIN refunds r ON r.country = s.country AND r.sku = s.sku
     LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, r.sku)
@@ -4046,6 +4062,13 @@ app.get('/api/pvm', async (req, res) => {
     // bridge below needs both revenue AND profit per member regardless of which one the
     // £ bridge above happens to be showing, since a margin RATE is profit ÷ revenue.
     const revenueOf = (r, fx) => parseFloat(r.net_revenue || 0) * fx;
+    // Granular cost drivers, tracked unconditionally alongside revenue — only consumed
+    // by the margin-rate sub-bridge below (Price/Std COGS/Freight/Amazon fees/FBA fees),
+    // but cheap enough to accumulate regardless of metric/marginView.
+    const cogsStdOf     = (r, fx) => parseFloat(r.cogs_std || 0) * fx;
+    const cogsFreightOf = (r, fx) => parseFloat(r.cogs_freight || 0) * fx;
+    const feeAmzOf       = (r, fx) => parseFloat(r.fee_amz || 0) * fx;
+    const feeFbaOf       = (r, fx) => parseFloat(r.fee_fba || 0) * fx;
 
     const accumulate = (rows, fx) => {
       const acc = new Map();
@@ -4059,12 +4082,17 @@ app.get('/api/pvm', async (req, res) => {
           acc.set(key, {
             key, label: labelOf(r), asin: r.asin, sku: r.sku,
             product_name: r.product_name, image_url: r.image_url, value: 0, units: 0, revenue: 0,
+            cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0,
           });
         }
         const m = acc.get(key);
         m.value += valueOf(r, fx);
         m.units += parseInt(r.units || 0, 10);
         m.revenue += revenueOf(r, fx);
+        m.cogs_std += cogsStdOf(r, fx);
+        m.cogs_freight += cogsFreightOf(r, fx);
+        m.fee_amz += feeAmzOf(r, fx);
+        m.fee_fba += feeFbaOf(r, fx);
       }
       return acc;
     };
@@ -4144,8 +4172,8 @@ app.get('/api/pvm', async (req, res) => {
 
       const pctByKey = new Map();
       for (const key of memberKeys) {
-        const a = acc1.get(key) || { value: 0, revenue: 0 };
-        const b = acc2.get(key) || { value: 0, revenue: 0 };
+        const a = acc1.get(key) || { value: 0, revenue: 0, units: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
+        const b = acc2.get(key) || { value: 0, revenue: 0, units: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
         const rev1 = a.revenue, rev2 = b.revenue;
         const rate1 = rev1 !== 0 ? (a.value / rev1) * 100 : 0;
         const rate2 = rev2 !== 0 ? (b.value / rev2) * 100 : 0;
@@ -4154,9 +4182,48 @@ app.get('/api/pvm', async (req, res) => {
         const deltaContribution = (w2 * rate2) - (w1 * rate1);
         const bothPresent = rev1 !== 0 && rev2 !== 0;
         const rateEffect = bothPresent ? w1 * (rate2 - rate1) : 0;
+
+        // ─── Rate driver breakdown: Price / Std COGS / Freight / Amazon fees / FBA fees ──
+        // Walks rate1 → rate2 one driver at a time (price first, then each cost bucket),
+        // each step re-pricing against price2 once price has moved — a sequential/
+        // waterfall attribution (same convention as the £ Price/Volume/Mix bridge, which
+        // is also order-dependent). Because each step is "previous rate + this driver's
+        // move, nothing else", the five deltas telescope exactly to (rate2 − rate1); no
+        // residual is left over for Mix to silently absorb. Needs a per-unit price, so
+        // members present in only one scenario (bothPresent false, same guard as
+        // rateEffect above) get all-zero drivers — their whole rate delta already isn't
+        // in Rate, it's in Mix, exactly as before this breakdown was added.
+        let priceDriver = 0, cogsDriver = 0, freightDriver = 0, amzFeeDriver = 0, fbaFeeDriver = 0;
+        if (bothPresent && a.units > 0 && b.units > 0) {
+          const price1 = a.revenue / a.units, price2 = b.revenue / b.units;
+          const c1_1 = a.cogs_std / a.units,     c1_2 = b.cogs_std / b.units;
+          const c2_1 = a.cogs_freight / a.units, c2_2 = b.cogs_freight / b.units;
+          const c3_1 = a.fee_amz / a.units,      c3_2 = b.fee_amz / b.units;
+          const c4_1 = a.fee_fba / a.units,      c4_2 = b.fee_fba / b.units;
+          const rateAt = (price, c1, c2, c3, c4) => (price - c1 - c2 - c3 - c4) / price * 100;
+
+          const r0 = rateAt(price1, c1_1, c2_1, c3_1, c4_1); // = rate1
+          const r1 = rateAt(price2, c1_1, c2_1, c3_1, c4_1);
+          const r2 = rateAt(price2, c1_2, c2_1, c3_1, c4_1);
+          const r3 = rateAt(price2, c1_2, c2_2, c3_1, c4_1);
+          const r4 = rateAt(price2, c1_2, c2_2, c3_2, c4_1);
+          const r5 = rateAt(price2, c1_2, c2_2, c3_2, c4_2); // = rate2
+
+          priceDriver   = w1 * (r1 - r0);
+          cogsDriver    = w1 * (r2 - r1);
+          freightDriver = w1 * (r3 - r2);
+          amzFeeDriver  = w1 * (r4 - r3);
+          fbaFeeDriver  = w1 * (r5 - r4);
+        }
+
         pctByKey.set(key, {
           s1_margin_pct: rate1, s2_margin_pct: rate2,
           rate_effect: rateEffect,
+          price_effect: priceDriver,
+          cogs_effect: cogsDriver,
+          freight_effect: freightDriver,
+          amz_fee_effect: amzFeeDriver,
+          fba_fee_effect: fbaFeeDriver,
           mix_effect_pct: deltaContribution - rateEffect,
           delta_pct: deltaContribution,
         });
@@ -4173,6 +4240,12 @@ app.get('/api/pvm', async (req, res) => {
         scenario1_pct: s1MarginPct,
         scenario2_pct: s2MarginPct,
         rate_effect: pctRateEffect,
+        // Sub-drivers of rate_effect — sum to it exactly (see per-member comment above).
+        price_effect: sum(members, m => m.price_effect),
+        cogs_effect: sum(members, m => m.cogs_effect),
+        freight_effect: sum(members, m => m.freight_effect),
+        amz_fee_effect: sum(members, m => m.amz_fee_effect),
+        fba_fee_effect: sum(members, m => m.fba_fee_effect),
         mix_effect: pctMixEffect,
         total_delta_pct: totalPctDelta,
       };
