@@ -3862,6 +3862,10 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       SELECT
         COALESCE(ao.shipping_country, 'Unknown') AS country,
         aol.sku,
+        -- sku_parameters.product_name is never populated on this account (see other
+        -- COALESCE(sp.product_name, aol.title, ...) call sites) — the Amazon listing
+        -- title from the order line itself is the only real source of a display name.
+        MAX(aol.title) AS product_title,
         SUM(aol.quantity)::int AS units,
         SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0))
              - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric AS net_before_refunds,
@@ -3902,6 +3906,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       SELECT
         COALESCE(so.shipping_country, 'Unknown') AS country,
         sol.sku,
+        MAX(sol.product_title) AS product_title,
         SUM(sol.quantity)::int AS units,
         SUM(((sol.unit_price - COALESCE(sol.discount_per_unit,0)) * sol.quantity) / vat_divisor(so.shipping_country))::numeric AS net_before_refunds,
         0::numeric AS fees,
@@ -3937,8 +3942,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
   if (channel !== 'shopify') parts.push(amazonSql);
   if (channel !== 'amazon') parts.push(shopifySql);
   const salesUnion = [
-    channel !== 'shopify' ? 'SELECT country, sku, units, net_before_refunds, fees, cogs FROM amazon_sales' : null,
-    channel !== 'amazon' ? 'SELECT country, sku, units, net_before_refunds, fees, cogs FROM shopify_sales' : null,
+    channel !== 'shopify' ? 'SELECT country, sku, product_title, units, net_before_refunds, fees, cogs FROM amazon_sales' : null,
+    channel !== 'amazon' ? 'SELECT country, sku, product_title, units, net_before_refunds, fees, cogs FROM shopify_sales' : null,
   ].filter(Boolean).join(' UNION ALL ');
   const refundUnion = [
     channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
@@ -3948,7 +3953,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
   const result = await pool.query(`
     WITH ${parts.join(',\n')},
     sales AS (
-      SELECT country, sku, SUM(units)::int AS units, SUM(net_before_refunds)::numeric AS net_before_refunds,
+      SELECT country, sku, MAX(product_title) AS product_title, SUM(units)::int AS units,
+             SUM(net_before_refunds)::numeric AS net_before_refunds,
              SUM(fees)::numeric AS fees, SUM(cogs)::numeric AS cogs
       FROM (${salesUnion}) s GROUP BY 1, 2
     ),
@@ -3963,7 +3969,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       COALESCE(s.sku, r.sku) AS sku,
       sp.asin,
       sp.brand,
-      sp.product_name,
+      COALESCE(sp.product_name, s.product_title) AS product_name,
       sp.image_url,
       COALESCE(s.units, 0)::int AS units,
       -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
