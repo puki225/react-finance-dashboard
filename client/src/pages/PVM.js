@@ -144,6 +144,11 @@ const fmtSigned = (n, sym = '£') => {
   return (v < 0 ? '−' : '+') + sym + Math.abs(v).toLocaleString('en-GB', { minimumFractionDigits: 0, maximumFractionDigits: 0 });
 };
 const fmtNum = (n) => parseInt(n || 0, 10).toLocaleString('en-GB');
+const fmtPct = (n) => parseFloat(n || 0).toFixed(2) + '%';
+const fmtSignedPct = (n) => {
+  const v = parseFloat(n || 0);
+  return (v < 0 ? '−' : '+') + Math.abs(v).toFixed(2) + 'pp';
+};
 
 const subTab = (active) => ({
   padding: '8px 20px', borderRadius: 8, fontSize: 13, fontWeight: 600,
@@ -173,31 +178,48 @@ const selectStyle = {
   cursor: 'pointer', minWidth: 130,
 };
 
-// ─── Waterfall ─────────────────────────────────────────────────────────────
-// Five columns: scenario 1 baseline, the three effects as floating bars, then
-// scenario 2. Bars are positioned against a shared scale that always includes 0 so
-// a negative effect reads as genuinely below the axis rather than just shorter.
-function Waterfall({ bridge, s1, s2, sym, isMobile }) {
+// ─── Growth arrow ──────────────────────────────────────────────────────────
+// Spans from Scenario 1's column-center to Scenario 2's — for an N-column bar row
+// that's always the [1/(2N), 1 − 1/(2N)] fraction of the row width; N is 5 for the
+// £ bridge (Scenario1/Price/Volume/Mix/Scenario2) and 4 for the % bridge (no
+// separate Price/Volume split, since a ratio has no independent "volume" term).
+function GrowthArrow({ text, color, isMobile, columns }) {
+  const inset = `${100 / (columns * 2)}%`;
+  return (
+    <div style={{ position: 'relative', height: isMobile ? 24 : 30, marginBottom: 4 }}>
+      <div style={{ position: 'absolute', left: inset, right: inset, top: '50%', borderTop: `2px solid ${color}` }} />
+      <div style={{
+        position: 'absolute', right: inset, top: '50%', transform: 'translate(50%, -50%)',
+        width: 0, height: 0, borderTop: '5px solid transparent', borderBottom: '5px solid transparent',
+        borderLeft: `7px solid ${color}`,
+      }} />
+      <div style={{
+        position: 'absolute', left: '50%', top: 0, transform: 'translateX(-50%)',
+        background: 'var(--bg2)', padding: '0 10px', fontSize: isMobile ? 11 : 13, fontWeight: 700,
+        color, fontFamily: 'var(--mono)', whiteSpace: 'nowrap',
+      }}>
+        {text}
+      </div>
+    </div>
+  );
+}
+
+// ─── Bridge chart engine ───────────────────────────────────────────────────
+// Shared bar-rendering for both the £ bridge (5 columns: Scenario1/Price/Volume/
+// Mix/Scenario2) and the margin-% bridge (4 columns: Scenario1/Rate/Mix/Scenario2)
+// — a bar is just {label, sub, start, end, kind: 'total'|'effect', value, display}
+// with `display` pre-formatted by the caller, so this component has no £-or-%
+// specific logic at all. Bars are positioned against a shared scale that always
+// includes 0 so a negative effect reads as genuinely below the axis, not just shorter.
+function BridgeChart({ bars, isMobile }) {
   const H = isMobile ? 220 : 300;
   // Reserved space below the bar canvas purely for a value label that lands there — a bar
   // reaching (near) the container's own top has nowhere "above" to put its label, so it
   // always renders below instead; without a dedicated gap that label sits right at H and
   // collides with the bar's own name/subtitle immediately underneath it.
   const LABEL_GAP = 26;
-  const c1 = s1.value;
-  const c2 = c1 + bridge.price;
-  const c3 = c2 + bridge.volume;
-  const c4 = c3 + bridge.mix; // == s2.value, bar the balancing rounding
 
-  const bars = [
-    { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total' },
-    { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price },
-    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume },
-    { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix },
-    { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total' },
-  ];
-
-  const pts = [0, c1, c2, c3, c4, s2.value];
+  const pts = [0, ...bars.flatMap(b => [b.start, b.end])];
   const yMax = Math.max(...pts);
   const yMin = Math.min(...pts);
   const span = (yMax - yMin) || 1;
@@ -210,7 +232,6 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
         const height = Math.max(Math.abs(y(b.end) - y(b.start)), 2);
         const positive = b.kind === 'total' ? true : (b.value || 0) >= 0;
         const color = b.kind === 'total' ? 'var(--accent2)' : positive ? 'var(--green)' : 'var(--red)';
-        const displayValue = b.kind === 'total' ? fmtMoney(b.end, sym) : fmtSigned(b.value, sym);
         // Labels sit above the bar, or below it when the bar reaches the very top.
         const labelAbove = top > 22;
         return (
@@ -226,7 +247,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
                 top: labelAbove ? top - 20 : top + height + 4,
                 fontSize: isMobile ? 10 : 12, fontWeight: 700, color,
                 fontFamily: 'var(--mono)', whiteSpace: 'nowrap',
-              }}>{displayValue}</div>
+              }}>{b.display}</div>
               {/* Zero axis, only drawn when the scale actually crosses it */}
               {yMin < 0 && yMax > 0 && (
                 <div style={{ position: 'absolute', top: y(0), left: 0, right: 0, borderTop: '1px dashed var(--border)' }} />
@@ -239,6 +260,63 @@ function Waterfall({ bridge, s1, s2, sym, isMobile }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+// ─── £ bridge (Price / Volume / Mix) ───────────────────────────────────────
+function Waterfall({ bridge, s1, s2, sym, isMobile }) {
+  const c1 = s1.value;
+  const c2 = c1 + bridge.price;
+  const c3 = c2 + bridge.volume;
+  const c4 = c3 + bridge.mix; // == s2.value, bar the balancing rounding
+
+  const bars = [
+    { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtMoney(c1, sym) },
+    { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price, display: fmtSigned(bridge.price, sym) },
+    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume, display: fmtSigned(bridge.volume, sym) },
+    { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix, display: fmtSigned(bridge.mix, sym) },
+    { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total', display: fmtMoney(s2.value, sym) },
+  ];
+
+  const totalDelta = s2.value - s1.value;
+  const pct = s1.value !== 0 ? (totalDelta / Math.abs(s1.value)) * 100 : null;
+  const growthPositive = totalDelta >= 0;
+  const growthText = `${fmtSigned(totalDelta, sym)}${pct !== null ? ` (${growthPositive ? '+' : ''}${pct.toFixed(1)}%)` : ''}`;
+
+  return (
+    <div>
+      <GrowthArrow text={growthText} color={growthPositive ? 'var(--green)' : 'var(--red)'} isMobile={isMobile} columns={bars.length} />
+      <BridgeChart bars={bars} isMobile={isMobile} />
+    </div>
+  );
+}
+
+// ─── Margin-rate (%) bridge — Rate / Mix, no Volume term ───────────────────
+// A margin RATE (profit ÷ revenue) is a ratio, not an additive £ amount, so unlike
+// the £ bridge there is no independent "volume" effect — scaling volume uniformly
+// doesn't move a ratio at all. See the server's /api/pvm margin_pct_bridge comment
+// for the full derivation of the two terms this decomposes into instead.
+function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
+  const c1 = pctBridge.scenario1_pct;
+  const c2 = c1 + pctBridge.rate_effect;
+  const c3 = c2 + pctBridge.mix_effect; // == scenario2_pct, bar the balancing rounding
+
+  const bars = [
+    { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtPct(c1) },
+    { label: 'Rate', sub: 'Δmember rate × S1 revenue share', start: c1, end: c2, kind: 'effect', value: pctBridge.rate_effect, display: fmtSignedPct(pctBridge.rate_effect) },
+    { label: 'Mix', sub: 'balancing figure', start: c2, end: c3, kind: 'effect', value: pctBridge.mix_effect, display: fmtSignedPct(pctBridge.mix_effect) },
+    { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: pctBridge.scenario2_pct, kind: 'total', display: fmtPct(pctBridge.scenario2_pct) },
+  ];
+
+  const totalDelta = pctBridge.total_delta_pct;
+  const growthPositive = totalDelta >= 0;
+  const growthText = `${growthPositive ? '+' : ''}${totalDelta.toFixed(2)}pp`;
+
+  return (
+    <div>
+      <GrowthArrow text={growthText} color={growthPositive ? 'var(--green)' : 'var(--red)'} isMobile={isMobile} columns={bars.length} />
+      <BridgeChart bars={bars} isMobile={isMobile} />
     </div>
   );
 }
@@ -256,6 +334,10 @@ function StatCard({ label, value, sub, accent }) {
 export default function PVM() {
   const isMobile = useIsMobile();
   const [metric, setMetric] = useState(() => localStorage.getItem('gb_pvm_metric') || 'revenue');
+  // Only meaningful in Margin mode — 'currency' is the existing £ Price/Volume/Mix
+  // bridge, 'percent' is the margin RATE (ppt) bridge. Revenue mode has no % analogue
+  // (revenue ÷ revenue is trivially 100%), so this is simply ignored outside Margin.
+  const [marginView, setMarginView] = useState('currency');
   const [level, setLevel] = useState(() => localStorage.getItem('gb_pvm_level') || 'asin');
   const [presetId, setPresetId] = useState('lq');
   const [periods, setPeriods] = useState(() => PRESETS[0].build());
@@ -292,6 +374,7 @@ export default function PVM() {
   const opts = data?.options || { countries: [], brands: [], asins: [] };
   const [hoverTip, setHoverTip] = useState(null);
   const showProduct = level === 'asin';
+  const showPct = metric === 'margin' && marginView === 'percent';
 
   // null = the server's own order (largest absolute movement first). Once a column is
   // clicked, sort by its raw signed value instead — a plain numeric sort is what a click
@@ -318,9 +401,15 @@ export default function PVM() {
       </div>
 
       {/* Subheaders — Revenue | Margin */}
-      <div style={{ display: 'flex', gap: 8, borderBottom: '1px solid var(--border)', paddingBottom: 14 }}>
+      <div style={{ display: 'flex', gap: 8, borderBottom: '1px solid var(--border)', paddingBottom: 14, alignItems: 'center', flexWrap: 'wrap' }}>
         <button style={subTab(metric === 'revenue')} onClick={() => chooseMetric('revenue')}>Revenue</button>
         <button style={subTab(metric === 'margin')} onClick={() => chooseMetric('margin')}>Margin</button>
+        {metric === 'margin' && (
+          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4, marginLeft: 8 }}>
+            <button style={chip(marginView === 'currency')} onClick={() => { setMarginView('currency'); setSort({ key: null, dir: 'desc' }); }} title="Gross Profit £ bridge">£</button>
+            <button style={chip(marginView === 'percent')} onClick={() => { setMarginView('percent'); setSort({ key: null, dir: 'desc' }); }} title="Margin rate (percentage-point) bridge">%</button>
+          </div>
+        )}
       </div>
 
       {/* Controls */}
@@ -396,32 +485,48 @@ export default function PVM() {
         <>
           {/* Summary stats */}
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            <StatCard
-              label={`S1 ${metricLabel}`} value={fmtMoney(data.scenario1.value, sym)}
-              sub={`${fmtNum(data.scenario1.units)} units · ${fmtMoney2(data.scenario1.avg_price, sym)} ${unitLabel}`}
-            />
-            <StatCard
-              label={`S2 ${metricLabel}`} value={fmtMoney(data.scenario2.value, sym)}
-              sub={`${fmtNum(data.scenario2.units)} units · ${fmtMoney2(data.scenario2.avg_price, sym)} ${unitLabel}`}
-            />
-            <StatCard
-              label="Total Δ" value={fmtSigned(data.bridge.total_delta, sym)}
-              accent={data.bridge.total_delta >= 0 ? 'var(--green)' : 'var(--red)'}
-              sub={data.scenario1.value !== 0
-                ? `${(data.bridge.total_delta / Math.abs(data.scenario1.value) * 100).toFixed(1)}% vs base`
-                : '—'}
-            />
+            {showPct ? (
+              <>
+                <StatCard label="S1 Margin %" value={fmtPct(data.margin_pct_bridge.scenario1_pct)} sub={`${data.scenario1.from} → ${data.scenario1.to}`} />
+                <StatCard label="S2 Margin %" value={fmtPct(data.margin_pct_bridge.scenario2_pct)} sub={`${data.scenario2.from} → ${data.scenario2.to}`} />
+                <StatCard
+                  label="Total Δ" value={fmtSignedPct(data.margin_pct_bridge.total_delta_pct)}
+                  accent={data.margin_pct_bridge.total_delta_pct >= 0 ? 'var(--green)' : 'var(--red)'}
+                  sub="percentage points"
+                />
+              </>
+            ) : (
+              <>
+                <StatCard
+                  label={`S1 ${metricLabel}`} value={fmtMoney(data.scenario1.value, sym)}
+                  sub={`${fmtNum(data.scenario1.units)} units · ${fmtMoney2(data.scenario1.avg_price, sym)} ${unitLabel}`}
+                />
+                <StatCard
+                  label={`S2 ${metricLabel}`} value={fmtMoney(data.scenario2.value, sym)}
+                  sub={`${fmtNum(data.scenario2.units)} units · ${fmtMoney2(data.scenario2.avg_price, sym)} ${unitLabel}`}
+                />
+                <StatCard
+                  label="Total Δ" value={fmtSigned(data.bridge.total_delta, sym)}
+                  accent={data.bridge.total_delta >= 0 ? 'var(--green)' : 'var(--red)'}
+                  sub={data.scenario1.value !== 0
+                    ? `${(data.bridge.total_delta / Math.abs(data.scenario1.value) * 100).toFixed(1)}% vs base`
+                    : '—'}
+                />
+              </>
+            )}
           </div>
 
           {/* Bridge */}
           <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: isMobile ? '18px 12px' : '24px 28px' }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 20 }}>
-              {metricLabel} Bridge
+              {showPct ? 'Margin Rate Bridge' : `${metricLabel} Bridge`}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
-                — mix is the residual after price and volume
+                {showPct ? '— mix is the residual after rate' : '— mix is the residual after price and volume'}
               </span>
             </div>
-            <Waterfall bridge={data.bridge} s1={data.scenario1} s2={data.scenario2} sym={sym} isMobile={isMobile} />
+            {showPct
+              ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} />
+              : <Waterfall bridge={data.bridge} s1={data.scenario1} s2={data.scenario2} sym={sym} isMobile={isMobile} />}
           </div>
 
           {/* Breakdown table */}
@@ -430,14 +535,21 @@ export default function PVM() {
               By {LEVELS.find(l => l.id === level)?.label}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
                 {members.length} {members.length === 1 ? 'row' : 'rows'}
-                {sort.key ? ` — sorted by ${sort.key.replace('_', ' ')} (${sort.dir === 'asc' ? 'low→high' : 'high→low'})` : ', largest movement first'}
+                {sort.key ? ` — sorted by ${sort.key.replace(/_/g, ' ')} (${sort.dir === 'asc' ? 'low→high' : 'high→low'})` : ', largest movement first'}
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: showProduct ? 940 : 860, borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 640 : 940) : (showPct ? 560 : 860), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
-                    {[
+                    {(showPct ? [
+                      { label: '' },
+                      { label: 'S1 Margin %', key: 's1_margin_pct' },
+                      { label: 'S2 Margin %', key: 's2_margin_pct' },
+                      { label: 'Rate', key: 'rate_effect' },
+                      { label: 'Mix', key: 'mix_effect_pct' },
+                      { label: 'Δ Total', key: 'delta_pct' },
+                    ] : [
                       { label: '' },
                       { label: 'S1 Units', key: 's1_units' },
                       { label: `S1 ${unitLabel}`, key: 's1_price' },
@@ -449,7 +561,7 @@ export default function PVM() {
                       { label: 'Volume', key: 'volume' },
                       { label: 'Mix', key: 'mix' },
                       { label: 'Δ Total', key: 'delta' },
-                    ].map((h, i) => (
+                    ]).map((h, i) => (
                       <th
                         key={i}
                         onClick={h.key ? () => toggleSort(h.key) : undefined}
@@ -468,7 +580,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {members.length === 0 && (
-                    <tr><td colSpan={11} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={showPct ? 6 : 11} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {members.map(m => {
                     const cell = (v, color) => (
@@ -501,16 +613,28 @@ export default function PVM() {
                             </span>
                           )}
                         </td>
-                        {cell(fmtNum(m.s1_units))}
-                        {cell(fmtMoney2(m.s1_price, sym), 'var(--muted)')}
-                        {cell(fmtMoney(m.s1_value, sym))}
-                        {cell(fmtNum(m.s2_units))}
-                        {cell(fmtMoney2(m.s2_price, sym), 'var(--muted)')}
-                        {cell(fmtMoney(m.s2_value, sym))}
-                        {cell(fmtSigned(m.price, sym), effColor(m.price))}
-                        {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
-                        {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
-                        {cell(fmtSigned(m.delta, sym), effColor(m.delta))}
+                        {showPct ? (
+                          <>
+                            {cell(fmtPct(m.s1_margin_pct), 'var(--muted)')}
+                            {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
+                            {cell(fmtSignedPct(m.rate_effect), effColor(m.rate_effect))}
+                            {cell(fmtSignedPct(m.mix_effect_pct), effColor(m.mix_effect_pct))}
+                            {cell(fmtSignedPct(m.delta_pct), effColor(m.delta_pct))}
+                          </>
+                        ) : (
+                          <>
+                            {cell(fmtNum(m.s1_units))}
+                            {cell(fmtMoney2(m.s1_price, sym), 'var(--muted)')}
+                            {cell(fmtMoney(m.s1_value, sym))}
+                            {cell(fmtNum(m.s2_units))}
+                            {cell(fmtMoney2(m.s2_price, sym), 'var(--muted)')}
+                            {cell(fmtMoney(m.s2_value, sym))}
+                            {cell(fmtSigned(m.price, sym), effColor(m.price))}
+                            {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
+                            {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
+                            {cell(fmtSigned(m.delta, sym), effColor(m.delta))}
+                          </>
+                        )}
                       </tr>
                     );
                   })}
@@ -519,25 +643,44 @@ export default function PVM() {
                   <tfoot>
                     <tr style={{ borderTop: '2px solid var(--border)', background: 'var(--bg3)', fontWeight: 700 }}>
                       <td style={{ padding: '11px 10px' }}>Total</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario1.units)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario1.avg_price, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario1.value, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario2.units)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario2.avg_price, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario2.value, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
-                      <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSigned(data.bridge.total_delta, sym)}</td>
+                      {showPct ? (
+                        <>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario1_pct)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario2_pct)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.rate_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.mix_effect)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSignedPct(data.margin_pct_bridge.total_delta_pct)}</td>
+                        </>
+                      ) : (
+                        <>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario1.units)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario1.avg_price, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario1.value, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario2.units)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario2.avg_price, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario2.value, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSigned(data.bridge.total_delta, sym)}</td>
+                        </>
+                      )}
                     </tr>
                   </tfoot>
                 )}
               </table>
             </div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--muted)' }}>
-              Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
-              priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
-              mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
+              {showPct ? (
+                <>Rate is each row's own margin-rate change, weighted at its scenario-1 revenue share — it isolates
+                  "did this row itself get more/less profitable" from "did the revenue mix shift toward it." Mix is
+                  the residual, capturing that share shift. A row with revenue in only one scenario has no rate to
+                  compare, so its whole movement counts as Mix. Rows sum exactly to the Total.</>
+              ) : (
+                <>Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
+                  priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
+                  mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.</>
+              )}
             </div>
           </div>
         </>
