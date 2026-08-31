@@ -3787,19 +3787,32 @@ app.get('/api/cash-reconciliation', async (req, res) => {
 // Decomposes the change in Revenue or Margin between two scenario periods into
 // price, volume and mix effects.
 //
-//   Price  = Σ over members of (price2ₘ − price1ₘ) × volume2ₘ   ← per member
-//   Volume = (volume2 − volume1) × blendedPrice1                ← on the blend
-//   Mix    = totalDelta − Price − Volume                        (balancing figure)
+//   Price  = Σ over finest-grain members of (price2ₘ − price1ₘ) × volume2ₘ
+//   Volume = (volume2 − volume1) × the member's GROUP's own blended price1
+//   Mix    = groupDelta − groupPrice − groupVolume        (balancing figure)
 //
-// The two terms are deliberately evaluated at DIFFERENT granularities, and that is
-// the whole point. Evaluate both on the same blended average and the algebra
-// collapses — (avgP2−avgP1)V2 + (V2−V1)avgP1 == Value2 − Value1 identically — so
-// the residual would always be exactly zero and there would be no mix to report.
-// Pricing the volume term at the blended average instead leaves precisely the
-// cross-member effect behind: each member's mix works out to
-//   (volume2ₘ − volume1ₘ) × (price1ₘ − blendedPrice1)
-// i.e. growth in members priced above the blend lifts mix, growth in members below
-// it drags mix down. Members' price/volume/mix therefore sum exactly to the totals.
+// The finest grain the data has is (country, sku); "group" means whichever display
+// level is selected (country / brand / asin / sku_country). Price and Volume are
+// deliberately evaluated at different granularities within a group — evaluate both
+// on the same blended average and the algebra collapses identically to zero (see
+// git history for the derivation) — but critically, the reference price Volume uses
+// is the GROUP's OWN blend, not a single global one. This is what makes each group's
+// mix reflect only genuine structure inside it: an ASIN's mix reflects its own
+// country split and is never contaminated by some unrelated ASIN's price level the
+// way a single global reference would be (verified against a fixture where a portfolio
+// mate's unrelated price flipped both the sign and size of another ASIN's mix under a
+// global reference).
+//
+// A direct consequence: Price/Volume/Mix are level-dependent BY DESIGN, not a bug to
+// eliminate. "ASIN" (pooling every country together) surfaces the country-mix inside
+// each ASIN as mix; pin the country too (sku_country level, or filtering down to one
+// ASIN in one country) and there is no dimension left to mix across, so that group's
+// own mix is necessarily exactly zero — structurally, not by coincidence of filtering
+// (barring a SKU/country pairing that only exists in one scenario, which is priced
+// entirely as volume — there's no comparable price to move from). The headline bridge
+// card is the sum of whatever groups the table is currently showing, so it moves when
+// you change level or filters — it's reporting the price/volume/mix that exist AT
+// that grouping, not a single fixed company-wide split.
 //
 // "Price" generalises to "value per unit": net revenue per unit in revenue mode,
 // gross profit per unit in margin mode.
@@ -3958,6 +3971,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       sp.asin,
       sp.brand,
       sp.product_name,
+      sp.image_url,
       COALESCE(s.units, 0)::int AS units,
       -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
       (COALESCE(s.net_before_refunds, 0) - COALESCE(r.refunded, 0))::numeric AS net_revenue,
@@ -3979,7 +3993,7 @@ app.get('/api/pvm', async (req, res) => {
   if (!s1_from || !s1_to || !s2_from || !s2_to) {
     return res.status(400).json({ error: 's1_from, s1_to, s2_from and s2_to are required' });
   }
-  const validLevels = ['country', 'brand', 'asin'];
+  const validLevels = ['country', 'brand', 'asin', 'sku_country'];
   const groupLevel = validLevels.includes(level) ? level : 'asin';
   const isMargin = metric === 'margin';
 
@@ -4012,17 +4026,6 @@ app.get('/api/pvm', async (req, res) => {
       (!brand   || r.brand === brand) &&
       (!asin    || r.asin === asin);
 
-    const keyOf = (r) => {
-      if (groupLevel === 'country') return r.country || 'Unknown';
-      if (groupLevel === 'brand')   return r.brand || 'Unassigned';
-      return r.asin || r.sku || 'Unknown';
-    };
-    const labelOf = (r) => {
-      if (groupLevel === 'country') return r.country || 'Unknown';
-      if (groupLevel === 'brand')   return r.brand || 'Unassigned';
-      return r.product_name || r.asin || r.sku;
-    };
-
     // value = the metric being bridged; volume = units sold.
     const valueOf = (r, fx) => {
       const netRevenue = parseFloat(r.net_revenue || 0) * fx;
@@ -4030,12 +4033,30 @@ app.get('/api/pvm', async (req, res) => {
       return netRevenue - (parseFloat(r.cogs || 0) * fx) - (parseFloat(r.fees || 0) * fx);
     };
 
-    const accumulate = (rows, fx) => {
+    // The bridge is computed at the finest grain the data has — (country, sku) — but the
+    // reference price the Volume term uses is deliberately GROUP-relative, not global: each
+    // display-level group (a country, a brand, an ASIN, or a single SKU×country) prices its
+    // own members' Volume against that group's OWN blended price₁, computed only from its
+    // own members. This means a group's mix reflects ONLY the structure genuinely inside
+    // it — an ASIN's mix reflects its own country split; it is never contaminated by some
+    // unrelated ASIN's price level the way a single global reference would be. It also means
+    // Price/Volume/Mix are level-dependent BY DESIGN: "ASIN" (pooling countries together)
+    // shows the country-mix within each ASIN; filtering down to one ASIN in one country
+    // pins away every dimension that could mix, so that group's mix is necessarily zero
+    // (barring a SKU/country pairing that only exists in one scenario, which is priced
+    // entirely as volume — there's no comparable price to move from).
+    const fineKeyOf = (r) => `${r.country || 'Unknown'}::${r.sku || 'Unknown'}`;
+    const accumulateFine = (rows, fx) => {
       const acc = new Map();
       for (const r of rows) {
         if (!matchesFilters(r)) continue;
-        const key = keyOf(r);
-        if (!acc.has(key)) acc.set(key, { key, label: labelOf(r), value: 0, units: 0 });
+        const key = fineKeyOf(r);
+        if (!acc.has(key)) {
+          acc.set(key, {
+            key, country: r.country || 'Unknown', sku: r.sku, asin: r.asin,
+            brand: r.brand, product_name: r.product_name, image_url: r.image_url, value: 0, units: 0,
+          });
+        }
         const m = acc.get(key);
         m.value += valueOf(r, fx);
         m.units += parseInt(r.units || 0, 10);
@@ -4043,46 +4064,79 @@ app.get('/api/pvm', async (req, res) => {
       return acc;
     };
 
-    const acc1 = accumulate(rows1, fx1);
-    const acc2 = accumulate(rows2, fx2);
+    const fine1 = accumulateFine(rows1, fx1);
+    const fine2 = accumulateFine(rows2, fx2);
+    const fineKeys = [...new Set([...fine1.keys(), ...fine2.keys()])];
 
-    const memberKeys = [...new Set([...acc1.keys(), ...acc2.keys()])];
-
-    // Blended scenario-1 price across the whole selection — the reference the volume
-    // term is priced at, and the yardstick each member's mix is measured against.
+    // Overall totals across the whole filtered selection — descriptive only (the stat
+    // cards' "S1/S2 value, units, avg price"), no longer feeding the bridge math below.
     const sumOver = (acc, f) => [...acc.values()].reduce((t, m) => t + f(m), 0);
-    const s1Value = sumOver(acc1, m => m.value);
-    const s1Units = sumOver(acc1, m => m.units);
-    const s2Value = sumOver(acc2, m => m.value);
-    const s2Units = sumOver(acc2, m => m.units);
+    const s1Value = sumOver(fine1, m => m.value);
+    const s1Units = sumOver(fine1, m => m.units);
+    const s2Value = sumOver(fine2, m => m.value);
+    const s2Units = sumOver(fine2, m => m.units);
     const avg1 = s1Units > 0 ? s1Value / s1Units : 0;
     const avg2 = s2Units > 0 ? s2Value / s2Units : 0;
 
-    // Per-member bridge. Volume is priced at the blended avg1 (not the member's own
-    // price) so that what the member's own price premium/discount contributes lands
-    // in mix instead of being absorbed into volume — and so members sum to the totals.
-    const members = memberKeys.map(key => {
-      const a = acc1.get(key) || { value: 0, units: 0 };
-      const b = acc2.get(key) || { value: 0, units: 0 };
-      const p1 = a.units > 0 ? a.value / a.units : 0;
-      const p2 = b.units > 0 ? b.value / b.units : 0;
-      const delta  = b.value - a.value;
-      // A member with no scenario-1 units has no price to compare against, so its
-      // entire movement is new volume rather than a price change out of nowhere.
-      const price  = a.units > 0 && b.units > 0 ? (p2 - p1) * b.units : 0;
-      const volume = (b.units - a.units) * avg1;
+    const levelKeyOf = (meta) => {
+      if (groupLevel === 'country')     return meta.country || 'Unknown';
+      if (groupLevel === 'brand')       return meta.brand || 'Unassigned';
+      if (groupLevel === 'sku_country') return `${meta.sku || 'Unknown'}::${meta.country || 'Unknown'}`;
+      return meta.asin || meta.sku || 'Unknown';
+    };
+    const levelLabelOf = (meta) => {
+      if (groupLevel === 'country')     return meta.country || 'Unknown';
+      if (groupLevel === 'brand')       return meta.brand || 'Unassigned';
+      if (groupLevel === 'sku_country') return `${meta.product_name || meta.asin || meta.sku} — ${meta.country || 'Unknown'}`;
+      return meta.product_name || meta.asin || meta.sku;
+    };
+
+    // Bucket the finest-grain members by the selected level FIRST (metadata only — no
+    // math yet), so each group's own reference price can be derived purely from its own
+    // members before any price/volume/mix is computed.
+    const groups = new Map();
+    for (const key of fineKeys) {
+      const a = fine1.get(key) || { value: 0, units: 0 };
+      const b = fine2.get(key) || { value: 0, units: 0 };
+      const meta = fine2.get(key) || fine1.get(key);
+      const gKey = levelKeyOf(meta);
+      if (!groups.has(gKey)) groups.set(gKey, { key: gKey, label: levelLabelOf(meta), meta, fineMembers: [] });
+      groups.get(gKey).fineMembers.push({ a, b });
+    }
+
+    const sum = (arr, f) => arr.reduce((t, x) => t + f(x), 0);
+    const members = [...groups.values()].map(g => {
+      const groupS1Value = sum(g.fineMembers, f => f.a.value);
+      const groupS1Units = sum(g.fineMembers, f => f.a.units);
+      const groupAvg1 = groupS1Units > 0 ? groupS1Value / groupS1Units : 0;
+
+      let price = 0, volume = 0, mS1Value = 0, mS1Units = 0, mS2Value = 0, mS2Units = 0;
+      for (const f of g.fineMembers) {
+        const p1 = f.a.units > 0 ? f.a.value / f.a.units : 0;
+        const p2 = f.b.units > 0 ? f.b.value / f.b.units : 0;
+        // A combination with no scenario-1 units has no price to compare against, so its
+        // entire movement is new volume rather than a price change out of nowhere.
+        price  += f.a.units > 0 && f.b.units > 0 ? (p2 - p1) * f.b.units : 0;
+        volume += (f.b.units - f.a.units) * groupAvg1;
+        mS1Value += f.a.value; mS1Units += f.a.units;
+        mS2Value += f.b.value; mS2Units += f.b.units;
+      }
+      const delta = mS2Value - mS1Value;
       return {
-        key,
-        label: (acc2.get(key) || acc1.get(key)).label,
-        s1_value: a.value, s1_units: a.units, s1_price: p1,
-        s2_value: b.value, s2_units: b.units, s2_price: p2,
-        price, volume,
-        mix: delta - price - volume,
-        delta,
+        key: g.key, label: g.label,
+        // country is only a meaningful single value at country/sku_country level (a group
+        // spanning multiple countries, e.g. an ASIN, just carries whichever member's meta
+        // happened to seed the group — the frontend only reads this field at those two levels).
+        country: g.meta.country, asin: g.meta.asin, sku: g.meta.sku, product_name: g.meta.product_name, image_url: g.meta.image_url,
+        s1_value: mS1Value, s1_units: mS1Units, s1_price: mS1Units > 0 ? mS1Value / mS1Units : 0,
+        s2_value: mS2Value, s2_units: mS2Units, s2_price: mS2Units > 0 ? mS2Value / mS2Units : 0,
+        price, volume, mix: delta - price - volume, delta,
       };
     }).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
 
-    const sum = (arr, f) => arr.reduce((t, x) => t + f(x), 0);
+    // The headline bridge is simply the sum of the currently-displayed groups — by design
+    // it moves as you change level or filters, since it's reporting the price/volume/mix
+    // that exist AT that grouping, not one fixed company-wide split (see comment above).
     const totalDelta   = s2Value - s1Value;
     const priceEffect  = sum(members, m => m.price);
     const volumeEffect = sum(members, m => m.volume);
