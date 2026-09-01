@@ -272,17 +272,28 @@ function BridgeChart({ bars, isMobile }) {
 }
 
 // ─── £ bridge (Price / Volume / Mix) ───────────────────────────────────────
-function Waterfall({ bridge, s1, s2, sym, isMobile }) {
+// showPctOfBase (Revenue mode only — see the call site) appends each effect's size as
+// a % of scenario-1's value alongside its £ figure, so "how much of the move is Price
+// vs Volume vs Mix" reads at a glance instead of requiring mental division.
+function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase }) {
   const c1 = s1.value;
   const c2 = c1 + bridge.price;
   const c3 = c2 + bridge.volume;
   const c4 = c3 + bridge.mix; // == s2.value, bar the balancing rounding
 
+  const pctOfBase = (v) => s1.value !== 0 ? (v / Math.abs(s1.value)) * 100 : null;
+  const withPct = (v) => {
+    const base = fmtSigned(v, sym);
+    if (!showPctOfBase) return base;
+    const p = pctOfBase(v);
+    return p === null ? base : `${base} (${p >= 0 ? '+' : ''}${p.toFixed(1)}%)`;
+  };
+
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtMoney(c1, sym) },
-    { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price, display: fmtSigned(bridge.price, sym) },
-    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume, display: fmtSigned(bridge.volume, sym) },
-    { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix, display: fmtSigned(bridge.mix, sym) },
+    { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price, display: withPct(bridge.price) },
+    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume, display: withPct(bridge.volume) },
+    { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix, display: withPct(bridge.mix) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total', display: fmtMoney(s2.value, sym) },
   ];
 
@@ -337,6 +348,28 @@ function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
   );
 }
 
+// A single active filter, shown in the banner below the Hierarchy controls — click
+// the × to drop just that one value (equivalent to a ctrl/cmd-click on its row again).
+function FilterChip({ label, onRemove }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6, background: 'var(--bg3)',
+      border: '1px solid var(--accent2)', borderRadius: 999, padding: '3px 6px 3px 10px',
+      fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text)',
+    }}>
+      {label}
+      <button
+        onClick={onRemove}
+        aria-label={`Remove ${label} filter`}
+        style={{
+          background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer',
+          fontSize: 13, lineHeight: 1, padding: '0 2px', fontFamily: 'inherit',
+        }}
+      >×</button>
+    </span>
+  );
+}
+
 function StatCard({ label, value, sub, accent }) {
   return (
     <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 10, padding: '14px 16px', flex: 1, minWidth: 150 }}>
@@ -358,7 +391,9 @@ export default function PVM() {
   const [channel, setChannel] = useState(() => localStorage.getItem('gb_pvm_channel') || 'all');
   const [presetId, setPresetId] = useState('lq');
   const [periods, setPeriods] = useState(() => PRESETS[0].build());
-  const [filters, setFilters] = useState({ country: '', brand: '', asin: '' });
+  // Each is an array — the dropdowns below set a single-element array, while
+  // ctrl/cmd-clicking a breakdown-table row toggles membership for multi-select.
+  const [filters, setFilters] = useState({ country: [], brand: [], asin: [], sku: [] });
 
   const applyPreset = (p) => { setPresetId(p.id); setPeriods(p.build()); };
   const setScenario = (which, field, value) => {
@@ -371,21 +406,51 @@ export default function PVM() {
   // selected under the old channel (e.g. a Shopify-only SKU with no ASIN, filtered
   // while on "All") can silently zero out the whole result under "Amazon" — clear
   // filters on every channel switch rather than leave a stale, invisible-cause filter.
-  const chooseChannel = (c) => { setChannel(c); localStorage.setItem('gb_pvm_channel', c); setFilters({ country: '', brand: '', asin: '' }); };
+  const chooseChannel = (c) => { setChannel(c); localStorage.setItem('gb_pvm_channel', c); setFilters({ country: [], brand: [], asin: [], sku: [] }); };
 
-  // Empty filter values must be omitted entirely — URLSearchParams would otherwise
-  // serialise them as literal "undefined"/"" and the server would filter on that.
+  // Non-additive click (no ctrl/cmd): selecting the already-sole-selected value clears it
+  // (click to drill in, click again to back out); otherwise it replaces the selection.
+  // Additive (ctrl/cmd-click): toggles that one value in/out of the existing selection.
+  const toggleRowFilter = (field, value, additive) => {
+    setFilters(prev => {
+      const current = prev[field] || [];
+      const next = additive
+        ? (current.includes(value) ? current.filter(v => v !== value) : [...current, value])
+        : (current.length === 1 && current[0] === value ? [] : [value]);
+      return { ...prev, [field]: next };
+    });
+  };
+  const clearFilters = () => setFilters({ country: [], brand: [], asin: [], sku: [] });
+  const hasActiveFilters = filters.country.length || filters.brand.length || filters.asin.length || filters.sku.length;
+  const showPct = metric === 'margin' && marginView === 'percent';
+
+  // Empty filter arrays must be omitted entirely — URLSearchParams would otherwise
+  // serialise them as literal "" and the server would filter on that. The CURRENT
+  // level's own dimension is deliberately left off the request (except in %-mode, see
+  // below) so the table keeps listing every row at this level — letting you keep
+  // ctrl/cmd-clicking more of them — instead of narrowing away every sibling the moment
+  // one is picked. The £ Price/Volume/Mix bridge is then re-aggregated client-side from
+  // just the selected rows (see `effective` below), which is exact because those figures
+  // are plain per-member sums. The margin-RATE (%) bridge can't do the same trick — its
+  // Price/COGS/Freight/Fees drivers are weighted by each member's share of scenario-1
+  // REVENUE, so re-deriving them for an arbitrary subset needs the same server-side
+  // computation the full page uses — so in %-mode the self filter IS sent, and the table
+  // narrows immediately like any other filter.
   const params = useMemo(() => {
     const p = {
       s1_from: periods.s1.from, s1_to: periods.s1.to,
       s2_from: periods.s2.from, s2_to: periods.s2.to,
       metric, level, channel,
     };
-    if (filters.country) p.country = filters.country;
-    if (filters.brand) p.brand = filters.brand;
-    if (filters.asin) p.asin = filters.asin;
+    // The filter dimension(s) matching the CURRENTLY DISPLAYED breakdown level — e.g. at
+    // asin level, a member is identified by either 'asin' or 'sku' (see clickableFilterFor).
+    const selfFields = level === 'country' ? ['country'] : level === 'brand' ? ['brand'] : ['asin', 'sku'];
+    for (const field of ['country', 'brand', 'asin', 'sku']) {
+      if (!showPct && selfFields.includes(field)) continue;
+      if (filters[field].length) p[field] = filters[field].join(',');
+    }
     return p;
-  }, [periods, metric, level, channel, filters]);
+  }, [periods, metric, level, channel, filters, showPct]);
 
   const { data, loading, error } = useApi('/api/pvm', params);
   const sym = data?.currency_symbol || '£';
@@ -396,7 +461,20 @@ export default function PVM() {
   const opts = data?.options || { countries: [], brands: [], asins: [] };
   const [hoverTip, setHoverTip] = useState(null);
   const showProduct = level === 'asin';
-  const showPct = metric === 'margin' && marginView === 'percent';
+
+  // Which filter dimension (and value) a click on this row drills into — null for a
+  // synthetic bucket (e.g. a null-country "Unknown" group) that has no real filterable
+  // value. At asin level, m.asin/m.sku genuinely identify that one row's own product
+  // (unlike at country/brand level, where they're just whichever underlying row
+  // happened to seed the group) — sku is the fallback for a member with no real ASIN
+  // (e.g. a Shopify-only SKU).
+  const clickableFilterFor = (m) => {
+    if (level === 'country') return opts.countries.includes(m.key) ? { field: 'country', value: m.key } : null;
+    if (level === 'brand')   return opts.brands.includes(m.key) ? { field: 'brand', value: m.key } : null;
+    if (m.asin) return { field: 'asin', value: m.asin };
+    if (m.sku)  return { field: 'sku', value: m.sku };
+    return null;
+  };
 
   // null = the server's own order (largest absolute movement first). Once a column is
   // clicked, sort by its raw signed value instead — a plain numeric sort is what a click
@@ -410,6 +488,35 @@ export default function PVM() {
     const mult = sort.dir === 'asc' ? 1 : -1;
     return [...rawMembers].sort((a, b) => (parseFloat(a[sort.key] || 0) - parseFloat(b[sort.key] || 0)) * mult);
   }, [rawMembers, sort]);
+
+  const isMemberSelected = (m) => {
+    const c = clickableFilterFor(m);
+    return !!c && filters[c.field].includes(c.value);
+  };
+  // True when the CURRENT level's own dimension has an active selection (see the params
+  // comment above) — the case where the table lists every row but the summary above it
+  // needs to be re-aggregated down to just the selected ones.
+  const selfSelectionActive = !showPct && (
+    level === 'country' ? filters.country.length > 0 :
+    level === 'brand'   ? filters.brand.length > 0 :
+    (filters.asin.length > 0 || filters.sku.length > 0)
+  );
+  // The £ Price/Volume/Mix bridge (Revenue mode, or Margin's £ view) sums exactly from
+  // its members either way, so summing just the selected ones is exact — no server
+  // round-trip needed to show "what these selected rows alone are doing".
+  const effective = useMemo(() => {
+    if (!data) return null;
+    if (!selfSelectionActive) return { scenario1: data.scenario1, scenario2: data.scenario2, bridge: data.bridge };
+    const sel = rawMembers.filter(isMemberSelected);
+    const sumOf = (f) => sel.reduce((t, m) => t + (parseFloat(m[f]) || 0), 0);
+    const s1Units = sumOf('s1_units'), s2Units = sumOf('s2_units');
+    const s1Value = sumOf('s1_value'), s2Value = sumOf('s2_value');
+    return {
+      scenario1: { ...data.scenario1, value: s1Value, units: s1Units, avg_price: s1Units ? s1Value / s1Units : 0 },
+      scenario2: { ...data.scenario2, value: s2Value, units: s2Units, avg_price: s2Units ? s2Value / s2Units : 0 },
+      bridge: { price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value },
+    };
+  }, [data, rawMembers, selfSelectionActive, filters]);
 
   return (
     <div style={{ padding: isMobile ? '16px' : '28px 32px', display: 'flex', flexDirection: 'column', gap: isMobile ? 16 : 22 }}>
@@ -485,24 +592,38 @@ export default function PVM() {
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
           <span style={groupLabel}>Filter</span>
           <div style={{ display: 'flex', gap: 6, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4, flexWrap: 'wrap' }}>
-            <select style={selectStyle} value={filters.country} onChange={e => setFilters(f => ({ ...f, country: e.target.value }))}>
+            <select style={selectStyle} value={filters.country.length === 1 ? filters.country[0] : ''} onChange={e => setFilters(f => ({ ...f, country: e.target.value ? [e.target.value] : [] }))}>
               <option value="">All countries</option>
               {opts.countries.map(c => <option key={c} value={c}>{c}</option>)}
             </select>
-            <select style={selectStyle} value={filters.brand} onChange={e => setFilters(f => ({ ...f, brand: e.target.value }))}>
+            <select style={selectStyle} value={filters.brand.length === 1 ? filters.brand[0] : ''} onChange={e => setFilters(f => ({ ...f, brand: e.target.value ? [e.target.value] : [] }))}>
               <option value="">All brands</option>
               {opts.brands.map(b => <option key={b} value={b}>{b}</option>)}
             </select>
-            <select style={selectStyle} value={filters.asin} onChange={e => setFilters(f => ({ ...f, asin: e.target.value }))}>
+            <select style={selectStyle} value={filters.asin.length === 1 ? filters.asin[0] : ''} onChange={e => setFilters(f => ({ ...f, asin: e.target.value ? [e.target.value] : [], sku: [] }))}>
               <option value="">All ASINs</option>
               {opts.asins.map(a => <option key={a} value={a}>{a}</option>)}
             </select>
-            {(filters.country || filters.brand || filters.asin) && (
-              <button style={chip(false)} onClick={() => setFilters({ country: '', brand: '', asin: '' })}>Clear</button>
+            {hasActiveFilters > 0 && (
+              <button style={chip(false)} onClick={clearFilters}>Clear</button>
             )}
           </div>
         </div>
       </div>
+
+      {/* Active-filter banner — surfaces row-click selections (which don't show up in the
+          dropdowns above once more than one value is picked) and gives one obvious way
+          back to the unfiltered totals, alongside the small "Clear" in the Filter group. */}
+      {hasActiveFilters > 0 && (
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', background: 'var(--bg2)', border: '1px solid var(--accent2)', borderRadius: 10, padding: '8px 12px' }}>
+          <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent2)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Filtered</span>
+          {filters.country.map(v => <FilterChip key={`country-${v}`} label={v} onRemove={() => toggleRowFilter('country', v, true)} />)}
+          {filters.brand.map(v => <FilterChip key={`brand-${v}`} label={v} onRemove={() => toggleRowFilter('brand', v, true)} />)}
+          {filters.asin.map(v => <FilterChip key={`asin-${v}`} label={v} onRemove={() => toggleRowFilter('asin', v, true)} />)}
+          {filters.sku.map(v => <FilterChip key={`sku-${v}`} label={v} onRemove={() => toggleRowFilter('sku', v, true)} />)}
+          <button style={{ ...chip(false), marginLeft: 'auto' }} onClick={clearFilters}>Clear — show total business</button>
+        </div>
+      )}
 
       {error && (
         <div style={{ background: '#f8717112', border: '1px solid #f8717140', borderRadius: 10, padding: '12px 16px', fontSize: 12, color: 'var(--red)' }}>
@@ -528,35 +649,37 @@ export default function PVM() {
             ) : (
               <>
                 <StatCard
-                  label={`S1 ${metricLabel}`} value={fmtMoney(data.scenario1.value, sym)}
-                  sub={`${fmtNum(data.scenario1.units)} units · ${fmtMoney2(data.scenario1.avg_price, sym)} ${unitLabel}`}
+                  label={`S1 ${metricLabel}`} value={fmtMoney(effective.scenario1.value, sym)}
+                  sub={`${fmtNum(effective.scenario1.units)} units · ${fmtMoney2(effective.scenario1.avg_price, sym)} ${unitLabel}`}
                 />
                 <StatCard
-                  label={`S2 ${metricLabel}`} value={fmtMoney(data.scenario2.value, sym)}
-                  sub={`${fmtNum(data.scenario2.units)} units · ${fmtMoney2(data.scenario2.avg_price, sym)} ${unitLabel}`}
+                  label={`S2 ${metricLabel}`} value={fmtMoney(effective.scenario2.value, sym)}
+                  sub={`${fmtNum(effective.scenario2.units)} units · ${fmtMoney2(effective.scenario2.avg_price, sym)} ${unitLabel}`}
                 />
                 <StatCard
-                  label="Total Δ" value={fmtSigned(data.bridge.total_delta, sym)}
-                  accent={data.bridge.total_delta >= 0 ? 'var(--green)' : 'var(--red)'}
-                  sub={data.scenario1.value !== 0
-                    ? `${(data.bridge.total_delta / Math.abs(data.scenario1.value) * 100).toFixed(1)}% vs base`
+                  label="Total Δ" value={fmtSigned(effective.bridge.total_delta, sym)}
+                  accent={effective.bridge.total_delta >= 0 ? 'var(--green)' : 'var(--red)'}
+                  sub={effective.scenario1.value !== 0
+                    ? `${(effective.bridge.total_delta / Math.abs(effective.scenario1.value) * 100).toFixed(1)}% vs base`
                     : '—'}
                 />
               </>
             )}
           </div>
 
-          {/* Bridge */}
+          {/* Bridge — reflects the selected subset when a same-level filter is active
+              (see `effective` above), the full totals otherwise. */}
           <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: isMobile ? '18px 12px' : '24px 28px' }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 20 }}>
               {showPct ? 'Margin Rate Bridge' : `${metricLabel} Bridge`}
+              {selfSelectionActive && <span style={{ color: 'var(--accent2)', fontWeight: 700, marginLeft: 8, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em' }}>selected rows only</span>}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
                 {showPct ? '— mix is the residual after the rate drivers' : '— mix is the residual after price and volume'}
               </span>
             </div>
             {showPct
               ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} />
-              : <Waterfall bridge={data.bridge} s1={data.scenario1} s2={data.scenario2} sym={sym} isMobile={isMobile} />}
+              : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} />}
           </div>
 
           {/* Breakdown table */}
@@ -621,8 +744,20 @@ export default function PVM() {
                       <td style={{ padding: '9px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: color || 'var(--text)', whiteSpace: 'nowrap' }}>{v}</td>
                     );
                     const effColor = (v) => v > 0 ? 'var(--green)' : v < 0 ? 'var(--red)' : 'var(--muted)';
+                    const clickTarget = clickableFilterFor(m);
+                    const isSelected = !!clickTarget && filters[clickTarget.field].includes(clickTarget.value);
                     return (
-                      <tr key={m.key} style={{ borderTop: '1px solid var(--border)' }}>
+                      <tr
+                        key={m.key}
+                        onClick={clickTarget ? (e) => toggleRowFilter(clickTarget.field, clickTarget.value, e.ctrlKey || e.metaKey) : undefined}
+                        title={clickTarget ? 'Click to filter · ctrl/cmd-click to select multiple' : undefined}
+                        style={{
+                          borderTop: '1px solid var(--border)',
+                          borderLeft: isSelected ? '3px solid var(--accent2)' : '3px solid transparent',
+                          background: isSelected ? '#a78bfa14' : 'transparent',
+                          cursor: clickTarget ? 'pointer' : 'default',
+                        }}
+                      >
                         <td style={{ padding: showProduct ? '8px 10px' : '9px 10px', maxWidth: 300, overflow: 'hidden' }}>
                           {showProduct ? (
                             <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
