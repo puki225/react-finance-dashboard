@@ -4003,8 +4003,15 @@ app.get('/api/pvm', async (req, res) => {
   const {
     s1_from, s1_to, s2_from, s2_to,
     metric = 'revenue', level = 'asin', channel = 'all',
-    country, brand, asin,
+    country, brand, asin, sku,
   } = req.query;
+  // Each of country/brand/asin/sku accepts a comma-separated list — the breakdown
+  // table supports ctrl/cmd-click multi-select on top of the single-value dropdowns.
+  const listOf = (v) => (v ? String(v).split(',').map(s => s.trim()).filter(Boolean) : null);
+  const countryList = listOf(country);
+  const brandList = listOf(brand);
+  const asinList = listOf(asin);
+  const skuList = listOf(sku);
   if (!s1_from || !s1_to || !s2_from || !s2_to) {
     return res.status(400).json({ error: 's1_from, s1_to, s2_from and s2_to are required' });
   }
@@ -4036,10 +4043,17 @@ app.get('/api/pvm', async (req, res) => {
       asins:     uniqSorted(allRows.map(r => r.asin)),
     };
 
+    // asin/sku are OR'd together, not ANDed: sku is the fallback dimension for asin-level
+    // clicks on members with no real ASIN (e.g. a Shopify-only SKU), so a multi-select
+    // spanning both real-ASIN and ASIN-less rows must match either, not require both.
+    const asinOrSkuMatches = (r) => {
+      if (!asinList && !skuList) return true;
+      return (!!asinList && asinList.includes(r.asin)) || (!!skuList && skuList.includes(r.sku));
+    };
     const matchesFilters = (r) =>
-      (!country || r.country === country) &&
-      (!brand   || r.brand === brand) &&
-      (!asin    || r.asin === asin);
+      (!countryList || countryList.includes(r.country)) &&
+      (!brandList   || brandList.includes(r.brand)) &&
+      asinOrSkuMatches(r);
 
     const keyOf = (r) => {
       if (groupLevel === 'country') return r.country || 'Unknown';
@@ -4255,7 +4269,7 @@ app.get('/api/pvm', async (req, res) => {
       metric: isMargin ? 'margin' : 'revenue',
       level: groupLevel,
       channel,
-      filters: { country: country || null, brand: brand || null, asin: asin || null },
+      filters: { country: countryList, brand: brandList, asin: asinList, sku: skuList },
       options,
       currency_symbol: currencySymbol(reportingCurrency),
       scenario1: { from: s1_from, to: s1_to, value: s1Value, units: s1Units, avg_price: avg1 },
