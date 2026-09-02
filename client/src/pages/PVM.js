@@ -155,6 +155,13 @@ const fmtSignedPct = (n) => {
   const v = parseFloat(n || 0);
   return (v < 0 ? '−' : '+') + Math.abs(v).toFixed(2) + 'pp';
 };
+// A margin RATE always has to come from summed revenue and summed profit — averaging
+// the child rows' own rates would weight a £5 variant the same as a £5,000 one — so
+// every rate shown in the table (child, parent group, or total) is derived here.
+const marginPct = (revenue, profit) => {
+  const r = parseFloat(revenue || 0);
+  return r === 0 ? 0 : (parseFloat(profit || 0) / r) * 100;
+};
 
 const subTab = (active) => ({
   padding: '8px 20px', borderRadius: 8, fontSize: 13, fontWeight: 600,
@@ -408,16 +415,32 @@ export default function PVM() {
   // filters on every channel switch rather than leave a stale, invisible-cause filter.
   const chooseChannel = (c) => { setChannel(c); localStorage.setItem('gb_pvm_channel', c); setFilters({ country: [], brand: [], asin: [], sku: [] }); };
 
-  // Non-additive click (no ctrl/cmd): selecting the already-sole-selected value clears it
-  // (click to drill in, click again to back out); otherwise it replaces the selection.
-  // Additive (ctrl/cmd-click): toggles that one value in/out of the existing selection.
-  const toggleRowFilter = (field, value, additive) => {
+  // Toggles a row's filter values. Takes a LIST because one row can stand for several
+  // values — a parent-ASIN group row selects all of its child ASINs at once.
+  // Non-additive click (no ctrl/cmd): selecting what's already the sole selection clears
+  // it (click to drill in, click again to back out); otherwise it replaces the selection
+  // within this row's own dimension(s), leaving a filter on another dimension alone.
+  // Additive (ctrl/cmd-click): folds this row's values in/out of the existing selection.
+  const toggleTargets = (targets, additive) => {
+    if (!targets.length) return;
     setFilters(prev => {
-      const current = prev[field] || [];
-      const next = additive
-        ? (current.includes(value) ? current.filter(v => v !== value) : [...current, value])
-        : (current.length === 1 && current[0] === value ? [] : [value]);
-      return { ...prev, [field]: next };
+      const next = { ...prev };
+      const allSelected = targets.every(t => (prev[t.field] || []).includes(t.value));
+      if (additive) {
+        for (const t of targets) {
+          const cur = next[t.field] || [];
+          next[t.field] = allSelected
+            ? cur.filter(v => v !== t.value)
+            : (cur.includes(t.value) ? cur : [...cur, t.value]);
+        }
+        return next;
+      }
+      // At ASIN level a member is keyed by asin OR sku, so both are this row's dimension.
+      const touched = level === 'asin' ? ['asin', 'sku'] : [...new Set(targets.map(t => t.field))];
+      const onlyThis = allSelected && touched.reduce((n, f) => n + (prev[f] || []).length, 0) === targets.length;
+      for (const f of touched) next[f] = [];
+      if (!onlyThis) for (const t of targets) next[t.field] = [...next[t.field], t.value];
+      return next;
     });
   };
   const clearFilters = () => setFilters({ country: [], brand: [], asin: [], sku: [] });
@@ -457,7 +480,14 @@ export default function PVM() {
   const metricLabel = metric === 'margin' ? 'Gross Profit' : 'Net Revenue';
   const unitLabel = metric === 'margin' ? 'margin/unit' : 'price/unit';
 
-  const rawMembers = data?.members || [];
+  // Margin rate is derived here rather than read off the server's own s1_margin_pct so
+  // it exists in EVERY metric mode (the server only builds that field for the margin-%
+  // bridge) and so one rule covers child rows, parent-group rows and the footer total.
+  const rawMembers = useMemo(() => (data?.members || []).map(m => ({
+    ...m,
+    s1_margin_pct: marginPct(m.s1_revenue, m.s1_profit),
+    s2_margin_pct: marginPct(m.s2_revenue, m.s2_profit),
+  })), [data]);
   const opts = data?.options || { countries: [], brands: [], asins: [] };
   const [hoverTip, setHoverTip] = useState(null);
   const showProduct = level === 'asin';
@@ -474,6 +504,13 @@ export default function PVM() {
     if (m.asin) return { field: 'asin', value: m.asin };
     if (m.sku)  return { field: 'sku', value: m.sku };
     return null;
+  };
+  // What clicking a row selects — one value normally, every child's value for a
+  // parent-ASIN group row.
+  const filterTargetsFor = (row) => {
+    if (row.isGroup) return row.children.map(clickableFilterFor).filter(Boolean);
+    const t = clickableFilterFor(row);
+    return t ? [t] : [];
   };
 
   // null = the server's own order (largest absolute movement first). Once a column is
@@ -493,6 +530,110 @@ export default function PVM() {
     const c = clickableFilterFor(m);
     return !!c && filters[c.field].includes(c.value);
   };
+
+  // ── Parent-ASIN grouping ────────────────────────────────────────────────────
+  // Variants of one product (same parent ASIN) collapse into a single expandable
+  // row. Only at ASIN level, and only where a parent actually has more than one
+  // child in the current selection — a "group" wrapping a single ASIN would just be
+  // a row with a chevron that reveals itself. Every figure on a group row is summed
+  // from its children (each per-member figure is an additive contribution to the
+  // totals, so this is exact), except the rates: price/unit and margin % are
+  // re-derived from the summed value/units/revenue/profit.
+  const [expandedParents, setExpandedParents] = useState(() => new Set());
+  const toggleParent = (parentAsin) => {
+    setExpandedParents(prev => {
+      const next = new Set(prev);
+      if (next.has(parentAsin)) next.delete(parentAsin); else next.add(parentAsin);
+      return next;
+    });
+  };
+
+  const aggregateGroup = (parentAsin, children) => {
+    const sumOf = (f) => children.reduce((t, m) => t + (parseFloat(m[f]) || 0), 0);
+    const s1Units = sumOf('s1_units'), s2Units = sumOf('s2_units');
+    const s1Value = sumOf('s1_value'), s2Value = sumOf('s2_value');
+    return {
+      key: `parent:${parentAsin}`,
+      isGroup: true,
+      parentAsin,
+      children,
+      label: parentAsin,
+      asin: parentAsin,
+      // Variants of one product share artwork, so the first child's image represents
+      // the group; there is no parent-level image_url in sku_parameters.
+      image_url: children.find(c => c.image_url)?.image_url || null,
+      product_name: children[0]?.product_name || parentAsin,
+      s1_units: s1Units, s2_units: s2Units,
+      s1_value: s1Value, s2_value: s2Value,
+      s1_price: s1Units ? s1Value / s1Units : 0,
+      s2_price: s2Units ? s2Value / s2Units : 0,
+      s1_revenue: sumOf('s1_revenue'), s1_profit: sumOf('s1_profit'),
+      s2_revenue: sumOf('s2_revenue'), s2_profit: sumOf('s2_profit'),
+      s1_margin_pct: marginPct(sumOf('s1_revenue'), sumOf('s1_profit')),
+      s2_margin_pct: marginPct(sumOf('s2_revenue'), sumOf('s2_profit')),
+      price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), delta: sumOf('delta'),
+      price_effect: sumOf('price_effect'), cogs_effect: sumOf('cogs_effect'),
+      freight_effect: sumOf('freight_effect'), amz_fee_effect: sumOf('amz_fee_effect'),
+      fba_fee_effect: sumOf('fba_fee_effect'), rate_effect: sumOf('rate_effect'),
+      mix_effect_pct: sumOf('mix_effect_pct'), delta_pct: sumOf('delta_pct'),
+    };
+  };
+
+  // Footer margin rate — from summed revenue/profit across every listed row, so it
+  // matches the rows above it whatever the metric mode or grouping.
+  const tableTotals = useMemo(() => {
+    const sumOf = (f) => rawMembers.reduce((t, m) => t + (parseFloat(m[f]) || 0), 0);
+    return {
+      s1_margin_pct: marginPct(sumOf('s1_revenue'), sumOf('s1_profit')),
+      s2_margin_pct: marginPct(sumOf('s2_revenue'), sumOf('s2_profit')),
+    };
+  }, [rawMembers]);
+
+  // Flat list of what the table actually renders: group rows (with their children
+  // inlined right after when expanded) and ungrouped rows, in sort order.
+  const displayRows = useMemo(() => {
+    if (level !== 'asin') return members.map(m => ({ row: m, depth: 0 }));
+
+    const byParent = new Map();
+    const loose = [];
+    for (const m of members) {
+      // A member IS its own parent (a parent ASIN sold directly) or has none — either
+      // way there's no group to fold it into on its own.
+      if (m.parent_asin && m.parent_asin !== m.asin) {
+        if (!byParent.has(m.parent_asin)) byParent.set(m.parent_asin, []);
+        byParent.get(m.parent_asin).push(m);
+      } else {
+        loose.push(m);
+      }
+    }
+
+    const entries = [];
+    for (const m of loose) entries.push({ row: m, depth: 0 });
+    for (const [parentAsin, children] of byParent) {
+      if (children.length < 2) entries.push({ row: children[0], depth: 0 });
+      else entries.push({ row: aggregateGroup(parentAsin, children), depth: 0 });
+    }
+
+    // Groups sort against ungrouped rows on their aggregate, using the same comparator
+    // the flat table uses; children keep the order they already came in.
+    if (sort.key) {
+      const mult = sort.dir === 'asc' ? 1 : -1;
+      entries.sort((a, b) => (parseFloat(a.row[sort.key] || 0) - parseFloat(b.row[sort.key] || 0)) * mult);
+    } else {
+      entries.sort((a, b) => Math.abs(b.row.delta || 0) - Math.abs(a.row.delta || 0));
+    }
+
+    const out = [];
+    for (const entry of entries) {
+      out.push(entry);
+      if (entry.row.isGroup && expandedParents.has(entry.row.parentAsin)) {
+        for (const child of entry.row.children) out.push({ row: child, depth: 1 });
+      }
+    }
+    return out;
+  }, [members, level, sort, expandedParents]);
+
+  const groupedParentCount = displayRows.filter(r => r.row.isGroup).length;
   // True when the CURRENT level's own dimension has an active selection (see the params
   // comment above) — the case where the table lists every row but the summary above it
   // needs to be re-aggregated down to just the selected ones.
@@ -617,10 +758,10 @@ export default function PVM() {
       {hasActiveFilters > 0 && (
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', background: 'var(--bg2)', border: '1px solid var(--accent2)', borderRadius: 10, padding: '8px 12px' }}>
           <span style={{ fontSize: 11, fontWeight: 700, color: 'var(--accent2)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>Filtered</span>
-          {filters.country.map(v => <FilterChip key={`country-${v}`} label={v} onRemove={() => toggleRowFilter('country', v, true)} />)}
-          {filters.brand.map(v => <FilterChip key={`brand-${v}`} label={v} onRemove={() => toggleRowFilter('brand', v, true)} />)}
-          {filters.asin.map(v => <FilterChip key={`asin-${v}`} label={v} onRemove={() => toggleRowFilter('asin', v, true)} />)}
-          {filters.sku.map(v => <FilterChip key={`sku-${v}`} label={v} onRemove={() => toggleRowFilter('sku', v, true)} />)}
+          {filters.country.map(v => <FilterChip key={`country-${v}`} label={v} onRemove={() => toggleTargets([{ field: 'country', value: v }], true)} />)}
+          {filters.brand.map(v => <FilterChip key={`brand-${v}`} label={v} onRemove={() => toggleTargets([{ field: 'brand', value: v }], true)} />)}
+          {filters.asin.map(v => <FilterChip key={`asin-${v}`} label={v} onRemove={() => toggleTargets([{ field: 'asin', value: v }], true)} />)}
+          {filters.sku.map(v => <FilterChip key={`sku-${v}`} label={v} onRemove={() => toggleTargets([{ field: 'sku', value: v }], true)} />)}
           <button style={{ ...chip(false), marginLeft: 'auto' }} onClick={clearFilters}>Clear — show total business</button>
         </div>
       )}
@@ -688,16 +829,19 @@ export default function PVM() {
               By {LEVELS.find(l => l.id === level)?.label}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
                 {members.length} {members.length === 1 ? 'row' : 'rows'}
+                {groupedParentCount > 0 && ` · ${groupedParentCount} parent ${groupedParentCount === 1 ? 'group' : 'groups'}`}
                 {sort.key ? ` — sorted by ${sort.key.replace(/_/g, ' ')} (${sort.dir === 'asc' ? 'low→high' : 'high→low'})` : ', largest movement first'}
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 980 : 940) : (showPct ? 900 : 860), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {(showPct ? [
                       { label: '' },
+                      { label: 'S1 Units', key: 's1_units' },
                       { label: 'S1 Margin %', key: 's1_margin_pct' },
+                      { label: 'S2 Units', key: 's2_units' },
                       { label: 'S2 Margin %', key: 's2_margin_pct' },
                       { label: 'Price', key: 'price_effect' },
                       { label: 'Std COGS', key: 'cogs_effect' },
@@ -711,9 +855,11 @@ export default function PVM() {
                       { label: 'S1 Units', key: 's1_units' },
                       { label: `S1 ${unitLabel}`, key: 's1_price' },
                       { label: 'S1 Value', key: 's1_value' },
+                      { label: 'S1 Margin %', key: 's1_margin_pct' },
                       { label: 'S2 Units', key: 's2_units' },
                       { label: `S2 ${unitLabel}`, key: 's2_price' },
                       { label: 'S2 Value', key: 's2_value' },
+                      { label: 'S2 Margin %', key: 's2_margin_pct' },
                       { label: 'Price', key: 'price' },
                       { label: 'Volume', key: 'volume' },
                       { label: 'Mix', key: 'mix' },
@@ -736,31 +882,44 @@ export default function PVM() {
                   </tr>
                 </thead>
                 <tbody>
-                  {members.length === 0 && (
-                    <tr><td colSpan={showPct ? 10 : 11} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                  {displayRows.length === 0 && (
+                    <tr><td colSpan={showPct ? 12 : 13} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
-                  {members.map(m => {
+                  {displayRows.map(({ row: m, depth }) => {
                     const cell = (v, color) => (
                       <td style={{ padding: '9px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: color || 'var(--text)', whiteSpace: 'nowrap' }}>{v}</td>
                     );
                     const effColor = (v) => v > 0 ? 'var(--green)' : v < 0 ? 'var(--red)' : 'var(--muted)';
-                    const clickTarget = clickableFilterFor(m);
-                    const isSelected = !!clickTarget && filters[clickTarget.field].includes(clickTarget.value);
+                    const targets = filterTargetsFor(m);
+                    // A group counts as selected only when every one of its children is.
+                    const isSelected = targets.length > 0 && targets.every(t => filters[t.field].includes(t.value));
+                    const isChild = depth > 0;
+                    const expanded = m.isGroup && expandedParents.has(m.parentAsin);
                     return (
                       <tr
                         key={m.key}
-                        onClick={clickTarget ? (e) => toggleRowFilter(clickTarget.field, clickTarget.value, e.ctrlKey || e.metaKey) : undefined}
-                        title={clickTarget ? 'Click to filter · ctrl/cmd-click to select multiple' : undefined}
+                        onClick={targets.length ? (e) => toggleTargets(targets, e.ctrlKey || e.metaKey) : undefined}
+                        title={targets.length ? 'Click to filter · ctrl/cmd-click to select multiple' : undefined}
                         style={{
-                          borderTop: '1px solid var(--border)',
+                          borderTop: isChild ? '1px solid var(--border)' : '1px solid var(--border)',
                           borderLeft: isSelected ? '3px solid var(--accent2)' : '3px solid transparent',
-                          background: isSelected ? '#a78bfa14' : 'transparent',
-                          cursor: clickTarget ? 'pointer' : 'default',
+                          background: isSelected ? '#a78bfa14' : isChild ? '#ffffff04' : 'transparent',
+                          cursor: targets.length ? 'pointer' : 'default',
                         }}
                       >
-                        <td style={{ padding: showProduct ? '8px 10px' : '9px 10px', maxWidth: 300, overflow: 'hidden' }}>
+                        <td style={{ padding: showProduct ? '8px 10px' : '9px 10px', maxWidth: 320, overflow: 'hidden' }}>
                           {showProduct ? (
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, minWidth: 0 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0, paddingLeft: isChild ? 22 : 0 }}>
+                              {m.isGroup ? (
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); toggleParent(m.parentAsin); }}
+                                  title={expanded ? 'Collapse variants' : 'Expand variants'}
+                                  style={{
+                                    background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer',
+                                    fontSize: 10, padding: '2px 4px', width: 18, flexShrink: 0, fontFamily: 'inherit',
+                                  }}
+                                >{expanded ? '▼' : '▶'}</button>
+                              ) : !isChild && <span style={{ width: 18, flexShrink: 0 }} />}
                               <ProductImage
                                 imageUrl={m.image_url} asin={m.asin} sku={m.sku}
                                 onEnter={e => {
@@ -770,9 +929,11 @@ export default function PVM() {
                                 onLeave={() => setHoverTip(null)}
                               />
                               <div style={{ minWidth: 0, overflow: 'hidden' }}>
-                                <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{m.sku || '—'}</div>
+                                <div style={{ fontSize: 12, color: 'var(--text)', fontFamily: 'var(--mono)', fontWeight: m.isGroup ? 700 : 400, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {m.isGroup ? m.parentAsin : (m.sku || '—')}
+                                </div>
                                 <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                  {m.asin || '—'}
+                                  {m.isGroup ? `${m.children.length} variants` : (m.asin || '—')}
                                 </div>
                               </div>
                             </div>
@@ -784,7 +945,9 @@ export default function PVM() {
                         </td>
                         {showPct ? (
                           <>
+                            {cell(fmtNum(m.s1_units))}
                             {cell(fmtPct(m.s1_margin_pct), 'var(--muted)')}
+                            {cell(fmtNum(m.s2_units))}
                             {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
                             {cell(fmtSignedPct(m.price_effect), effColor(m.price_effect))}
                             {cell(fmtSignedPct(m.cogs_effect), effColor(m.cogs_effect))}
@@ -799,9 +962,11 @@ export default function PVM() {
                             {cell(fmtNum(m.s1_units))}
                             {cell(fmtMoney2(m.s1_price, sym), 'var(--muted)')}
                             {cell(fmtMoney(m.s1_value, sym))}
+                            {cell(fmtPct(m.s1_margin_pct), 'var(--muted)')}
                             {cell(fmtNum(m.s2_units))}
                             {cell(fmtMoney2(m.s2_price, sym), 'var(--muted)')}
                             {cell(fmtMoney(m.s2_value, sym))}
+                            {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
                             {cell(fmtSigned(m.price, sym), effColor(m.price))}
                             {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
                             {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
@@ -818,7 +983,9 @@ export default function PVM() {
                       <td style={{ padding: '11px 10px' }}>Total</td>
                       {showPct ? (
                         <>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario1.units)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario1_pct)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario2.units)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario2_pct)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.price_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.cogs_effect)}</td>
@@ -833,9 +1000,11 @@ export default function PVM() {
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario1.units)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario1.avg_price, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario1.value, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(tableTotals.s1_margin_pct)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario2.units)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario2.avg_price, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario2.value, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(tableTotals.s2_margin_pct)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
