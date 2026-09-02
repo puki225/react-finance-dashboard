@@ -4201,6 +4201,38 @@ app.get('/api/pvm', async (req, res) => {
         channelMix = mixContribution * b.units;
       }
 
+      // ─── £ cost-driver breakdown of Price — Margin £ mode only ────────────────────
+      // Only meaningful when the bridge's own "value" is margin/unit (isMargin) — in
+      // Revenue mode 'price' already IS the ASP move outright, there's no COGS/fees
+      // underneath it to break out. Same one-driver-at-a-time walk as the margin-RATE
+      // bridge's price_effect/cogs_effect/etc below, just left in £ (no ÷price×100 to
+      // convert to a rate) and NOT revenue-share weighted — a plain per-member £ figure,
+      // consistent with how 'price'/'volume'/'channel_mix' above are already unweighted.
+      // Exact sub-split of 'price': asp+cogs+freight+amzFee+fbaFee telescopes to it.
+      let priceAsp = price, priceCogs = 0, priceFreight = 0, priceAmzFee = 0, priceFbaFee = 0;
+      if (isMargin && bothPresent) {
+        // ASP (revenue/unit) — NOT p1/p2, which are already margin/unit (net of cost) in
+        // this mode. The walk needs the gross selling price to subtract costs FROM.
+        const asp1 = a.revenue / a.units, asp2 = b.revenue / b.units;
+        const c1_1 = a.cogs_std / a.units,     c1_2 = b.cogs_std / b.units;
+        const c2_1 = a.cogs_freight / a.units, c2_2 = b.cogs_freight / b.units;
+        const c3_1 = a.fee_amz / a.units,      c3_2 = b.fee_amz / b.units;
+        const c4_1 = a.fee_fba / a.units,      c4_2 = b.fee_fba / b.units;
+        const marginPerUnitAt = (price, c1, c2, c3, c4) => price - c1 - c2 - c3 - c4;
+
+        const m1 = marginPerUnitAt(asp2, c1_1, c2_1, c3_1, c4_1);
+        const m2 = marginPerUnitAt(asp2, c1_2, c2_1, c3_1, c4_1);
+        const m3 = marginPerUnitAt(asp2, c1_2, c2_2, c3_1, c4_1);
+        const m4 = marginPerUnitAt(asp2, c1_2, c2_2, c3_2, c4_1);
+        const m5 = marginPerUnitAt(asp2, c1_2, c2_2, c3_2, c4_2); // = p2
+
+        priceAsp     = (m1 - p1)  * b.units;
+        priceCogs    = (m2 - m1)  * b.units;
+        priceFreight = (m3 - m2)  * b.units;
+        priceAmzFee  = (m4 - m3)  * b.units;
+        priceFbaFee  = (m5 - m4)  * b.units;
+      }
+
       return {
         key, label: meta.label, asin: meta.asin, parent_asin: meta.parent_asin, sku: meta.sku,
         product_name: meta.product_name, image_url: meta.image_url,
@@ -4213,6 +4245,9 @@ app.get('/api/pvm', async (req, res) => {
         s1_revenue: a.revenue, s1_profit: profitOf(a),
         s2_revenue: b.revenue, s2_profit: profitOf(b),
         price, volume, channel_mix: channelMix,
+        // £ sub-split of price — Margin £ mode only, see derivation above.
+        price_asp: priceAsp, price_cogs: priceCogs, price_freight: priceFreight,
+        price_amz_fee: priceAmzFee, price_fba_fee: priceFbaFee,
         mix: delta - price - volume,
         delta,
       };
@@ -4226,6 +4261,13 @@ app.get('/api/pvm', async (req, res) => {
     // Exact sub-total of priceEffect (see channelMix derivation above), not incremental
     // to it — only meaningful with channel='all' selected, see the client for the gate.
     const channelMixEffect = sum(members, m => m.channel_mix);
+    // Exact sub-split of priceEffect by cost driver — Margin £ mode only (see per-member
+    // derivation above); in Revenue mode price_asp === price and the other four are 0.
+    const priceAspEffect     = sum(members, m => m.price_asp);
+    const priceCogsEffect    = sum(members, m => m.price_cogs);
+    const priceFreightEffect = sum(members, m => m.price_freight);
+    const priceAmzFeeEffect  = sum(members, m => m.price_amz_fee);
+    const priceFbaFeeEffect  = sum(members, m => m.price_fba_fee);
 
     // ─── Margin-rate (percentage-point) bridge — Margin mode only ──────────────────
     // A margin RATE (profit ÷ revenue) is a ratio, not an additive £ amount, so it can't
@@ -4371,7 +4413,12 @@ app.get('/api/pvm', async (req, res) => {
       currency_symbol: currencySymbol(reportingCurrency),
       scenario1: { from: s1_from, to: s1_to, value: s1Value, units: s1Units, avg_price: avg1 },
       scenario2: { from: s2_from, to: s2_to, value: s2Value, units: s2Units, avg_price: avg2 },
-      bridge: { price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta, channel_mix: channelMixEffect },
+      bridge: {
+        price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta,
+        channel_mix: channelMixEffect,
+        price_asp: priceAspEffect, price_cogs: priceCogsEffect, price_freight: priceFreightEffect,
+        price_amz_fee: priceAmzFeeEffect, price_fba_fee: priceFbaFeeEffect,
+      },
       margin_pct_bridge: marginPctBridge,
       members,
     });
