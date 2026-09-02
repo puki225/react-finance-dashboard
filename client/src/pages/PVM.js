@@ -451,6 +451,10 @@ export default function PVM() {
   // story when both channels are actually in view — filtered to one channel, every row
   // IS single-channel, so it would just be a column of zeros. Drop it entirely then.
   const showChannelMix = channel === 'all';
+  // Margin's £ view mirrors the same cost-driver breakdown the % view already has
+  // (Price/Std COGS/Freight/Amazon Fees/FBA Fees), just left in £ instead of scaled to
+  // a rate — meaningless in Revenue mode (there's no COGS/fees under a pure ASP move).
+  const showMarginDrivers = metric === 'margin' && !showPct;
 
   // Empty filter arrays must be omitted entirely — URLSearchParams would otherwise
   // serialise them as literal "" and the server would filter on that. The CURRENT
@@ -578,6 +582,8 @@ export default function PVM() {
       s2_margin_pct: marginPct(sumOf('s2_revenue'), sumOf('s2_profit')),
       price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), delta: sumOf('delta'),
       channel_mix: sumOf('channel_mix'),
+      price_asp: sumOf('price_asp'), price_cogs: sumOf('price_cogs'), price_freight: sumOf('price_freight'),
+      price_amz_fee: sumOf('price_amz_fee'), price_fba_fee: sumOf('price_fba_fee'),
       price_effect: sumOf('price_effect'), cogs_effect: sumOf('cogs_effect'),
       freight_effect: sumOf('freight_effect'), amz_fee_effect: sumOf('amz_fee_effect'),
       fba_fee_effect: sumOf('fba_fee_effect'), rate_effect: sumOf('rate_effect'),
@@ -841,7 +847,7 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showChannelMix ? 120 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showChannelMix ? 120 : 0) + (showMarginDrivers ? 480 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {(showPct ? [
@@ -868,7 +874,13 @@ export default function PVM() {
                       { label: `S2 ${unitLabel}`, key: 's2_price' },
                       { label: 'S2 Value', key: 's2_value' },
                       { label: 'S2 Margin %', key: 's2_margin_pct' },
-                      { label: 'Price', key: 'price' },
+                      { label: 'Price', key: showMarginDrivers ? 'price_asp' : 'price' },
+                      ...(showMarginDrivers ? [
+                        { label: 'Std COGS', key: 'price_cogs' },
+                        { label: 'Freight', key: 'price_freight' },
+                        { label: 'Amazon Fees', key: 'price_amz_fee' },
+                        { label: 'FBA Fees', key: 'price_fba_fee' },
+                      ] : []),
                       ...(showChannelMix ? [{ label: 'Channel Mix', key: 'channel_mix' }] : []),
                       { label: 'Volume', key: 'volume' },
                       { label: 'Mix', key: 'mix' },
@@ -892,7 +904,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {displayRows.length === 0 && (
-                    <tr><td colSpan={(showPct ? 12 : 13) + (showChannelMix ? 1 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={(showPct ? 12 : 13) + (showChannelMix ? 1 : 0) + (showMarginDrivers ? 4 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {displayRows.map(({ row: m, depth }) => {
                     const cell = (v, color) => (
@@ -977,7 +989,11 @@ export default function PVM() {
                             {cell(fmtMoney2(m.s2_price, sym), 'var(--muted)')}
                             {cell(fmtMoney(m.s2_value, sym))}
                             {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
-                            {cell(fmtSigned(m.price, sym), effColor(m.price))}
+                            {cell(fmtSigned(showMarginDrivers ? m.price_asp : m.price, sym), effColor(showMarginDrivers ? m.price_asp : m.price))}
+                            {showMarginDrivers && cell(fmtSigned(m.price_cogs, sym), effColor(m.price_cogs))}
+                            {showMarginDrivers && cell(fmtSigned(m.price_freight, sym), effColor(m.price_freight))}
+                            {showMarginDrivers && cell(fmtSigned(m.price_amz_fee, sym), effColor(m.price_amz_fee))}
+                            {showMarginDrivers && cell(fmtSigned(m.price_fba_fee, sym), effColor(m.price_fba_fee))}
                             {showChannelMix && cell(fmtSigned(m.channel_mix, sym), effColor(m.channel_mix))}
                             {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
                             {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
@@ -1017,7 +1033,11 @@ export default function PVM() {
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney2(data.scenario2.avg_price, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario2.value, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(tableTotals.s2_margin_pct)}</td>
-                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price, sym)}</td>
+                          <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(showMarginDrivers ? data.bridge.price_asp : data.bridge.price, sym)}</td>
+                          {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_cogs, sym)}</td>}
+                          {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_freight, sym)}</td>}
+                          {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_amz_fee, sym)}</td>}
+                          {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_fba_fee, sym)}</td>}
                           {showChannelMix && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.channel_mix, sym)}</td>}
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
@@ -1040,6 +1060,7 @@ export default function PVM() {
                 <>Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
                   priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
                   mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
+                  {showMarginDrivers && ' Price/Std COGS/Freight/Amazon Fees/FBA Fees split the same margin/unit move the % bridge decomposes, just left in £ instead of scaled to a rate — Price+Std COGS+Freight+Amazon Fees+FBA Fees sums exactly to what a single "Price" column would show.'}
                   {showChannelMix && ' Channel Mix is carved OUT of Price (not incremental to it) — it isolates how much of a row’s own blended-price move came from its Amazon/Shopify unit split shifting, as opposed to either channel’s own price genuinely moving.'}</>
               )}
             </div>
