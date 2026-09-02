@@ -3978,6 +3978,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       COALESCE(s.country, r.country) AS country,
       COALESCE(s.sku, r.sku) AS sku,
       sp.asin,
+      sp.parent_asin,
       sp.brand,
       COALESCE(sp.product_name, s.product_title) AS product_name,
       sp.image_url,
@@ -4094,7 +4095,7 @@ app.get('/api/pvm', async (req, res) => {
         // math below, so at country/brand level they're just whichever row seeded the key.
         if (!acc.has(key)) {
           acc.set(key, {
-            key, label: labelOf(r), asin: r.asin, sku: r.sku,
+            key, label: labelOf(r), asin: r.asin, parent_asin: r.parent_asin, sku: r.sku,
             product_name: r.product_name, image_url: r.image_url, value: 0, units: 0, revenue: 0,
             cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0,
           });
@@ -4129,9 +4130,11 @@ app.get('/api/pvm', async (req, res) => {
     // Per-member bridge. Volume is priced at the blended avg1 (not the member's own
     // price) so that what the member's own price premium/discount contributes lands
     // in mix instead of being absorbed into volume — and so members sum to the totals.
+    const zeroAcc = { value: 0, units: 0, revenue: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
+    const profitOf = (m) => m.revenue - m.cogs_std - m.cogs_freight - m.fee_amz - m.fee_fba;
     const members = memberKeys.map(key => {
-      const a = acc1.get(key) || { value: 0, units: 0 };
-      const b = acc2.get(key) || { value: 0, units: 0 };
+      const a = acc1.get(key) || zeroAcc;
+      const b = acc2.get(key) || zeroAcc;
       const meta = acc2.get(key) || acc1.get(key);
       const p1 = a.units > 0 ? a.value / a.units : 0;
       const p2 = b.units > 0 ? b.value / b.units : 0;
@@ -4146,9 +4149,16 @@ app.get('/api/pvm', async (req, res) => {
       const price  = bothPresent ? (p2 - p1) * b.units : 0;
       const volume = bothPresent ? (b.units - a.units) * avg1 : delta;
       return {
-        key, label: meta.label, asin: meta.asin, sku: meta.sku, product_name: meta.product_name, image_url: meta.image_url,
+        key, label: meta.label, asin: meta.asin, parent_asin: meta.parent_asin, sku: meta.sku,
+        product_name: meta.product_name, image_url: meta.image_url,
         s1_value: a.value, s1_units: a.units, s1_price: p1,
         s2_value: b.value, s2_units: b.units, s2_price: p2,
+        // Raw revenue/profit are returned in EVERY metric mode (s1_value/s2_value hold
+        // whichever one the active bridge is built on) so the client can show a margin %
+        // alongside the £ bridge, and can re-derive it for a parent-ASIN group — a rate
+        // is profit ÷ revenue, so it can't be averaged from the child rows' own rates.
+        s1_revenue: a.revenue, s1_profit: profitOf(a),
+        s2_revenue: b.revenue, s2_profit: profitOf(b),
         price, volume,
         mix: delta - price - volume,
         delta,
