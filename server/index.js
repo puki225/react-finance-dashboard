@@ -3863,6 +3863,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
   const amazonSql = `
     amazon_sales AS (
       SELECT
+        'amazon'::text AS channel,
         COALESCE(ao.shipping_country, 'Unknown') AS country,
         aol.sku,
         -- sku_parameters.product_name is never populated on this account (see other
@@ -3887,10 +3888,11 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
       ${cogsLateral('ao.order_date::date')}
       WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
-      GROUP BY 1, 2
+      GROUP BY 1, 2, 3
     ),
     amazon_refunds AS (
       SELECT
+        'amazon'::text AS channel,
         COALESCE(ao.shipping_country, 'Unknown') AS country,
         olr.sku,
         SUM(COALESCE(olr.quantity_refunded, 0))::int AS units_refunded,
@@ -3905,12 +3907,13 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
       LEFT JOIN amazon_orders ao ON ao.amazon_order_id = olr.amazon_order_id
       WHERE olr.sku IS NOT NULL AND olr.refund_date::date BETWEEN $1 AND $2
-      GROUP BY 1, 2
+      GROUP BY 1, 2, 3
     )`;
 
   const shopifySql = `
     shopify_sales AS (
       SELECT
+        'shopify'::text AS channel,
         COALESCE(so.shipping_country, 'Unknown') AS country,
         sol.sku,
         MAX(sol.product_title) AS product_title,
@@ -3925,12 +3928,17 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       LEFT JOIN sku_parameters sp ON sp.sku = sol.sku
       ${cogsLateral('sol.order_date::date')}
       WHERE sol.order_date::date BETWEEN $1 AND $2
-      GROUP BY 1, 2
+      GROUP BY 1, 2, 3
     ),
     shopify_refunds AS (
       SELECT
+        'shopify'::text AS channel,
         COALESCE(so.shipping_country, 'Unknown') AS country,
         sol.sku,
+        -- Shopify has no per-line refunded QUANTITY anywhere in this schema (only a
+        -- refund AMOUNT per transaction) — left at 0 rather than guessing, so net units
+        -- below is exact for Amazon and simply un-netted (matches today's behaviour)
+        -- for Shopify, instead of quietly feeding a fabricated count into price math.
         0::int AS units_refunded,
         SUM((st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor(so.shipping_country))::numeric AS refunded,
         0::numeric AS fee_commission_refunded,
@@ -3943,7 +3951,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
         FROM shopify_order_lines GROUP BY shopify_order_id
       ) order_totals ON order_totals.shopify_order_id = st.shopify_order_id
       WHERE st.kind = 'refund' AND st.status = 'success' AND st.transaction_date::date BETWEEN $1 AND $2
-      GROUP BY 1, 2
+      GROUP BY 1, 2, 3
     )`;
 
   // Which channel CTEs feed the union — 'all' stacks both.
@@ -3951,30 +3959,34 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
   if (channel !== 'shopify') parts.push(amazonSql);
   if (channel !== 'amazon') parts.push(shopifySql);
   const salesUnion = [
-    channel !== 'shopify' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM amazon_sales' : null,
-    channel !== 'amazon' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM shopify_sales' : null,
+    channel !== 'shopify' ? 'SELECT channel, country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM amazon_sales' : null,
+    channel !== 'amazon' ? 'SELECT channel, country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM shopify_sales' : null,
   ].filter(Boolean).join(' UNION ALL ');
   const refundUnion = [
-    channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
-    channel !== 'amazon' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM shopify_refunds' : null,
+    channel !== 'shopify' ? 'SELECT channel, country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
+    channel !== 'amazon' ? 'SELECT channel, country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM shopify_refunds' : null,
   ].filter(Boolean).join(' UNION ALL ');
 
   const result = await pool.query(`
     WITH ${parts.join(',\n')},
     sales AS (
-      SELECT country, sku, MAX(product_title) AS product_title, SUM(units)::int AS units,
+      SELECT channel, country, sku, MAX(product_title) AS product_title, SUM(units)::int AS units,
              SUM(net_before_refunds)::numeric AS net_before_refunds,
              SUM(fee_amz)::numeric AS fee_amz, SUM(fee_fba)::numeric AS fee_fba,
              SUM(cogs_std)::numeric AS cogs_std, SUM(cogs_freight)::numeric AS cogs_freight
-      FROM (${salesUnion}) s GROUP BY 1, 2
+      FROM (${salesUnion}) s GROUP BY 1, 2, 3
     ),
     refunds AS (
-      SELECT country, sku, SUM(units_refunded)::int AS units_refunded, SUM(refunded)::numeric AS refunded,
+      SELECT channel, country, sku, SUM(units_refunded)::int AS units_refunded, SUM(refunded)::numeric AS refunded,
              SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
              SUM(fee_refund_admin)::numeric AS fee_refund_admin
-      FROM (${refundUnion}) r GROUP BY 1, 2
+      FROM (${refundUnion}) r GROUP BY 1, 2, 3
     )
     SELECT
+      -- Kept per-channel (not collapsed into (country, sku)) so /api/pvm can decompose
+      -- each product's OWN blended price/margin into an Amazon-vs-Shopify split — see
+      -- the "channel mix" fields on each member in the response.
+      COALESCE(s.channel, r.channel) AS channel,
       COALESCE(s.country, r.country) AS country,
       COALESCE(s.sku, r.sku) AS sku,
       sp.asin,
@@ -3982,7 +3994,11 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       sp.brand,
       COALESCE(sp.product_name, s.product_title) AS product_name,
       sp.image_url,
-      COALESCE(s.units, 0)::int AS units,
+      -- NET of returned units (Amazon: exact, from quantity_refunded; Shopify: not
+      -- netted, see shopify_refunds above) — a return is a genuinely lost unit, not
+      -- just lost revenue, so PVM's Volume term should move with it instead of the
+      -- whole swing landing in Price/Mix as it would off a gross unit count.
+      (COALESCE(s.units, 0) - COALESCE(r.units_refunded, 0))::int AS units,
       -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
       (COALESCE(s.net_before_refunds, 0) - COALESCE(r.refunded, 0))::numeric AS net_revenue,
       COALESCE(s.cogs_std, 0)::numeric AS cogs_std,
@@ -3994,7 +4010,7 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       COALESCE(s.fee_fba, 0)::numeric AS fee_fba,
       (COALESCE(s.fee_amz, 0) + COALESCE(s.fee_fba, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fees
     FROM sales s
-    FULL OUTER JOIN refunds r ON r.country = s.country AND r.sku = s.sku
+    FULL OUTER JOIN refunds r ON r.channel = s.channel AND r.country = s.country AND r.sku = s.sku
     LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, r.sku)
   `, [dateFrom, dateTo]);
   return result.rows;
@@ -4098,16 +4114,25 @@ app.get('/api/pvm', async (req, res) => {
             key, label: labelOf(r), asin: r.asin, parent_asin: r.parent_asin, sku: r.sku,
             product_name: r.product_name, image_url: r.image_url, value: 0, units: 0, revenue: 0,
             cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0,
+            // Per-channel splits of the SAME member — only consumed by the channel-mix
+            // fields below (Amazon vs Shopify pricing/margin differ, so a member sold on
+            // both has a "channel mix" hiding inside its own blended price/rate). Cheap
+            // to track unconditionally; zero and unused for a single-channel member.
+            value_amz: 0, units_amz: 0, revenue_amz: 0,
+            value_shopify: 0, units_shopify: 0, revenue_shopify: 0,
           });
         }
         const m = acc.get(key);
-        m.value += valueOf(r, fx);
-        m.units += parseInt(r.units || 0, 10);
-        m.revenue += revenueOf(r, fx);
+        const rValue = valueOf(r, fx), rUnits = parseInt(r.units || 0, 10), rRevenue = revenueOf(r, fx);
+        m.value += rValue;
+        m.units += rUnits;
+        m.revenue += rRevenue;
         m.cogs_std += cogsStdOf(r, fx);
         m.cogs_freight += cogsFreightOf(r, fx);
         m.fee_amz += feeAmzOf(r, fx);
         m.fee_fba += feeFbaOf(r, fx);
+        if (r.channel === 'amazon') { m.value_amz += rValue; m.units_amz += rUnits; m.revenue_amz += rRevenue; }
+        else if (r.channel === 'shopify') { m.value_shopify += rValue; m.units_shopify += rUnits; m.revenue_shopify += rRevenue; }
       }
       return acc;
     };
@@ -4130,7 +4155,10 @@ app.get('/api/pvm', async (req, res) => {
     // Per-member bridge. Volume is priced at the blended avg1 (not the member's own
     // price) so that what the member's own price premium/discount contributes lands
     // in mix instead of being absorbed into volume — and so members sum to the totals.
-    const zeroAcc = { value: 0, units: 0, revenue: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
+    const zeroAcc = {
+      value: 0, units: 0, revenue: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0,
+      value_amz: 0, units_amz: 0, revenue_amz: 0, value_shopify: 0, units_shopify: 0, revenue_shopify: 0,
+    };
     const profitOf = (m) => m.revenue - m.cogs_std - m.cogs_freight - m.fee_amz - m.fee_fba;
     const members = memberKeys.map(key => {
       const a = acc1.get(key) || zeroAcc;
@@ -4148,6 +4176,31 @@ app.get('/api/pvm', async (req, res) => {
       const bothPresent = a.units > 0 && b.units > 0;
       const price  = bothPresent ? (p2 - p1) * b.units : 0;
       const volume = bothPresent ? (b.units - a.units) * avg1 : delta;
+
+      // ─── Channel mix (carved OUT of Price, exact — see the /api/pvm module comment
+      // above the response for the derivation) ─────────────────────────────────────
+      // This member's own blended price/unit (p1/p2) already averages together whatever
+      // it sold on Amazon vs Shopify. If those two channels sell at different price
+      // points and the UNIT SPLIT between them shifts, that alone moves the blend even
+      // if neither channel's own price changed — exactly the kind of "share shift"
+      // Mix normally captures, just at a finer grain than Price currently sees it. Walk
+      // p1 → p2 the same one-driver-at-a-time way the margin-rate drivers below do:
+      // hold each channel's own per-unit price at its scenario-1 level and swap only the
+      // unit WEIGHTS to scenario-2's split, isolating the pure mix-shift contribution.
+      let channelMix = 0;
+      if (bothPresent && a.units_amz + a.units_shopify > 0 && b.units_amz + b.units_shopify > 0) {
+        const pA1 = a.units_amz > 0 ? a.value_amz / a.units_amz : 0;
+        const pA2 = b.units_amz > 0 ? b.value_amz / b.units_amz : 0;
+        const pS1 = a.units_shopify > 0 ? a.value_shopify / a.units_shopify : 0;
+        const pS2 = b.units_shopify > 0 ? b.value_shopify / b.units_shopify : 0;
+        const w1A = a.units_amz / a.units, w1S = a.units_shopify / a.units;
+        // Own-channel-price contribution, at scenario-1 weights — whatever's left of the
+        // member's own price delta is the pure channel-mix (unit-split) contribution.
+        const ownPriceContribution = w1A * (pA2 - pA1) + w1S * (pS2 - pS1);
+        const mixContribution = (p2 - p1) - ownPriceContribution;
+        channelMix = mixContribution * b.units;
+      }
+
       return {
         key, label: meta.label, asin: meta.asin, parent_asin: meta.parent_asin, sku: meta.sku,
         product_name: meta.product_name, image_url: meta.image_url,
@@ -4159,17 +4212,20 @@ app.get('/api/pvm', async (req, res) => {
         // is profit ÷ revenue, so it can't be averaged from the child rows' own rates.
         s1_revenue: a.revenue, s1_profit: profitOf(a),
         s2_revenue: b.revenue, s2_profit: profitOf(b),
-        price, volume,
+        price, volume, channel_mix: channelMix,
         mix: delta - price - volume,
         delta,
       };
     }).sort((x, y) => Math.abs(y.delta) - Math.abs(x.delta));
 
     const sum = (arr, f) => arr.reduce((t, x) => t + f(x), 0);
-    const totalDelta   = s2Value - s1Value;
-    const priceEffect  = sum(members, m => m.price);
-    const volumeEffect = sum(members, m => m.volume);
-    const mixEffect    = totalDelta - priceEffect - volumeEffect;
+    const totalDelta      = s2Value - s1Value;
+    const priceEffect     = sum(members, m => m.price);
+    const volumeEffect    = sum(members, m => m.volume);
+    const mixEffect       = totalDelta - priceEffect - volumeEffect;
+    // Exact sub-total of priceEffect (see channelMix derivation above), not incremental
+    // to it — only meaningful with channel='all' selected, see the client for the gate.
+    const channelMixEffect = sum(members, m => m.channel_mix);
 
     // ─── Margin-rate (percentage-point) bridge — Margin mode only ──────────────────
     // A margin RATE (profit ÷ revenue) is a ratio, not an additive £ amount, so it can't
@@ -4196,8 +4252,8 @@ app.get('/api/pvm', async (req, res) => {
 
       const pctByKey = new Map();
       for (const key of memberKeys) {
-        const a = acc1.get(key) || { value: 0, revenue: 0, units: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
-        const b = acc2.get(key) || { value: 0, revenue: 0, units: 0, cogs_std: 0, cogs_freight: 0, fee_amz: 0, fee_fba: 0 };
+        const a = acc1.get(key) || zeroAcc;
+        const b = acc2.get(key) || zeroAcc;
         const rev1 = a.revenue, rev2 = b.revenue;
         const rate1 = rev1 !== 0 ? (a.value / rev1) * 100 : 0;
         const rate2 = rev2 !== 0 ? (b.value / rev2) * 100 : 0;
@@ -4240,6 +4296,33 @@ app.get('/api/pvm', async (req, res) => {
           fbaFeeDriver  = w1 * (r5 - r4);
         }
 
+        // ─── Channel mix (carved OUT of rate_effect, exact) ───────────────────────────
+        // This member's own margin rate (rate1/rate2) already blends together whatever
+        // it earned on Amazon vs Shopify — different fee structures (Amazon: referral +
+        // FBA; Shopify: neither, in this data) mean those two channel rates can differ a
+        // lot. If the REVENUE split between them shifts, that alone moves the blended
+        // rate even if neither channel's own rate moved — same idea as the 5 drivers
+        // above, just cut by channel instead of by cost category, so it's kept as an
+        // independent split of rate_effect rather than a 6th sequential step (channel
+        // touches price AND every fee simultaneously — it doesn't sit "between" COGS and
+        // Freight in a single walk the way those five genuinely sequential drivers do).
+        let channelMixDriver = 0;
+        if (bothPresent) {
+          const revAmz1 = a.revenue_amz, revShop1 = a.revenue_shopify;
+          const revAmz2 = b.revenue_amz, revShop2 = b.revenue_shopify;
+          const rateAmz1 = revAmz1 !== 0 ? (a.value_amz / revAmz1) * 100 : 0;
+          const rateShop1 = revShop1 !== 0 ? (a.value_shopify / revShop1) * 100 : 0;
+          const rateAmz2 = revAmz2 !== 0 ? (b.value_amz / revAmz2) * 100 : 0;
+          const rateShop2 = revShop2 !== 0 ? (b.value_shopify / revShop2) * 100 : 0;
+          const localW1Amz = rev1 !== 0 ? revAmz1 / rev1 : 0;
+          const localW1Shop = rev1 !== 0 ? revShop1 / rev1 : 0;
+          // Own-channel-rate contribution, at scenario-1 revenue-share weights — whatever
+          // is left of this member's own rate delta is the pure channel-mix (revenue
+          // split shifting between Amazon/Shopify) contribution.
+          const ownRateContribution = localW1Amz * (rateAmz2 - rateAmz1) + localW1Shop * (rateShop2 - rateShop1);
+          channelMixDriver = w1 * ((rate2 - rate1) - ownRateContribution);
+        }
+
         pctByKey.set(key, {
           s1_margin_pct: rate1, s2_margin_pct: rate2,
           rate_effect: rateEffect,
@@ -4248,6 +4331,7 @@ app.get('/api/pvm', async (req, res) => {
           freight_effect: freightDriver,
           amz_fee_effect: amzFeeDriver,
           fba_fee_effect: fbaFeeDriver,
+          channel_mix_effect: channelMixDriver,
           mix_effect_pct: deltaContribution - rateEffect,
           delta_pct: deltaContribution,
         });
@@ -4270,6 +4354,9 @@ app.get('/api/pvm', async (req, res) => {
         freight_effect: sum(members, m => m.freight_effect),
         amz_fee_effect: sum(members, m => m.amz_fee_effect),
         fba_fee_effect: sum(members, m => m.fba_fee_effect),
+        // Exact sub-total of rate_effect, not incremental to it — only meaningful with
+        // channel='all' selected, see the client for the gate.
+        channel_mix_effect: sum(members, m => m.channel_mix_effect),
         mix_effect: pctMixEffect,
         total_delta_pct: totalPctDelta,
       };
@@ -4284,7 +4371,7 @@ app.get('/api/pvm', async (req, res) => {
       currency_symbol: currencySymbol(reportingCurrency),
       scenario1: { from: s1_from, to: s1_to, value: s1Value, units: s1Units, avg_price: avg1 },
       scenario2: { from: s2_from, to: s2_to, value: s2Value, units: s2Units, avg_price: avg2 },
-      bridge: { price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta },
+      bridge: { price: priceEffect, volume: volumeEffect, mix: mixEffect, total_delta: totalDelta, channel_mix: channelMixEffect },
       margin_pct_bridge: marginPctBridge,
       members,
     });

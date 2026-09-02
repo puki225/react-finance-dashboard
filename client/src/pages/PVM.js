@@ -446,6 +446,11 @@ export default function PVM() {
   const clearFilters = () => setFilters({ country: [], brand: [], asin: [], sku: [] });
   const hasActiveFilters = filters.country.length || filters.brand.length || filters.asin.length || filters.sku.length;
   const showPct = metric === 'margin' && marginView === 'percent';
+  // Channel Mix (revenue/margin hiding inside a member's own blended Price/Rate because
+  // its Amazon-vs-Shopify unit or revenue split shifted) is only a meaningful, distinct
+  // story when both channels are actually in view — filtered to one channel, every row
+  // IS single-channel, so it would just be a column of zeros. Drop it entirely then.
+  const showChannelMix = channel === 'all';
 
   // Empty filter arrays must be omitted entirely — URLSearchParams would otherwise
   // serialise them as literal "" and the server would filter on that. The CURRENT
@@ -572,9 +577,11 @@ export default function PVM() {
       s1_margin_pct: marginPct(sumOf('s1_revenue'), sumOf('s1_profit')),
       s2_margin_pct: marginPct(sumOf('s2_revenue'), sumOf('s2_profit')),
       price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), delta: sumOf('delta'),
+      channel_mix: sumOf('channel_mix'),
       price_effect: sumOf('price_effect'), cogs_effect: sumOf('cogs_effect'),
       freight_effect: sumOf('freight_effect'), amz_fee_effect: sumOf('amz_fee_effect'),
       fba_fee_effect: sumOf('fba_fee_effect'), rate_effect: sumOf('rate_effect'),
+      channel_mix_effect: sumOf('channel_mix_effect'),
       mix_effect_pct: sumOf('mix_effect_pct'), delta_pct: sumOf('delta_pct'),
     };
   };
@@ -655,7 +662,7 @@ export default function PVM() {
     return {
       scenario1: { ...data.scenario1, value: s1Value, units: s1Units, avg_price: s1Units ? s1Value / s1Units : 0 },
       scenario2: { ...data.scenario2, value: s2Value, units: s2Units, avg_price: s2Units ? s2Value / s2Units : 0 },
-      bridge: { price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value },
+      bridge: { price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value, channel_mix: sumOf('channel_mix') },
     };
   }, [data, rawMembers, selfSelectionActive, filters]);
 
@@ -834,7 +841,7 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showChannelMix ? 120 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {(showPct ? [
@@ -848,6 +855,7 @@ export default function PVM() {
                       { label: 'Freight', key: 'freight_effect' },
                       { label: 'Amazon Fees', key: 'amz_fee_effect' },
                       { label: 'FBA Fees', key: 'fba_fee_effect' },
+                      ...(showChannelMix ? [{ label: 'Channel Mix', key: 'channel_mix_effect' }] : []),
                       { label: 'Mix', key: 'mix_effect_pct' },
                       { label: 'Δ Total', key: 'delta_pct' },
                     ] : [
@@ -861,6 +869,7 @@ export default function PVM() {
                       { label: 'S2 Value', key: 's2_value' },
                       { label: 'S2 Margin %', key: 's2_margin_pct' },
                       { label: 'Price', key: 'price' },
+                      ...(showChannelMix ? [{ label: 'Channel Mix', key: 'channel_mix' }] : []),
                       { label: 'Volume', key: 'volume' },
                       { label: 'Mix', key: 'mix' },
                       { label: 'Δ Total', key: 'delta' },
@@ -883,7 +892,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {displayRows.length === 0 && (
-                    <tr><td colSpan={showPct ? 12 : 13} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={(showPct ? 12 : 13) + (showChannelMix ? 1 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {displayRows.map(({ row: m, depth }) => {
                     const cell = (v, color) => (
@@ -954,6 +963,7 @@ export default function PVM() {
                             {cell(fmtSignedPct(m.freight_effect), effColor(m.freight_effect))}
                             {cell(fmtSignedPct(m.amz_fee_effect), effColor(m.amz_fee_effect))}
                             {cell(fmtSignedPct(m.fba_fee_effect), effColor(m.fba_fee_effect))}
+                            {showChannelMix && cell(fmtSignedPct(m.channel_mix_effect), effColor(m.channel_mix_effect))}
                             {cell(fmtSignedPct(m.mix_effect_pct), effColor(m.mix_effect_pct))}
                             {cell(fmtSignedPct(m.delta_pct), effColor(m.delta_pct))}
                           </>
@@ -968,6 +978,7 @@ export default function PVM() {
                             {cell(fmtMoney(m.s2_value, sym))}
                             {cell(fmtPct(m.s2_margin_pct), 'var(--muted)')}
                             {cell(fmtSigned(m.price, sym), effColor(m.price))}
+                            {showChannelMix && cell(fmtSigned(m.channel_mix, sym), effColor(m.channel_mix))}
                             {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
                             {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
                             {cell(fmtSigned(m.delta, sym), effColor(m.delta))}
@@ -992,6 +1003,7 @@ export default function PVM() {
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.freight_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.amz_fee_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.fba_fee_effect)}</td>
+                          {showChannelMix && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.channel_mix_effect)}</td>}
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.mix_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSignedPct(data.margin_pct_bridge.total_delta_pct)}</td>
                         </>
@@ -1006,6 +1018,7 @@ export default function PVM() {
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtMoney(data.scenario2.value, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(tableTotals.s2_margin_pct)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price, sym)}</td>
+                          {showChannelMix && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.channel_mix, sym)}</td>}
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSigned(data.bridge.total_delta, sym)}</td>
@@ -1021,11 +1034,13 @@ export default function PVM() {
                 <>Rate is each row's own margin-rate change, weighted at its scenario-1 revenue share — it isolates
                   "did this row itself get more/less profitable" from "did the revenue mix shift toward it." Mix is
                   the residual, capturing that share shift. A row with revenue in only one scenario has no rate to
-                  compare, so its whole movement counts as Mix. Rows sum exactly to the Total.</>
+                  compare, so its whole movement counts as Mix. Rows sum exactly to the Total.
+                  {showChannelMix && ' Channel Mix is carved OUT of Rate (not incremental to it) — it isolates how much of a row’s own rate move came from its Amazon/Shopify revenue split shifting, as opposed to either channel genuinely getting more or less profitable.'}</>
               ) : (
                 <>Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
                   priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
-                  mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.</>
+                  mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
+                  {showChannelMix && ' Channel Mix is carved OUT of Price (not incremental to it) — it isolates how much of a row’s own blended-price move came from its Amazon/Shopify unit split shifting, as opposed to either channel’s own price genuinely moving.'}</>
               )}
             </div>
           </div>
