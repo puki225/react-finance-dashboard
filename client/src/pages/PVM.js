@@ -219,16 +219,11 @@ function GrowthArrow({ text, color, isMobile, columns }) {
 
 // ─── Bridge chart engine ───────────────────────────────────────────────────
 // Shared bar-rendering for the £ bridge, the margin-% bridge, and Margin's £-mode
-// driver breakdown — a bar is just {label, sub, start, end, kind, value, display}
-// with `display` pre-formatted by the caller, so this component has no £-or-%
-// specific logic at all. Bars are positioned against a shared scale that always
-// includes 0 so a negative effect reads as genuinely below the axis, not just shorter.
-// kind: 'total' (Scenario 1/2, solid accent) | 'effect' (a real additive step in the
-// chain to Scenario 2, solid green/red) | 'reference' (Channel Mix — see the two
-// Waterfall components below: it's an exact slice of a total that's ALSO carved up by
-// the driver bars sitting next to it, e.g. Price+Std COGS+...+FBA Fees, so it can't be
-// chained onto the running total without double-counting. Drawn hatched/dashed, always
-// measured from the pre-driver baseline, to read as "of which" rather than "and then").
+// driver breakdown — a bar is just {label, sub, start, end, kind: 'total'|'effect',
+// value, display} with `display` pre-formatted by the caller, so this component has
+// no £-or-% specific logic at all. Bars are positioned against a shared scale that
+// always includes 0 so a negative effect reads as genuinely below the axis, not just
+// shorter.
 function BridgeChart({ bars, isMobile }) {
   const H = isMobile ? 220 : 300;
   // Reserved space below the bar canvas purely for a value label that lands there — a bar
@@ -248,7 +243,6 @@ function BridgeChart({ bars, isMobile }) {
       {bars.map((b, i) => {
         const top = Math.min(y(b.start), y(b.end));
         const height = Math.max(Math.abs(y(b.end) - y(b.start)), 2);
-        const isReference = b.kind === 'reference';
         const positive = b.kind === 'total' ? true : (b.value || 0) >= 0;
         const color = b.kind === 'total' ? 'var(--accent2)' : positive ? 'var(--green)' : 'var(--red)';
         // Labels sit above the bar, or below it when the bar reaches the very top.
@@ -258,18 +252,15 @@ function BridgeChart({ bars, isMobile }) {
             <div style={{ position: 'relative', height: H, marginBottom: LABEL_GAP }}>
               <div style={{
                 position: 'absolute', top, height, left: '10%', width: '80%',
-                background: isReference ? 'transparent' : color,
-                border: isReference ? `2px dashed ${color}` : 'none',
-                opacity: b.kind === 'total' ? 1 : 0.85,
+                background: color, opacity: b.kind === 'total' ? 1 : 0.85,
                 borderRadius: 4, transition: 'all 0.25s ease',
-                boxSizing: 'border-box',
               }} />
               <div style={{
                 position: 'absolute', left: 0, right: 0, textAlign: 'center',
                 top: labelAbove ? top - 20 : top + height + 4,
                 fontSize: isMobile ? 10 : 12, fontWeight: 700, color,
                 fontFamily: 'var(--mono)', whiteSpace: 'nowrap',
-              }}>{isReference ? '≈ ' : ''}{b.display}</div>
+              }}>{b.display}</div>
               {/* Zero axis, only drawn when the scale actually crosses it */}
               {yMin < 0 && yMax > 0 && (
                 <div style={{ position: 'absolute', top: y(0), left: 0, right: 0, borderTop: '1px dashed var(--border)' }} />
@@ -292,15 +283,9 @@ function BridgeChart({ bars, isMobile }) {
 // vs Volume vs Mix" reads at a glance instead of requiring mental division.
 // showMarginDrivers (Margin's £ view) explodes Price into the same Std COGS/Freight/
 // Amazon Fees/FBA Fees drivers the % bridge already shows, just left in £ — mirrors
-// the table below exactly. showChannelMix draws Channel Mix alongside them: in
-// Revenue mode it's an exact slice of the single Price bucket, so it chains onto the
-// running total like any other bar (Price here is shown NET of it); in Margin's £
-// view it's a slice of the Price+Std COGS+...+FBA Fees total taken together (not of
-// any one of them), so it can't be chained without double-counting — drawn as a
-// dashed reference bar instead (see BridgeChart).
-function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDrivers, showChannelMix }) {
+// the table below exactly.
+function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDrivers }) {
   const c1 = s1.value;
-  const priceNet = showMarginDrivers ? bridge.price : bridge.price - (showChannelMix ? bridge.channel_mix : 0);
   let c = c1;
   const driverBars = [];
   if (showMarginDrivers) {
@@ -316,20 +301,8 @@ function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDri
       driverBars.push({ label, sub, start, end: c, kind: 'effect', value, display: fmtSigned(value, sym) });
     }
   } else {
-    const start = c; c += priceNet;
-    driverBars.push({ label: 'Price', sub: 'Δprice × vol₂, per member', start, end: c, kind: 'effect', value: priceNet, display: fmtSigned(priceNet, sym) });
-  }
-  const cAfterDrivers = c;
-  const channelMixBar = showChannelMix ? {
-    label: 'Channel Mix', sub: showMarginDrivers ? 'of which, Amazon⇄Shopify split' : 'Δunit split, per member',
-    start: c1, end: c1 + bridge.channel_mix, kind: showMarginDrivers ? 'reference' : 'effect',
-    value: bridge.channel_mix, display: fmtSigned(bridge.channel_mix, sym),
-  } : null;
-  if (channelMixBar && !showMarginDrivers) {
-    // Revenue mode: a real chained step (Price above is already net of it).
-    const start = cAfterDrivers; const end = start + bridge.channel_mix;
-    channelMixBar.start = start; channelMixBar.end = end;
-    c = end;
+    const start = c; c += bridge.price;
+    driverBars.push({ label: 'Price', sub: 'Δprice × vol₂, per member', start, end: c, kind: 'effect', value: bridge.price, display: fmtSigned(bridge.price, sym) });
   }
   const cVolStart = c;
   const cVol = cVolStart + bridge.volume;
@@ -347,7 +320,6 @@ function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDri
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtMoney(c1, sym) },
     ...driverBars,
-    ...(channelMixBar ? [channelMixBar] : []),
     { label: 'Volume', sub: 'Δvol × blended price₁', start: cVolStart, end: cVol, kind: 'effect', value: bridge.volume, display: withPct(bridge.volume) },
     { label: 'Mix', sub: 'balancing figure', start: cVol, end: cMix, kind: 'effect', value: bridge.mix, display: withPct(bridge.mix) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total', display: fmtMoney(s2.value, sym) },
@@ -372,11 +344,7 @@ function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDri
 // doesn't move a ratio at all. What used to be one lumped "Rate" bar is exploded into
 // its 5 underlying drivers (they telescope exactly to the old Rate figure — see the
 // server's /api/pvm margin_pct_bridge comment for the derivation); Mix is unchanged.
-// showChannelMix draws Channel Mix as a dashed reference bar (see BridgeChart) — it's
-// carved out of rate_effect as a WHOLE (the five drivers below combined), not out of
-// any single one of them, so it can't be chained onto the running total without
-// double-counting; it's measured from the pre-driver baseline instead.
-function MarginPctWaterfall({ pctBridge, s1, s2, isMobile, showChannelMix }) {
+function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
   const c1 = pctBridge.scenario1_pct;
   const c2 = c1 + pctBridge.price_effect;
   const c3 = c2 + pctBridge.cogs_effect;
@@ -392,10 +360,6 @@ function MarginPctWaterfall({ pctBridge, s1, s2, isMobile, showChannelMix }) {
     { label: 'Freight', sub: 'inbound freight/unit', start: c3, end: c4, kind: 'effect', value: pctBridge.freight_effect, display: fmtSignedPct(pctBridge.freight_effect) },
     { label: 'Amazon Fees', sub: 'referral + closing fees', start: c4, end: c5, kind: 'effect', value: pctBridge.amz_fee_effect, display: fmtSignedPct(pctBridge.amz_fee_effect) },
     { label: 'FBA Fees', sub: 'fulfillment fee/unit', start: c5, end: c6, kind: 'effect', value: pctBridge.fba_fee_effect, display: fmtSignedPct(pctBridge.fba_fee_effect) },
-    ...(showChannelMix ? [{
-      label: 'Channel Mix', sub: 'of which, Amazon⇄Shopify split', start: c1, end: c1 + pctBridge.channel_mix_effect,
-      kind: 'reference', value: pctBridge.channel_mix_effect, display: fmtSignedPct(pctBridge.channel_mix_effect),
-    }] : []),
     { label: 'Mix', sub: 'balancing figure', start: c6, end: c7, kind: 'effect', value: pctBridge.mix_effect, display: fmtSignedPct(pctBridge.mix_effect) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: pctBridge.scenario2_pct, kind: 'total', display: fmtPct(pctBridge.scenario2_pct) },
   ];
@@ -503,11 +467,6 @@ export default function PVM() {
   const clearFilters = () => setFilters({ country: [], brand: [], asin: [], sku: [] });
   const hasActiveFilters = filters.country.length || filters.brand.length || filters.asin.length || filters.sku.length;
   const showPct = metric === 'margin' && marginView === 'percent';
-  // Channel Mix (revenue/margin hiding inside a member's own blended Price/Rate because
-  // its Amazon-vs-Shopify unit or revenue split shifted) is only a meaningful, distinct
-  // story when both channels are actually in view — filtered to one channel, every row
-  // IS single-channel, so it would just be a column of zeros. Drop it entirely then.
-  const showChannelMix = channel === 'all';
   // Margin's £ view mirrors the same cost-driver breakdown the % view already has
   // (Price/Std COGS/Freight/Amazon Fees/FBA Fees), just left in £ instead of scaled to
   // a rate — meaningless in Revenue mode (there's no COGS/fees under a pure ASP move).
@@ -638,13 +597,11 @@ export default function PVM() {
       s1_margin_pct: marginPct(sumOf('s1_revenue'), sumOf('s1_profit')),
       s2_margin_pct: marginPct(sumOf('s2_revenue'), sumOf('s2_profit')),
       price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), delta: sumOf('delta'),
-      channel_mix: sumOf('channel_mix'),
       price_asp: sumOf('price_asp'), price_cogs: sumOf('price_cogs'), price_freight: sumOf('price_freight'),
       price_amz_fee: sumOf('price_amz_fee'), price_fba_fee: sumOf('price_fba_fee'),
       price_effect: sumOf('price_effect'), cogs_effect: sumOf('cogs_effect'),
       freight_effect: sumOf('freight_effect'), amz_fee_effect: sumOf('amz_fee_effect'),
       fba_fee_effect: sumOf('fba_fee_effect'), rate_effect: sumOf('rate_effect'),
-      channel_mix_effect: sumOf('channel_mix_effect'),
       mix_effect_pct: sumOf('mix_effect_pct'), delta_pct: sumOf('delta_pct'),
     };
   };
@@ -727,7 +684,6 @@ export default function PVM() {
       scenario2: { ...data.scenario2, value: s2Value, units: s2Units, avg_price: s2Units ? s2Value / s2Units : 0 },
       bridge: {
         price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value,
-        channel_mix: sumOf('channel_mix'),
         price_asp: sumOf('price_asp'), price_cogs: sumOf('price_cogs'), price_freight: sumOf('price_freight'),
         price_amz_fee: sumOf('price_amz_fee'), price_fba_fee: sumOf('price_fba_fee'),
       },
@@ -894,8 +850,8 @@ export default function PVM() {
               </span>
             </div>
             {showPct
-              ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} showChannelMix={showChannelMix} />
-              : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} showMarginDrivers={showMarginDrivers} showChannelMix={showChannelMix} />}
+              ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} />
+              : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} showMarginDrivers={showMarginDrivers} />}
           </div>
 
           {/* Breakdown table */}
@@ -909,7 +865,7 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showChannelMix ? 120 : 0) + (showMarginDrivers ? 480 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showMarginDrivers ? 480 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
                     {(showPct ? [
@@ -923,7 +879,6 @@ export default function PVM() {
                       { label: 'Freight', key: 'freight_effect' },
                       { label: 'Amazon Fees', key: 'amz_fee_effect' },
                       { label: 'FBA Fees', key: 'fba_fee_effect' },
-                      ...(showChannelMix ? [{ label: 'Channel Mix', key: 'channel_mix_effect' }] : []),
                       { label: 'Mix', key: 'mix_effect_pct' },
                       { label: 'Δ Total', key: 'delta_pct' },
                     ] : [
@@ -943,7 +898,6 @@ export default function PVM() {
                         { label: 'Amazon Fees', key: 'price_amz_fee' },
                         { label: 'FBA Fees', key: 'price_fba_fee' },
                       ] : []),
-                      ...(showChannelMix ? [{ label: 'Channel Mix', key: 'channel_mix' }] : []),
                       { label: 'Volume', key: 'volume' },
                       { label: 'Mix', key: 'mix' },
                       { label: 'Δ Total', key: 'delta' },
@@ -966,7 +920,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {displayRows.length === 0 && (
-                    <tr><td colSpan={(showPct ? 12 : 13) + (showChannelMix ? 1 : 0) + (showMarginDrivers ? 4 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={(showPct ? 12 : 13) + (showMarginDrivers ? 4 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {displayRows.map(({ row: m, depth }) => {
                     const cell = (v, color) => (
@@ -1037,7 +991,6 @@ export default function PVM() {
                             {cell(fmtSignedPct(m.freight_effect), effColor(m.freight_effect))}
                             {cell(fmtSignedPct(m.amz_fee_effect), effColor(m.amz_fee_effect))}
                             {cell(fmtSignedPct(m.fba_fee_effect), effColor(m.fba_fee_effect))}
-                            {showChannelMix && cell(fmtSignedPct(m.channel_mix_effect), effColor(m.channel_mix_effect))}
                             {cell(fmtSignedPct(m.mix_effect_pct), effColor(m.mix_effect_pct))}
                             {cell(fmtSignedPct(m.delta_pct), effColor(m.delta_pct))}
                           </>
@@ -1056,7 +1009,6 @@ export default function PVM() {
                             {showMarginDrivers && cell(fmtSigned(m.price_freight, sym), effColor(m.price_freight))}
                             {showMarginDrivers && cell(fmtSigned(m.price_amz_fee, sym), effColor(m.price_amz_fee))}
                             {showMarginDrivers && cell(fmtSigned(m.price_fba_fee, sym), effColor(m.price_fba_fee))}
-                            {showChannelMix && cell(fmtSigned(m.channel_mix, sym), effColor(m.channel_mix))}
                             {cell(fmtSigned(m.volume, sym), effColor(m.volume))}
                             {cell(fmtSigned(m.mix, sym), effColor(m.mix))}
                             {cell(fmtSigned(m.delta, sym), effColor(m.delta))}
@@ -1081,7 +1033,6 @@ export default function PVM() {
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.freight_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.amz_fee_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.fba_fee_effect)}</td>
-                          {showChannelMix && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.channel_mix_effect)}</td>}
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSignedPct(data.margin_pct_bridge.mix_effect)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSignedPct(data.margin_pct_bridge.total_delta_pct)}</td>
                         </>
@@ -1100,7 +1051,6 @@ export default function PVM() {
                           {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_freight, sym)}</td>}
                           {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_amz_fee, sym)}</td>}
                           {showMarginDrivers && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.price_fba_fee, sym)}</td>}
-                          {showChannelMix && <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.channel_mix, sym)}</td>}
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.volume, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtSigned(data.bridge.mix, sym)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtSigned(data.bridge.total_delta, sym)}</td>
@@ -1116,14 +1066,12 @@ export default function PVM() {
                 <>Rate is each row's own margin-rate change, weighted at its scenario-1 revenue share — it isolates
                   "did this row itself get more/less profitable" from "did the revenue mix shift toward it." Mix is
                   the residual, capturing that share shift. A row with revenue in only one scenario has no rate to
-                  compare, so its whole movement counts as Mix. Rows sum exactly to the Total.
-                  {showChannelMix && ' Channel Mix is carved OUT of Rate (not incremental to it) — it isolates how much of a row’s own rate move came from its Amazon/Shopify revenue split shifting, as opposed to either channel genuinely getting more or less profitable.'}</>
+                  compare, so its whole movement counts as Mix. Rows sum exactly to the Total.</>
               ) : (
                 <>Price is each row's own {unitLabel} change on its scenario-2 units. Volume is the unit change
                   priced at the blended scenario-1 {unitLabel} ({fmtMoney2(data.scenario1.avg_price, sym)}), so a row's
                   mix is its unit change × how far its own {unitLabel} sits from that blend. Rows sum exactly to the Total.
-                  {showMarginDrivers && ' Price/Std COGS/Freight/Amazon Fees/FBA Fees split the same margin/unit move the % bridge decomposes, just left in £ instead of scaled to a rate — Price+Std COGS+Freight+Amazon Fees+FBA Fees sums exactly to what a single "Price" column would show.'}
-                  {showChannelMix && ' Channel Mix is carved OUT of Price (not incremental to it) — it isolates how much of a row’s own blended-price move came from its Amazon/Shopify unit split shifting, as opposed to either channel’s own price genuinely moving.'}</>
+                  {showMarginDrivers && ' Price/Std COGS/Freight/Amazon Fees/FBA Fees split the same margin/unit move the % bridge decomposes, just left in £ instead of scaled to a rate — Price+Std COGS+Freight+Amazon Fees+FBA Fees sums exactly to what a single "Price" column would show.'}</>
               )}
             </div>
           </div>
