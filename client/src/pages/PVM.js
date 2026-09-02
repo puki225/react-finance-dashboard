@@ -218,13 +218,17 @@ function GrowthArrow({ text, color, isMobile, columns }) {
 }
 
 // ─── Bridge chart engine ───────────────────────────────────────────────────
-// Shared bar-rendering for both the £ bridge (5 columns: Scenario1/Price/Volume/
-// Mix/Scenario2) and the margin-% bridge (8 columns: Scenario1/Price/Std COGS/
-// Freight/Amazon Fees/FBA Fees/Mix/Scenario2) — a bar is just
-// {label, sub, start, end, kind: 'total'|'effect', value, display}
+// Shared bar-rendering for the £ bridge, the margin-% bridge, and Margin's £-mode
+// driver breakdown — a bar is just {label, sub, start, end, kind, value, display}
 // with `display` pre-formatted by the caller, so this component has no £-or-%
 // specific logic at all. Bars are positioned against a shared scale that always
 // includes 0 so a negative effect reads as genuinely below the axis, not just shorter.
+// kind: 'total' (Scenario 1/2, solid accent) | 'effect' (a real additive step in the
+// chain to Scenario 2, solid green/red) | 'reference' (Channel Mix — see the two
+// Waterfall components below: it's an exact slice of a total that's ALSO carved up by
+// the driver bars sitting next to it, e.g. Price+Std COGS+...+FBA Fees, so it can't be
+// chained onto the running total without double-counting. Drawn hatched/dashed, always
+// measured from the pre-driver baseline, to read as "of which" rather than "and then").
 function BridgeChart({ bars, isMobile }) {
   const H = isMobile ? 220 : 300;
   // Reserved space below the bar canvas purely for a value label that lands there — a bar
@@ -244,6 +248,7 @@ function BridgeChart({ bars, isMobile }) {
       {bars.map((b, i) => {
         const top = Math.min(y(b.start), y(b.end));
         const height = Math.max(Math.abs(y(b.end) - y(b.start)), 2);
+        const isReference = b.kind === 'reference';
         const positive = b.kind === 'total' ? true : (b.value || 0) >= 0;
         const color = b.kind === 'total' ? 'var(--accent2)' : positive ? 'var(--green)' : 'var(--red)';
         // Labels sit above the bar, or below it when the bar reaches the very top.
@@ -253,15 +258,18 @@ function BridgeChart({ bars, isMobile }) {
             <div style={{ position: 'relative', height: H, marginBottom: LABEL_GAP }}>
               <div style={{
                 position: 'absolute', top, height, left: '10%', width: '80%',
-                background: color, opacity: b.kind === 'total' ? 1 : 0.85,
+                background: isReference ? 'transparent' : color,
+                border: isReference ? `2px dashed ${color}` : 'none',
+                opacity: b.kind === 'total' ? 1 : 0.85,
                 borderRadius: 4, transition: 'all 0.25s ease',
+                boxSizing: 'border-box',
               }} />
               <div style={{
                 position: 'absolute', left: 0, right: 0, textAlign: 'center',
                 top: labelAbove ? top - 20 : top + height + 4,
                 fontSize: isMobile ? 10 : 12, fontWeight: 700, color,
                 fontFamily: 'var(--mono)', whiteSpace: 'nowrap',
-              }}>{b.display}</div>
+              }}>{isReference ? '≈ ' : ''}{b.display}</div>
               {/* Zero axis, only drawn when the scale actually crosses it */}
               {yMin < 0 && yMax > 0 && (
                 <div style={{ position: 'absolute', top: y(0), left: 0, right: 0, borderTop: '1px dashed var(--border)' }} />
@@ -282,11 +290,50 @@ function BridgeChart({ bars, isMobile }) {
 // showPctOfBase (Revenue mode only — see the call site) appends each effect's size as
 // a % of scenario-1's value alongside its £ figure, so "how much of the move is Price
 // vs Volume vs Mix" reads at a glance instead of requiring mental division.
-function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase }) {
+// showMarginDrivers (Margin's £ view) explodes Price into the same Std COGS/Freight/
+// Amazon Fees/FBA Fees drivers the % bridge already shows, just left in £ — mirrors
+// the table below exactly. showChannelMix draws Channel Mix alongside them: in
+// Revenue mode it's an exact slice of the single Price bucket, so it chains onto the
+// running total like any other bar (Price here is shown NET of it); in Margin's £
+// view it's a slice of the Price+Std COGS+...+FBA Fees total taken together (not of
+// any one of them), so it can't be chained without double-counting — drawn as a
+// dashed reference bar instead (see BridgeChart).
+function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase, showMarginDrivers, showChannelMix }) {
   const c1 = s1.value;
-  const c2 = c1 + bridge.price;
-  const c3 = c2 + bridge.volume;
-  const c4 = c3 + bridge.mix; // == s2.value, bar the balancing rounding
+  const priceNet = showMarginDrivers ? bridge.price : bridge.price - (showChannelMix ? bridge.channel_mix : 0);
+  let c = c1;
+  const driverBars = [];
+  if (showMarginDrivers) {
+    const steps = [
+      ['Price', 'ASP per unit', bridge.price_asp],
+      ['Std COGS', 'unit cost of goods', bridge.price_cogs],
+      ['Freight', 'inbound freight/unit', bridge.price_freight],
+      ['Amazon Fees', 'referral + closing fees', bridge.price_amz_fee],
+      ['FBA Fees', 'fulfillment fee/unit', bridge.price_fba_fee],
+    ];
+    for (const [label, sub, value] of steps) {
+      const start = c; c += value;
+      driverBars.push({ label, sub, start, end: c, kind: 'effect', value, display: fmtSigned(value, sym) });
+    }
+  } else {
+    const start = c; c += priceNet;
+    driverBars.push({ label: 'Price', sub: 'Δprice × vol₂, per member', start, end: c, kind: 'effect', value: priceNet, display: fmtSigned(priceNet, sym) });
+  }
+  const cAfterDrivers = c;
+  const channelMixBar = showChannelMix ? {
+    label: 'Channel Mix', sub: showMarginDrivers ? 'of which, Amazon⇄Shopify split' : 'Δunit split, per member',
+    start: c1, end: c1 + bridge.channel_mix, kind: showMarginDrivers ? 'reference' : 'effect',
+    value: bridge.channel_mix, display: fmtSigned(bridge.channel_mix, sym),
+  } : null;
+  if (channelMixBar && !showMarginDrivers) {
+    // Revenue mode: a real chained step (Price above is already net of it).
+    const start = cAfterDrivers; const end = start + bridge.channel_mix;
+    channelMixBar.start = start; channelMixBar.end = end;
+    c = end;
+  }
+  const cVolStart = c;
+  const cVol = cVolStart + bridge.volume;
+  const cMix = cVol + bridge.mix; // == s2.value, bar the balancing rounding
 
   const pctOfBase = (v) => s1.value !== 0 ? (v / Math.abs(s1.value)) * 100 : null;
   const withPct = (v) => {
@@ -295,12 +342,14 @@ function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase }) {
     const p = pctOfBase(v);
     return p === null ? base : `${base} (${p >= 0 ? '+' : ''}${p.toFixed(1)}%)`;
   };
+  if (!showMarginDrivers) driverBars[0].display = withPct(driverBars[0].value);
 
   const bars = [
     { label: 'Scenario 1', sub: `${s1.from} → ${s1.to}`, start: 0, end: c1, kind: 'total', display: fmtMoney(c1, sym) },
-    { label: 'Price', sub: 'Δprice × vol₂, per member', start: c1, end: c2, kind: 'effect', value: bridge.price, display: withPct(bridge.price) },
-    { label: 'Volume', sub: 'Δvol × blended price₁', start: c2, end: c3, kind: 'effect', value: bridge.volume, display: withPct(bridge.volume) },
-    { label: 'Mix', sub: 'balancing figure', start: c3, end: c4, kind: 'effect', value: bridge.mix, display: withPct(bridge.mix) },
+    ...driverBars,
+    ...(channelMixBar ? [channelMixBar] : []),
+    { label: 'Volume', sub: 'Δvol × blended price₁', start: cVolStart, end: cVol, kind: 'effect', value: bridge.volume, display: withPct(bridge.volume) },
+    { label: 'Mix', sub: 'balancing figure', start: cVol, end: cMix, kind: 'effect', value: bridge.mix, display: withPct(bridge.mix) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: s2.value, kind: 'total', display: fmtMoney(s2.value, sym) },
   ];
 
@@ -323,7 +372,11 @@ function Waterfall({ bridge, s1, s2, sym, isMobile, showPctOfBase }) {
 // doesn't move a ratio at all. What used to be one lumped "Rate" bar is exploded into
 // its 5 underlying drivers (they telescope exactly to the old Rate figure — see the
 // server's /api/pvm margin_pct_bridge comment for the derivation); Mix is unchanged.
-function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
+// showChannelMix draws Channel Mix as a dashed reference bar (see BridgeChart) — it's
+// carved out of rate_effect as a WHOLE (the five drivers below combined), not out of
+// any single one of them, so it can't be chained onto the running total without
+// double-counting; it's measured from the pre-driver baseline instead.
+function MarginPctWaterfall({ pctBridge, s1, s2, isMobile, showChannelMix }) {
   const c1 = pctBridge.scenario1_pct;
   const c2 = c1 + pctBridge.price_effect;
   const c3 = c2 + pctBridge.cogs_effect;
@@ -339,6 +392,10 @@ function MarginPctWaterfall({ pctBridge, s1, s2, isMobile }) {
     { label: 'Freight', sub: 'inbound freight/unit', start: c3, end: c4, kind: 'effect', value: pctBridge.freight_effect, display: fmtSignedPct(pctBridge.freight_effect) },
     { label: 'Amazon Fees', sub: 'referral + closing fees', start: c4, end: c5, kind: 'effect', value: pctBridge.amz_fee_effect, display: fmtSignedPct(pctBridge.amz_fee_effect) },
     { label: 'FBA Fees', sub: 'fulfillment fee/unit', start: c5, end: c6, kind: 'effect', value: pctBridge.fba_fee_effect, display: fmtSignedPct(pctBridge.fba_fee_effect) },
+    ...(showChannelMix ? [{
+      label: 'Channel Mix', sub: 'of which, Amazon⇄Shopify split', start: c1, end: c1 + pctBridge.channel_mix_effect,
+      kind: 'reference', value: pctBridge.channel_mix_effect, display: fmtSignedPct(pctBridge.channel_mix_effect),
+    }] : []),
     { label: 'Mix', sub: 'balancing figure', start: c6, end: c7, kind: 'effect', value: pctBridge.mix_effect, display: fmtSignedPct(pctBridge.mix_effect) },
     { label: 'Scenario 2', sub: `${s2.from} → ${s2.to}`, start: 0, end: pctBridge.scenario2_pct, kind: 'total', display: fmtPct(pctBridge.scenario2_pct) },
   ];
@@ -668,7 +725,12 @@ export default function PVM() {
     return {
       scenario1: { ...data.scenario1, value: s1Value, units: s1Units, avg_price: s1Units ? s1Value / s1Units : 0 },
       scenario2: { ...data.scenario2, value: s2Value, units: s2Units, avg_price: s2Units ? s2Value / s2Units : 0 },
-      bridge: { price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value, channel_mix: sumOf('channel_mix') },
+      bridge: {
+        price: sumOf('price'), volume: sumOf('volume'), mix: sumOf('mix'), total_delta: s2Value - s1Value,
+        channel_mix: sumOf('channel_mix'),
+        price_asp: sumOf('price_asp'), price_cogs: sumOf('price_cogs'), price_freight: sumOf('price_freight'),
+        price_amz_fee: sumOf('price_amz_fee'), price_fba_fee: sumOf('price_fba_fee'),
+      },
     };
   }, [data, rawMembers, selfSelectionActive, filters]);
 
@@ -832,8 +894,8 @@ export default function PVM() {
               </span>
             </div>
             {showPct
-              ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} />
-              : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} />}
+              ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} showChannelMix={showChannelMix} />
+              : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} showMarginDrivers={showMarginDrivers} showChannelMix={showChannelMix} />}
           </div>
 
           {/* Breakdown table */}
