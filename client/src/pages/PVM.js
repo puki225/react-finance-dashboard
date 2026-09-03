@@ -417,6 +417,13 @@ export default function PVM() {
   const [marginView, setMarginView] = useState('currency');
   const [level, setLevel] = useState(() => localStorage.getItem('gb_pvm_level') || 'asin');
   const [channel, setChannel] = useState(() => localStorage.getItem('gb_pvm_channel') || 'all');
+  // Vine giveaways (see Product Breakdown's "vine" callout) aren't real sales - excluding
+  // them here drops their units/revenue/COGS/fees from every KPI and bridge term below,
+  // not just revenue, so they stop pulling Volume up and margin down. Amazon-only (Vine
+  // requires FBA), so this has no effect on a Shopify-only view, but is left available
+  // regardless of channel rather than hidden - a "no effect" toggle is less confusing
+  // than one that disappears and reappears as the channel selector changes.
+  const [excludeVine, setExcludeVine] = useState(() => localStorage.getItem('gb_pvm_exclude_vine') === 'true');
   const [presetId, setPresetId] = useState('lq');
   const [periods, setPeriods] = useState(() => PRESETS[0].build());
   // Each is an array — the dropdowns below set a single-element array, while
@@ -435,6 +442,11 @@ export default function PVM() {
   // while on "All") can silently zero out the whole result under "Amazon" — clear
   // filters on every channel switch rather than leave a stale, invisible-cause filter.
   const chooseChannel = (c) => { setChannel(c); localStorage.setItem('gb_pvm_channel', c); setFilters({ country: [], brand: [], asin: [], sku: [] }); };
+  const toggleExcludeVine = () => setExcludeVine(v => {
+    const next = !v;
+    localStorage.setItem('gb_pvm_exclude_vine', String(next));
+    return next;
+  });
 
   // Toggles a row's filter values. Takes a LIST because one row can stand for several
   // values — a parent-ASIN group row selects all of its child ASINs at once.
@@ -489,6 +501,7 @@ export default function PVM() {
       s1_from: periods.s1.from, s1_to: periods.s1.to,
       s2_from: periods.s2.from, s2_to: periods.s2.to,
       metric, level, channel,
+      ...(excludeVine ? { exclude_vine: 'true' } : {}),
     };
     // The filter dimension(s) matching the CURRENTLY DISPLAYED breakdown level — e.g. at
     // asin level, a member is identified by either 'asin' or 'sku' (see clickableFilterFor).
@@ -498,7 +511,7 @@ export default function PVM() {
       if (filters[field].length) p[field] = filters[field].join(',');
     }
     return p;
-  }, [periods, metric, level, channel, filters, showPct]);
+  }, [periods, metric, level, channel, filters, showPct, excludeVine]);
 
   const { data, loading, error } = useApi('/api/pvm', params);
   const sym = data?.currency_symbol || '£';
@@ -759,6 +772,18 @@ export default function PVM() {
             {CHANNELS.map(c => (
               <button key={c.id} style={chip(channel === c.id)} onClick={() => chooseChannel(c.id)}>{c.label}</button>
             ))}
+          </div>
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+          <span style={groupLabel}>Vine</span>
+          <div style={{ display: 'flex', gap: 4, background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 8, padding: 4 }}>
+            <button
+              style={chip(excludeVine)}
+              onClick={toggleExcludeVine}
+              title="Exclude Amazon Vine giveaway units - and their revenue, COGS and fees - from every KPI and bridge term below"
+            >
+              Exclude vine
+            </button>
           </div>
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>

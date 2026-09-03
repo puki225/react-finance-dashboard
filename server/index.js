@@ -3875,7 +3875,19 @@ app.get('/api/cash-reconciliation', async (req, res) => {
 // Base rows for one period at (country, sku) granularity — the finest grain any of
 // the three hierarchy levels needs, so both scenarios and every level roll up from
 // the same numbers.
-async function pvmBaseRows(dateFrom, dateTo, channel) {
+async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
+  // When excluding Vine, drop those order lines entirely from amazon_sales — not just
+  // their revenue but their units/COGS/fees too, so Volume and margin both stop being
+  // pulled around by giveaways that were never real sales. Keyed on order_item_id (the
+  // order line's own unique key), matching v_amazon_vine_order_lines' classification
+  // (see that view — react-finance-dashboard/server/index.js, VINE ORDER CLASSIFICATION).
+  // Vine-refund interplay needs no special handling here: the view already excludes any
+  // line matched in amazon_order_line_refunds, so a vine-classified line never overlaps
+  // with amazon_refunds below, and non-vine refunds are untouched by this filter.
+  const vineJoin = excludeVine
+    ? `LEFT JOIN v_amazon_vine_order_lines vine ON vine.order_item_id = aol.order_item_id`
+    : '';
+  const vineFilter = excludeVine ? `AND vine.order_item_id IS NULL` : '';
   // Itemised per-unit COGS, converted to GBP at the order-date rate. Same expression
   // used by /api/product-breakdown — kept identical so margins agree across pages.
   // Split into a "standard" bucket (base unit cost + demurrage/quality/other, which are
@@ -3942,7 +3954,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel) {
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
       ${cogsLateral('ao.order_date::date')}
-      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
+      ${vineJoin}
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${vineFilter}
       GROUP BY 1, 2
     ),
     amazon_refunds AS (
@@ -4068,8 +4081,9 @@ app.get('/api/pvm', async (req, res) => {
   const {
     s1_from, s1_to, s2_from, s2_to,
     metric = 'revenue', level = 'asin', channel = 'all',
-    country, brand, asin, sku,
+    country, brand, asin, sku, exclude_vine,
   } = req.query;
+  const excludeVine = exclude_vine === 'true' || exclude_vine === '1';
   // Each of country/brand/asin/sku accepts a comma-separated list — the breakdown
   // table supports ctrl/cmd-click multi-select on top of the single-value dropdowns.
   const listOf = (v) => (v ? String(v).split(',').map(s => s.trim()).filter(Boolean) : null);
@@ -4086,8 +4100,8 @@ app.get('/api/pvm', async (req, res) => {
 
   try {
     const [rows1, rows2] = await Promise.all([
-      pvmBaseRows(s1_from, s1_to, channel),
-      pvmBaseRows(s2_from, s2_to, channel),
+      pvmBaseRows(s1_from, s1_to, channel, excludeVine),
+      pvmBaseRows(s2_from, s2_to, channel, excludeVine),
     ]);
 
     // Each scenario is converted at its OWN period-average rate, so the bridge compares
@@ -4386,6 +4400,7 @@ app.get('/api/pvm', async (req, res) => {
       metric: isMargin ? 'margin' : 'revenue',
       level: groupLevel,
       channel,
+      exclude_vine: excludeVine,
       filters: { country: countryList, brand: brandList, asin: asinList, sku: skuList },
       options,
       currency_symbol: currencySymbol(reportingCurrency),
