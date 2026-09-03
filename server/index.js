@@ -3876,18 +3876,22 @@ app.get('/api/cash-reconciliation', async (req, res) => {
 // the three hierarchy levels needs, so both scenarios and every level roll up from
 // the same numbers.
 async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
-  // When excluding Vine, drop those order lines entirely from amazon_sales — not just
-  // their revenue but their units/COGS/fees too, so Volume and margin both stop being
-  // pulled around by giveaways that were never real sales. Keyed on order_item_id (the
-  // order line's own unique key), matching v_amazon_vine_order_lines' classification
-  // (see that view — react-finance-dashboard/server/index.js, VINE ORDER CLASSIFICATION).
-  // Vine-refund interplay needs no special handling here: the view already excludes any
-  // line matched in amazon_order_line_refunds, so a vine-classified line never overlaps
-  // with amazon_refunds below, and non-vine refunds are untouched by this filter.
+  // When excluding Vine, zero out each vine-classified line's units/COGS/fees — NOT its
+  // revenue. Per product decision: a vine line's net_before_refunds contribution stays
+  // exactly as computed (whatever that already is) so toggling this on moves margin and
+  // per-unit price by removing cost/volume, not by changing the revenue total. That's why
+  // this is a per-row CASE-zeroing (zeroIfVine below), not a WHERE-clause filter — a
+  // filter would drop the row's revenue along with everything else.
+  // Keyed on order_item_id (the order line's own unique key), matching
+  // v_amazon_vine_order_lines' classification (see that view — VINE ORDER
+  // CLASSIFICATION, above). Vine-refund interplay needs no special handling: the view
+  // already excludes any line matched in amazon_order_line_refunds, so a vine-classified
+  // line never overlaps with amazon_refunds below, and non-vine refunds are untouched.
   const vineJoin = excludeVine
     ? `LEFT JOIN v_amazon_vine_order_lines vine ON vine.order_item_id = aol.order_item_id`
     : '';
-  const vineFilter = excludeVine ? `AND vine.order_item_id IS NULL` : '';
+  // No-op wrapper when the toggle is off.
+  const zeroIfVine = (expr) => excludeVine ? `(CASE WHEN vine.order_item_id IS NOT NULL THEN 0 ELSE ${expr} END)` : expr;
   // Itemised per-unit COGS, converted to GBP at the order-date rate. Same expression
   // used by /api/product-breakdown — kept identical so margins agree across pages.
   // Split into a "standard" bucket (base unit cost + demurrage/quality/other, which are
@@ -3937,25 +3941,27 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
         -- COALESCE(sp.product_name, aol.title, ...) call sites) — the Amazon listing
         -- title from the order line itself is the only real source of a display name.
         MAX(aol.title) AS product_title,
-        SUM(aol.quantity)::int AS units,
+        -- Revenue is NEVER zeroed for a vine line (see comment above) — only units,
+        -- COGS and fees below are.
+        SUM(${zeroIfVine('aol.quantity')})::int AS units,
         SUM((((COALESCE(NULLIF(aol.unit_price,0), lp.last_price, 0) * aol.quantity) + COALESCE(aol.shipping_price,0))
              - COALESCE(aol.promotion_discount,0)) / vat_divisor(ao.shipping_country))::numeric AS net_before_refunds,
         -- Amazon "listing" fees (referral/commission + closing fees) kept separate from
         -- FBA fulfillment, since the margin-rate bridge decomposes them as separate drivers.
-        SUM((COALESCE(aol.fee_commission, 0) +
+        SUM(${zeroIfVine(`(COALESCE(aol.fee_commission, 0) +
              COALESCE(aol.fee_fixed_closing, 0) + COALESCE(aol.fee_variable_closing, 0) +
              COALESCE(aol.fee_digital_services, 0) + COALESCE(aol.fee_giftwrap_chargeback, 0) +
-             COALESCE(aol.fee_shipping_chargeback, 0)) / vat_divisor_seller())::numeric AS fee_amz,
-        SUM(COALESCE(aol.fee_fba_fulfillment, 0) / vat_divisor_seller())::numeric AS fee_fba,
-        SUM(aol.quantity * ${cogsStdExpr})::numeric AS cogs_std,
-        SUM(aol.quantity * ${cogsFreightExpr})::numeric AS cogs_freight
+             COALESCE(aol.fee_shipping_chargeback, 0))`)} / vat_divisor_seller())::numeric AS fee_amz,
+        SUM(${zeroIfVine('COALESCE(aol.fee_fba_fulfillment, 0)')} / vat_divisor_seller())::numeric AS fee_fba,
+        SUM(${zeroIfVine(`aol.quantity * ${cogsStdExpr}`)})::numeric AS cogs_std,
+        SUM(${zeroIfVine(`aol.quantity * ${cogsFreightExpr}`)})::numeric AS cogs_freight
       FROM amazon_order_lines aol
       JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
       LEFT JOIN v_sku_last_price lp ON lp.sku = aol.sku
       LEFT JOIN sku_parameters sp ON sp.sku = aol.sku
       ${cogsLateral('ao.order_date::date')}
       ${vineJoin}
-      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled' ${vineFilter}
+      WHERE ao.order_date::date BETWEEN $1 AND $2 AND ao.status != 'Canceled'
       GROUP BY 1, 2
     ),
     amazon_refunds AS (

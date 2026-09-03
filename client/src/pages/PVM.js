@@ -418,11 +418,14 @@ export default function PVM() {
   const [level, setLevel] = useState(() => localStorage.getItem('gb_pvm_level') || 'asin');
   const [channel, setChannel] = useState(() => localStorage.getItem('gb_pvm_channel') || 'all');
   // Vine giveaways (see Product Breakdown's "vine" callout) aren't real sales - excluding
-  // them here drops their units/revenue/COGS/fees from every KPI and bridge term below,
-  // not just revenue, so they stop pulling Volume up and margin down. Amazon-only (Vine
-  // requires FBA), so this has no effect on a Shopify-only view, but is left available
-  // regardless of channel rather than hidden - a "no effect" toggle is less confusing
-  // than one that disappears and reappears as the channel selector changes.
+  // them zeroes their units/COGS/fees out of every KPI and bridge term below, WITHOUT
+  // touching revenue (per product decision - a vine line's revenue contribution doesn't
+  // move, only the cost/volume it carries). So toggling this on raises margin £ and %
+  // (same revenue, less COGS/fees) and raises price/unit (same revenue, fewer units) -
+  // see pvmBaseRows' zeroIfVine on the server for the actual per-line logic. Amazon-only
+  // (Vine requires FBA), so this has no effect on a Shopify-only view, but is left
+  // available regardless of channel rather than hidden - a "no effect" toggle is less
+  // confusing than one that disappears and reappears as the channel selector changes.
   const [excludeVine, setExcludeVine] = useState(() => localStorage.getItem('gb_pvm_exclude_vine') === 'true');
   const [presetId, setPresetId] = useState('lq');
   const [periods, setPeriods] = useState(() => PRESETS[0].build());
@@ -780,7 +783,7 @@ export default function PVM() {
             <button
               style={chip(excludeVine)}
               onClick={toggleExcludeVine}
-              title="Exclude Amazon Vine giveaway units - and their revenue, COGS and fees - from every KPI and bridge term below"
+              title="Exclude Amazon Vine giveaway units - and their COGS and fees - from every KPI and bridge term below, without changing revenue"
             >
               Exclude vine
             </button>
