@@ -86,8 +86,10 @@ const COLS = [
 // Shared column template for the header + every row — the product column no longer needs to
 // fit a long title (shown as a hover tooltip on the image instead), so it just needs room for
 // the image + SKU/ASIN; the freed-up width goes to the numeric columns, which run bigger text.
-const TABLE_GRID = '36px minmax(100px,1fr) 100px 110px 90px 110px 80px 120px 110px';
-const TABLE_MIN_WIDTH = 36 + 100 + 100 + 110 + 90 + 110 + 80 + 120 + 110;
+// Units column widened from 100px - the refund/organic/ppc/vine breakdown lines packed
+// into it (esp. "-N returns (X%)") were tight enough to wrap at the old width.
+const TABLE_GRID = '36px minmax(100px,1fr) 120px 110px 90px 110px 80px 120px 110px';
+const TABLE_MIN_WIDTH = 36 + 100 + 120 + 110 + 90 + 110 + 80 + 120 + 110;
 
 function PnlPanel({ sku, from, to, sym, country, channel, blended, brand, parentAsin }) {
   // Normalise channel: 'both' and undefined → 'all'
@@ -671,7 +673,7 @@ export default function ProductBreakdown() {
                 <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
                   <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(row.units_sold)}</span>
                   {row.units_refunded > 0 && (
-                    <span style={{ fontSize: 12, color: 'var(--red)', fontFamily: 'var(--mono)' }}>
+                    <span style={{ fontSize: 11, color: 'var(--red)', fontFamily: 'var(--mono)', whiteSpace: 'nowrap' }}>
                       −{fmtN(row.units_refunded)} returns ({parseFloat(row.units_refunded / row.units_sold * 100).toFixed(0)}%)
                     </span>
                   )}
