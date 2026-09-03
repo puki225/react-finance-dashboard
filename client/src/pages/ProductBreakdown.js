@@ -561,8 +561,8 @@ export default function ProductBreakdown() {
             {/* Units */}
             <div style={{ padding: '13px 8px', display: 'flex', flexDirection: 'column', justifyContent: 'center', gap: 2 }}>
               <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.units_sold)}</span>
-              <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totalOrganicUnits)} organic</span>
-              <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totals.ppc_units)} ppc</span>
+              <span style={{ fontSize: 11, color: 'var(--green)', fontFamily: 'var(--mono)' }}>{fmtN(totalOrganicUnits)} organic</span>
+              <span style={{ fontSize: 11, color: 'var(--amber)', fontFamily: 'var(--mono)' }}>{fmtN(totals.ppc_units)} ppc</span>
               {totals.vine_units > 0 && (
                 <span style={{ fontSize: 11, color: '#7c6af7', fontFamily: 'var(--mono)' }}>{fmtN(totals.vine_units)} vine</span>
               )}
@@ -672,11 +672,11 @@ export default function ProductBreakdown() {
                   <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(row.units_sold)}</span>
                   {row.units_refunded > 0 && (
                     <span style={{ fontSize: 12, color: 'var(--red)', fontFamily: 'var(--mono)' }}>
-                      −{fmtN(row.units_refunded)} ({parseFloat(row.units_refunded / row.units_sold * 100).toFixed(0)}%)
+                      −{fmtN(row.units_refunded)} returns ({parseFloat(row.units_refunded / row.units_sold * 100).toFixed(0)}%)
                     </span>
                   )}
-                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
-                  <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
+                  <span style={{ fontSize: 11, color: 'var(--green)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
+                  <span style={{ fontSize: 11, color: 'var(--amber)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
                   {vineUnits > 0 && (
                     <span style={{ fontSize: 11, color: '#7c6af7', fontFamily: 'var(--mono)' }}>{fmtN(vineUnits)} vine</span>
                   )}
