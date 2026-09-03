@@ -447,6 +447,7 @@ export default function ProductBreakdown() {
     return {
       units_sold:      rows.reduce((s, r) => s + parseInt(r.units_sold || 0), 0),
       ppc_units:       rows.reduce((s, r) => s + parseInt(r.ppc_units || 0), 0),
+      vine_units:      rows.reduce((s, r) => s + parseInt(r.vine_units || 0), 0),
       gross_sales:     rows.reduce((s, r) => s + parseFloat(r.gross_sales || 0), 0),
       total_discounts: rows.reduce((s, r) => s + parseFloat(r.total_discounts || 0), 0),
       total_refunded:  rows.reduce((s, r) => s + parseFloat(r.total_refunded || 0), 0),
@@ -466,7 +467,9 @@ export default function ProductBreakdown() {
   const totalAcos = totalHasPpc && totals.ad_sales > 0 ? (totals.ppc_cost / totals.ad_sales * 100) : 0;
   const totalTacos = totalHasPpc && totals.gross_sales > 0 ? (totals.ppc_cost / totals.gross_sales * 100) : 0;
   const totalRoas = totalHasPpc && totals.ppc_cost > 0 ? (totals.ad_sales / totals.ppc_cost) : 0;
-  const totalOrganicUnits = Math.max(totals.units_sold - totals.ppc_units, 0);
+  // Vine giveaways aren't ad-attributed or organic sales - carve them out of the
+  // organic bucket the same way ppc units are, so organic + ppc + vine = units_sold.
+  const totalOrganicUnits = Math.max(totals.units_sold - totals.ppc_units - totals.vine_units, 0);
 
   const handleSort = (key) => {
     if (sort === key) {
@@ -560,6 +563,9 @@ export default function ProductBreakdown() {
               <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)' }}>{fmtN(totals.units_sold)}</span>
               <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totalOrganicUnits)} organic</span>
               <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(totals.ppc_units)} ppc</span>
+              {totals.vine_units > 0 && (
+                <span style={{ fontSize: 11, color: '#7c6af7', fontFamily: 'var(--mono)' }}>{fmtN(totals.vine_units)} vine</span>
+              )}
             </div>
 
             {/* Revenue */}
@@ -627,7 +633,8 @@ export default function ProductBreakdown() {
           const roiPct = hasCogs ? (productContribution / totalCogs * 100) : 0;
           const hasPpc = parseFloat(row.ppc_cost || 0) > 0;
           const ppcUnits = parseInt(row.ppc_units || 0, 10);
-          const organicUnits = Math.max(parseInt(row.units_sold || 0, 10) - ppcUnits, 0);
+          const vineUnits = parseInt(row.vine_units || 0, 10);
+          const organicUnits = Math.max(parseInt(row.units_sold || 0, 10) - ppcUnits - vineUnits, 0);
 
           return (
             <div key={row.sku} style={{ borderBottom: i < rows.length - 1 ? '1px solid var(--border)' : 'none', borderLeft: expanded ? '3px solid #34d399' : '3px solid transparent', transition: 'border-color 0.15s' }}>
@@ -670,6 +677,9 @@ export default function ProductBreakdown() {
                   )}
                   <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(organicUnits)} organic</span>
                   <span style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)' }}>{fmtN(ppcUnits)} ppc</span>
+                  {vineUnits > 0 && (
+                    <span style={{ fontSize: 11, color: '#7c6af7', fontFamily: 'var(--mono)' }}>{fmtN(vineUnits)} vine</span>
+                  )}
                 </div>
 
                 {/* Revenue */}

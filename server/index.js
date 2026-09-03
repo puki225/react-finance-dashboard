@@ -169,6 +169,47 @@ app.use(express.static(path.join(__dirname, '../client/build')));
   }
 })();
 
+// ─── VINE ORDER CLASSIFICATION ──────────────────────────────────────────
+// Amazon Vine gives away FBA inventory as free review copies - not real sales, but they
+// inflate units-sold/gross-sales figures with no matching revenue if left unclassified.
+// There is no SP-API report or feed exposing which orders are Vine (confirmed against
+// Amazon's report-type reference - no "Vine" entry exists anywhere in it, and every
+// live attempt at a guessed report type came back "Invalid Report Type"), so this can't
+// be synced from Amazon directly. Instead this view flags order lines carrying every
+// hallmark of a Vine giveaway and none of a real refund or discount:
+//   - unit_price = 0 AND promotion_discount = 0 at order time - never priced, never
+//     discounted. Distinct from a 100%-off coupon, which nets to 0 via promotion_discount
+//     against a real unit_price, not a $0 price outright.
+//   - fulfillment_channel = 'AFN' - Vine only ever runs against FBA inventory.
+//   - never appears in amazon_order_line_refunds - a genuine refund is a priced order
+//     charged in full then reversed later; Vine units are never charged to begin with,
+//     so there's nothing to refund.
+// This is a heuristic, not a confirmed Amazon-side flag. False positives are possible from
+// any other mechanism that produces a genuine $0.00 charged FBA line, though none are known
+// to occur on this account's listings today.
+(async function migrateVineSchema() {
+  try {
+    await pool.query(`
+      CREATE OR REPLACE VIEW v_amazon_vine_order_lines AS
+      SELECT
+        l.amazon_order_id, l.order_item_id, l.sku, l.asin, l.quantity,
+        o.order_date, o.shipping_country
+      FROM amazon_order_lines l
+      JOIN amazon_orders o ON o.amazon_order_id = l.amazon_order_id
+      WHERE o.status <> 'Canceled'
+        AND o.fulfillment_channel = 'AFN'
+        AND COALESCE(l.unit_price, 0) = 0
+        AND COALESCE(l.promotion_discount, 0) = 0
+        AND NOT EXISTS (
+          SELECT 1 FROM amazon_order_line_refunds r
+          WHERE r.amazon_order_id = l.amazon_order_id AND r.sku = l.sku
+        );
+    `);
+  } catch (e) {
+    console.error('[db] Vine schema migration failed:', e.message);
+  }
+})();
+
 // Fetch the account's VAT-registration status once per request - true iff a VAT number is set
 // on file (per product decision: presence of a VAT number IS the registration signal, there's
 // no separate manually-set toggle). Endpoints use this to decide whether to apply vat_divisor()
@@ -1813,6 +1854,14 @@ app.get('/api/product-breakdown', async (req, res) => {
         FROM amazon_ppc_product_performance
         WHERE report_date BETWEEN $1 AND $2 AND sku IS NOT NULL
         GROUP BY sku
+      ),
+      -- Vine giveaway units per SKU (Amazon only - see v_amazon_vine_order_lines for the
+      -- classification heuristic). Pre-aggregated for the same fan-out reason as ppc_by_sku.
+      vine_by_sku AS (
+        SELECT sku, SUM(quantity)::int AS vine_units
+        FROM v_amazon_vine_order_lines
+        WHERE order_date::date BETWEEN $1 AND $2
+        GROUP BY sku
       )
     `;
 
@@ -1900,15 +1949,17 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(cogs.total_fees, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0) - COALESCE(r.fee_digital_services_refunded, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
-          COALESCE(ppc.ppc_units, 0)::int AS ppc_units
+          COALESCE(ppc.ppc_units, 0)::int AS ppc_units,
+          COALESCE(vine.vine_units, 0)::int AS vine_units
         FROM amazon_order_agg o
         FULL OUTER JOIN ppc_by_sku ppc ON ppc.sku = o.sku
         -- FULL OUTER so a SKU refunded this period but ordered outside it still surfaces as
         -- its own row, instead of the refund being silently dropped (same gap as the shopify
         -- branch above - the exact bug that let a real refund show in P&L but not here).
         FULL OUTER JOIN refunds_by_sku r ON r.sku = COALESCE(o.sku, ppc.sku)
-        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, ppc.sku, r.sku)
-        LEFT JOIN amazon_cogs_only cogs ON cogs.sku = COALESCE(o.sku, ppc.sku, r.sku)
+        FULL OUTER JOIN vine_by_sku vine ON vine.sku = COALESCE(o.sku, ppc.sku, r.sku)
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(o.sku, ppc.sku, r.sku, vine.sku)
+        LEFT JOIN amazon_cogs_only cogs ON cogs.sku = COALESCE(o.sku, ppc.sku, r.sku, vine.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
       `, [dateFrom, dateTo]);
     } else {
@@ -1968,7 +2019,8 @@ app.get('/api/product-breakdown', async (req, res) => {
           (COALESCE(cogs.total_fees, 0) - COALESCE(ra.fee_commission_refunded, 0) + COALESCE(ra.fee_refund_admin, 0) - COALESCE(ra.fee_digital_services_refunded, 0))::numeric(12,2) AS total_fees,
           COALESCE(ppc.ppc_cost, 0)::numeric(12,2) AS ppc_cost,
           COALESCE(ppc.ppc_sales, 0)::numeric(12,2) AS ppc_sales,
-          COALESCE(ppc.ppc_units, 0)::int AS ppc_units
+          COALESCE(ppc.ppc_units, 0)::int AS ppc_units,
+          COALESCE(vine.vine_units, 0)::int AS vine_units
         FROM shopify_skus s
         FULL OUTER JOIN amazon_skus a ON a.sku = s.sku
         -- FULL OUTER so a SKU with ad spend but zero orders anywhere (no Shopify, no
@@ -1979,8 +2031,9 @@ app.get('/api/product-breakdown', async (req, res) => {
         -- right channel badge - the exact gap that let a real refund show in P&L but not here.
         FULL OUTER JOIN refunds_by_sku ra ON ra.sku = COALESCE(s.sku, a.sku, ppc.sku)
         FULL OUTER JOIN shopify_refunds_by_sku rs ON rs.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku)
-        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku)
-        LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku)
+        FULL OUTER JOIN vine_by_sku vine ON vine.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku)
+        LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku, vine.sku)
+        LEFT JOIN cogs_by_sku cogs ON cogs.sku = COALESCE(s.sku, a.sku, ppc.sku, ra.sku, rs.sku, vine.sku)
         WHERE 1=1 ${brandFilter} ${parentFilter}
       `, [dateFrom, dateTo]);
     }
@@ -1999,6 +2052,8 @@ app.get('/api/product-breakdown', async (req, res) => {
       const ppcCost        = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_cost  || 0) * fxRate;
       const ppcSales       = r.channels === 'shopify' ? 0 : parseFloat(r.ppc_sales || 0) * fxRate;
       const ppcUnits       = r.channels === 'shopify' ? 0 : parseInt(r.ppc_units || 0, 10);
+      // Vine giveaway units — Amazon/FBA only, same reasoning as ppcUnits above.
+      const vineUnits      = r.channels === 'shopify' ? 0 : parseInt(r.vine_units || 0, 10);
       // Gross Profit (= Gross Margin) = Net Revenue − COGS − FBA fulfillment − listing fees
       const grossProfit    = netRevenue - totalCogs - totalFees;
       const grossMarginPct = netRevenue > 0 ? (grossProfit / netRevenue * 100) : 0;
@@ -2022,6 +2077,7 @@ app.get('/api/product-breakdown', async (req, res) => {
         ppc_cost:             ppcCost.toFixed(2),
         ppc_sales:            ppcSales.toFixed(2),
         ppc_units:            ppcUnits,
+        vine_units:           vineUnits,
         acos:                 acos.toFixed(1),
         roas:                 roas.toFixed(2),
         tacos:                tacos.toFixed(1),
