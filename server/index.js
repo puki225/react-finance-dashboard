@@ -175,18 +175,29 @@ app.use(express.static(path.join(__dirname, '../client/build')));
 // There is no SP-API report or feed exposing which orders are Vine (confirmed against
 // Amazon's report-type reference - no "Vine" entry exists anywhere in it, and every
 // live attempt at a guessed report type came back "Invalid Report Type"), so this can't
-// be synced from Amazon directly. Instead this view flags order lines carrying every
-// hallmark of a Vine giveaway and none of a real refund or discount:
-//   - unit_price = 0 AND promotion_discount = 0 at order time - never priced, never
-//     discounted. Distinct from a 100%-off coupon, which nets to 0 via promotion_discount
-//     against a real unit_price, not a $0 price outright.
+// be synced from Amazon directly.
+//
+// CORRECTED heuristic (was previously unit_price=0 AND promotion_discount=0 - confirmed
+// wrong against live data, see below). A real Vine order is recorded at its FULL listed
+// price with a promotion_discount that exactly offsets it to net $0 - not a raw $0.00
+// unit_price. Verified against four ASINs with known Vine activity: the account's expected
+// counts (30, ~29, 9-10 units over the same few days each) matched EXACTLY the
+// full-price-fully-discounted lines, clustered in tight bursts (claim waves), while
+// EVERY unit_price=0/promotion_discount=0 line turned out to be a same-account order still
+// in Amazon's "Pending" status - a temporary pre-ship state where Amazon hasn't posted a
+// price yet, unrelated to Vine and not a real $0 sale. That pattern is now excluded outright
+// (any correctly-priced order eventually leaves "Pending" and gets picked up as a normal
+// paid line - see amazon-spapi-proxy's regular order sync).
+//   - unit_price > 0 AND promotion_discount fully offsets it (>= unit_price × quantity,
+//     with a 2p tolerance for rounding) - the "100%-off coupon" shape, which is exactly how
+//     Amazon represents a Vine giveaway. A genuine partial-discount promo (the common case)
+//     never satisfies this, only a full write-off does.
 //   - fulfillment_channel = 'AFN' - Vine only ever runs against FBA inventory.
 //   - never appears in amazon_order_line_refunds - a genuine refund is a priced order
 //     charged in full then reversed later; Vine units are never charged to begin with,
 //     so there's nothing to refund.
-// This is a heuristic, not a confirmed Amazon-side flag. False positives are possible from
-// any other mechanism that produces a genuine $0.00 charged FBA line, though none are known
-// to occur on this account's listings today.
+// Still a heuristic, not a confirmed Amazon-side flag - a legitimate, unrelated 100%-off
+// promotion (not Vine) would also match this shape, though none are known on this account.
 (async function migrateVineSchema() {
   try {
     await pool.query(`
@@ -198,8 +209,8 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       JOIN amazon_orders o ON o.amazon_order_id = l.amazon_order_id
       WHERE o.status <> 'Canceled'
         AND o.fulfillment_channel = 'AFN'
-        AND COALESCE(l.unit_price, 0) = 0
-        AND COALESCE(l.promotion_discount, 0) = 0
+        AND COALESCE(l.unit_price, 0) > 0
+        AND COALESCE(l.promotion_discount, 0) >= (l.unit_price * l.quantity) - 0.02
         AND NOT EXISTS (
           SELECT 1 FROM amazon_order_line_refunds r
           WHERE r.amazon_order_id = l.amazon_order_id AND r.sku = l.sku
