@@ -92,6 +92,7 @@ function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, s
   pushRow('Units Sold', 'net_units_sold');
   pushRow('  Organic Units', 'organic_units');
   pushRow('  PPC Units', 'ppc_units');
+  pushRow('  Vine Units', 'vine_units');
   pushRow('  Refunded Units', 'units_refunded');
   pushRow('Gross Sales', 'gross_sales');
   pushRow('Discounts / Promos', 'total_discounts');
@@ -224,10 +225,14 @@ export default function PnL() {
   // every cost/fee/deduction row (Discounts, Refunds, COGS, Fees, PPC, OPEX). This gives the grid
   // a quick visual split between money coming in vs. money going out, on top of the existing
   // per-value red/green text coloring.
-  function ValueRow({ label, keyPath, kind = 'currency', bold, indent, highlight, cost, onClick, expandable, expanded }) {
+  function ValueRow({ label, keyPath, kind = 'currency', bold, indent, highlight, cost, color, onClick, expandable, expanded }) {
     const rowTotal = getPath(totals, keyPath);
     const fmtVal = (v) => kind === 'number' ? fmtNum(v) : kind === 'pct' ? fmtPct(v) : fmt(v);
     const colorFor = (v) => {
+      // Explicit override — used by the Units Sold breakdown to match Product Breakdown's
+      // organic/ppc/vine/returns color coding, which doesn't follow the sign/threshold
+      // rules below (those colors are fixed per row, not derived from the row's own value).
+      if (color) return color;
       if (kind === 'number') return 'var(--text)';
       const n = parseFloat(v || 0);
       if (kind === 'pct') return n >= 20 ? 'var(--green)' : n >= 0 ? 'var(--amber)' : 'var(--red)';
@@ -304,9 +309,12 @@ export default function PnL() {
                 />
                 {unitsExpanded && (
                   <>
-                    <ValueRow label="Organic Units" keyPath="organic_units" kind="number" indent />
-                    <ValueRow label="PPC Units" keyPath="ppc_units" kind="number" indent />
-                    <ValueRow label="Refunded Units" keyPath="units_refunded" kind="number" indent cost />
+                    {/* Same color coding as Product Breakdown's Units column: green organic,
+                        amber ppc, purple vine, red refunds. */}
+                    <ValueRow label="Organic Units" keyPath="organic_units" kind="number" indent color="var(--green)" />
+                    <ValueRow label="PPC Units" keyPath="ppc_units" kind="number" indent color="var(--amber)" />
+                    <ValueRow label="Vine Units" keyPath="vine_units" kind="number" indent color="#7c6af7" />
+                    <ValueRow label="Refunded Units" keyPath="units_refunded" kind="number" indent cost color="var(--red)" />
                   </>
                 )}
                 <ValueRow label="Gross Sales" keyPath="gross_sales" bold highlight />

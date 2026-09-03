@@ -1243,6 +1243,17 @@ app.get('/api/pnl', async (req, res) => {
       GROUP BY 1
     `, [dateFrom, dateTo]);
 
+    // Vine giveaway units, Amazon only — see v_amazon_vine_order_lines (migrateVineSchema
+    // above) for the classification. Not run through brand/parent/fulfillment/order_type/
+    // search filters, matching ppcResult and refundsResult above — this endpoint's
+    // supplementary per-period metrics only respect the channel split, not the main
+    // sales query's finer filters.
+    const vineResult = includeAmazon ? await pool.query(`
+      SELECT GREATEST(DATE_TRUNC('${trunc}', order_date), $1::date)::date AS period, SUM(quantity)::int AS vine_units
+      FROM v_amazon_vine_order_lines WHERE order_date::date BETWEEN $1 AND $2
+      GROUP BY 1
+    `, [dateFrom, dateTo]) : { rows: [] };
+
     // Account-level fees (subscription, storage, coupons, etc.) — itemized by whatever fee_type
     // Amazon actually reports, rather than a hardcoded row list, since these categories are only
     // as good as what's been synced via amazon-spapi-proxy's finances job. Adjustment-type events
@@ -1322,6 +1333,10 @@ app.get('/api/pnl', async (req, res) => {
       ppcByPeriod[key] = parseFloat(r.ppc_cost || 0);
       ppcUnitsByPeriod[key] = parseInt(r.ppc_units || 0, 10);
     }
+    const vineUnitsByPeriod = {};
+    for (const r of vineResult.rows) {
+      vineUnitsByPeriod[r.period.toISOString().split('T')[0]] = parseInt(r.vine_units || 0, 10);
+    }
     const mcfByPeriod = {};
     for (const r of mcfResult.rows) mcfByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.mcf_fees || 0);
 
@@ -1366,7 +1381,10 @@ app.get('/api/pnl', async (req, res) => {
       const unitsSold = parseInt(r?.units_sold || 0, 10);
       const unitsRefunded = unitsRefundedByPeriod[periodKey] || 0;
       const ppcUnits = ppcUnitsByPeriod[periodKey] || 0;
-      const organicUnits = Math.max(unitsSold - ppcUnits, 0);
+      const vineUnits = vineUnitsByPeriod[periodKey] || 0;
+      // Vine giveaways aren't ad-attributed or organic sales - carve them out of the
+      // organic bucket the same way ppc units are (matches Product Breakdown's convention).
+      const organicUnits = Math.max(unitsSold - ppcUnits - vineUnits, 0);
       const grossSales = fx(r?.gross_sales || 0);
       const totalDiscounts = fx(r?.total_discounts || 0);
       const netRevenue = grossSales - totalDiscounts;
@@ -1456,6 +1474,7 @@ app.get('/api/pnl', async (req, res) => {
         net_units_sold: unitsSold - unitsRefunded,
         organic_units: organicUnits,
         ppc_units: ppcUnits,
+        vine_units: vineUnits,
         gross_sales: grossSales.toFixed(2),
         total_discounts: (-totalDiscounts).toFixed(2),
         net_revenue: netRevenue.toFixed(2),
@@ -1564,6 +1583,7 @@ app.get('/api/pnl', async (req, res) => {
     returnsCogsByPeriod['__total__'] = sumMap(returnsCogsByPeriod);
     ppcByPeriod['__total__'] = sumMap(ppcByPeriod);
     ppcUnitsByPeriod['__total__'] = sumMap(ppcUnitsByPeriod);
+    vineUnitsByPeriod['__total__'] = sumMap(vineUnitsByPeriod);
     adjustmentsByPeriod['__total__'] = sumMap(adjustmentsByPeriod);
     mcfByPeriod['__total__'] = sumMap(mcfByPeriod);
     accountFeesByPeriod['__total__'] = {};
