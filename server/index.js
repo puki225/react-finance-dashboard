@@ -4006,7 +4006,12 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
             / vat_divisor_seller())::numeric AS fee_commission_refunded,
         SUM((CASE WHEN olr.fee_refund_admin > 0 THEN olr.fee_refund_admin
               ELSE COALESCE(aol.fee_commission / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded * 0.2 END)
-            / vat_divisor_seller())::numeric AS fee_refund_admin
+            / vat_divisor_seller())::numeric AS fee_refund_admin,
+        -- Matches /api/pnl and /api/product-breakdown's refund-fee CTEs exactly - a
+        -- credit netted against fee_amz below, same reasoning as fee_commission_refunded.
+        SUM((CASE WHEN olr.fee_digital_services_refunded > 0 THEN olr.fee_digital_services_refunded
+              ELSE COALESCE(aol.fee_digital_services / NULLIF(aol.quantity, 0), 0) * olr.quantity_refunded END)
+            / vat_divisor_seller())::numeric AS fee_digital_services_refunded
       FROM amazon_order_line_refunds olr
       LEFT JOIN amazon_order_lines aol ON aol.amazon_order_id = olr.amazon_order_id AND aol.sku = olr.sku
       LEFT JOIN amazon_orders ao ON ao.amazon_order_id = olr.amazon_order_id
@@ -4044,7 +4049,8 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
         0::int AS units_refunded,
         SUM((st.amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor(so.shipping_country))::numeric AS refunded,
         0::numeric AS fee_commission_refunded,
-        0::numeric AS fee_refund_admin
+        0::numeric AS fee_refund_admin,
+        0::numeric AS fee_digital_services_refunded
       FROM shopify_transactions st
       JOIN shopify_order_lines sol ON sol.shopify_order_id = st.shopify_order_id
       LEFT JOIN shopify_orders so ON so.shopify_order_id = st.shopify_order_id
@@ -4056,18 +4062,112 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
       GROUP BY 1, 2
     )`;
 
+  // COGS credit-back for genuine physical returns (Amazon/FBA only) - identical logic and
+  // date-attribution convention to /api/pnl's returnsCogsResult and /api/product-breakdown's
+  // returns_by_sku (see either for the reasoning), just split into std/freight buckets here
+  // (rather than one lump "returned" figure) to match how the sales side already separates
+  // them for the margin-rate bridge's Std COGS vs Freight drivers, and grouped by country too
+  // since PVM's grain is (country, sku) not just sku. A refund alone does NOT credit COGS -
+  // only a matching row in amazon_customer_returns (a physical unit actually came back) does.
+  const returnsCogsSql = channel !== 'shopify' ? `
+    amazon_returns_cogs AS (
+      SELECT
+        COALESCE(ao.shipping_country, 'Unknown') AS country,
+        acr.sku,
+        SUM(acr.quantity * ${cogsStdExpr})::numeric AS cogs_std_returned,
+        SUM(acr.quantity * ${cogsFreightExpr})::numeric AS cogs_freight_returned
+      FROM amazon_customer_returns acr
+      JOIN amazon_orders ao ON ao.amazon_order_id = acr.amazon_order_id
+      LEFT JOIN sku_parameters sp ON sp.sku = acr.sku
+      LEFT JOIN LATERAL (
+        SELECT olr.refund_date FROM amazon_order_line_refunds olr
+        WHERE olr.amazon_order_id = acr.amazon_order_id AND olr.sku = acr.sku
+        ORDER BY ABS(EXTRACT(EPOCH FROM (olr.refund_date - acr.return_date::timestamptz))) ASC
+        LIMIT 1
+      ) rf ON true
+      LEFT JOIN LATERAL (
+        SELECT
+          ce0.cogs_standard  * COALESCE(fx.rate, 1) AS cogs_standard,
+          ce0.cogs_freight   * COALESCE(fx.rate, 1) AS cogs_freight,
+          ce0.cogs_demurrage * COALESCE(fx.rate, 1) AS cogs_demurrage,
+          ce0.cogs_quality   * COALESCE(fx.rate, 1) AS cogs_quality,
+          ce0.cogs_other     * COALESCE(fx.rate, 1) AS cogs_other,
+          ce0.unit_cogs      * COALESCE(fx.rate, 1) AS unit_cogs
+        FROM cogs_entries ce0
+        LEFT JOIN LATERAL (
+          SELECT rate FROM exchange_rates
+          WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+            AND date <= ao.order_date::date
+          ORDER BY date DESC LIMIT 1
+        ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+        WHERE ce0.sku = acr.sku
+          AND ce0.effective_from <= ao.order_date::date
+          AND (ce0.effective_to IS NULL OR ce0.effective_to >= ao.order_date::date)
+        ORDER BY ce0.effective_from DESC LIMIT 1
+      ) ce ON true
+      WHERE COALESCE(rf.refund_date::date, acr.return_date) BETWEEN $1 AND $2
+      GROUP BY 1, 2
+    )` : '';
+
+  // MCF (Multi-Channel Fulfillment) fees - Amazon charges the account to fulfil a Shopify
+  // order out of FBA inventory. Matches /api/pnl's mcfByPeriod, but amazon_mcf_fees is only
+  // keyed by shopify_order_id (no per-SKU breakdown - MCF is a per-fulfillment-order charge,
+  // not itemized), so it's prorated across that order's lines by revenue share, same pattern
+  // shopify_refunds above already uses to prorate a Shopify refund transaction across lines.
+  const mcfSql = channel !== 'amazon' ? `
+    shopify_mcf AS (
+      SELECT
+        COALESCE(so.shipping_country, 'Unknown') AS country,
+        sol.sku,
+        SUM((mf.fee_amount * (sol.line_gross / NULLIF(order_totals.order_gross, 0))) / vat_divisor_seller())::numeric AS mcf_fee
+      FROM amazon_mcf_fees mf
+      JOIN shopify_order_lines sol ON sol.shopify_order_id = mf.shopify_order_id
+      LEFT JOIN shopify_orders so ON so.shopify_order_id = mf.shopify_order_id
+      JOIN (
+        SELECT shopify_order_id, SUM(line_gross) AS order_gross
+        FROM shopify_order_lines GROUP BY shopify_order_id
+      ) order_totals ON order_totals.shopify_order_id = sol.shopify_order_id
+      WHERE mf.fee_date::date BETWEEN $1 AND $2
+      GROUP BY 1, 2
+    )` : '';
+
   // Which channel CTEs feed the union — 'all' stacks both.
   const parts = [];
   if (channel !== 'shopify') parts.push(amazonSql);
   if (channel !== 'amazon') parts.push(shopifySql);
+  if (returnsCogsSql) parts.push(returnsCogsSql);
+  if (mcfSql) parts.push(mcfSql);
   const salesUnion = [
     channel !== 'shopify' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM amazon_sales' : null,
     channel !== 'amazon' ? 'SELECT country, sku, product_title, units, net_before_refunds, fee_amz, fee_fba, cogs_std, cogs_freight FROM shopify_sales' : null,
   ].filter(Boolean).join(' UNION ALL ');
   const refundUnion = [
-    channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM amazon_refunds' : null,
-    channel !== 'amazon' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin FROM shopify_refunds' : null,
+    channel !== 'shopify' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin, fee_digital_services_refunded FROM amazon_refunds' : null,
+    channel !== 'amazon' ? 'SELECT country, sku, units_refunded, refunded, fee_commission_refunded, fee_refund_admin, fee_digital_services_refunded FROM shopify_refunds' : null,
   ].filter(Boolean).join(' UNION ALL ');
+
+  // Returns-COGS and MCF join in as their own FULL OUTER JOINs (not a plain LEFT JOIN off
+  // sales) so a SKU with a return or MCF fee landing this period but no sale/refund in this
+  // exact window still surfaces as its own row, instead of being silently dropped - same
+  // reasoning /api/product-breakdown's vine_by_sku join uses. Built up incrementally since
+  // rc/mcf are each only included when their channel is in scope.
+  const joinLines = ['FROM sales s', 'FULL OUTER JOIN refunds r ON r.country = s.country AND r.sku = s.sku'];
+  const countryParts = ['s.country', 'r.country'];
+  const skuParts = ['s.sku', 'r.sku'];
+  if (channel !== 'shopify') {
+    joinLines.push(`FULL OUTER JOIN amazon_returns_cogs rc ON rc.country = COALESCE(${countryParts.join(', ')}) AND rc.sku = COALESCE(${skuParts.join(', ')})`);
+    countryParts.push('rc.country'); skuParts.push('rc.sku');
+  }
+  if (channel !== 'amazon') {
+    joinLines.push(`FULL OUTER JOIN shopify_mcf mcf ON mcf.country = COALESCE(${countryParts.join(', ')}) AND mcf.sku = COALESCE(${skuParts.join(', ')})`);
+    countryParts.push('mcf.country'); skuParts.push('mcf.sku');
+  }
+  const countryExpr = `COALESCE(${countryParts.join(', ')})`;
+  const skuExpr = `COALESCE(${skuParts.join(', ')})`;
+  joinLines.push(`LEFT JOIN sku_parameters sp ON sp.sku = ${skuExpr}`);
+  const cogsStdReturnedExpr = channel !== 'shopify' ? 'COALESCE(rc.cogs_std_returned, 0)' : '0';
+  const cogsFreightReturnedExpr = channel !== 'shopify' ? 'COALESCE(rc.cogs_freight_returned, 0)' : '0';
+  const mcfFeeExpr = channel !== 'amazon' ? 'COALESCE(mcf.mcf_fee, 0)' : '0';
 
   const result = await pool.query(`
     WITH ${parts.join(',\n')},
@@ -4081,12 +4181,13 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
     refunds AS (
       SELECT country, sku, SUM(units_refunded)::int AS units_refunded, SUM(refunded)::numeric AS refunded,
              SUM(fee_commission_refunded)::numeric AS fee_commission_refunded,
-             SUM(fee_refund_admin)::numeric AS fee_refund_admin
+             SUM(fee_refund_admin)::numeric AS fee_refund_admin,
+             SUM(fee_digital_services_refunded)::numeric AS fee_digital_services_refunded
       FROM (${refundUnion}) r GROUP BY 1, 2
     )
     SELECT
-      COALESCE(s.country, r.country) AS country,
-      COALESCE(s.sku, r.sku) AS sku,
+      ${countryExpr} AS country,
+      ${skuExpr} AS sku,
       sp.asin,
       sp.parent_asin,
       sp.brand,
@@ -4099,17 +4200,15 @@ async function pvmBaseRows(dateFrom, dateTo, channel, excludeVine = false) {
       (COALESCE(s.units, 0) - COALESCE(r.units_refunded, 0))::int AS units,
       -- Refunds deducted here, matching /api/product-breakdown's net_revenue.
       (COALESCE(s.net_before_refunds, 0) - COALESCE(r.refunded, 0))::numeric AS net_revenue,
-      COALESCE(s.cogs_std, 0)::numeric AS cogs_std,
-      COALESCE(s.cogs_freight, 0)::numeric AS cogs_freight,
-      (COALESCE(s.cogs_std, 0) + COALESCE(s.cogs_freight, 0))::numeric AS cogs,
-      -- Commission refunds (and the admin fee refunds charge on top) are Amazon-fee
-      -- adjustments, so they net against fee_amz; FBA fulfillment fees aren't refunded.
-      (COALESCE(s.fee_amz, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fee_amz,
-      COALESCE(s.fee_fba, 0)::numeric AS fee_fba,
-      (COALESCE(s.fee_amz, 0) + COALESCE(s.fee_fba, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0))::numeric AS fees
-    FROM sales s
-    FULL OUTER JOIN refunds r ON r.country = s.country AND r.sku = s.sku
-    LEFT JOIN sku_parameters sp ON sp.sku = COALESCE(s.sku, r.sku)
+      (COALESCE(s.cogs_std, 0) - ${cogsStdReturnedExpr})::numeric AS cogs_std,
+      (COALESCE(s.cogs_freight, 0) - ${cogsFreightReturnedExpr})::numeric AS cogs_freight,
+      (COALESCE(s.cogs_std, 0) + COALESCE(s.cogs_freight, 0) - ${cogsStdReturnedExpr} - ${cogsFreightReturnedExpr})::numeric AS cogs,
+      -- Commission/digital-services refunds are credits (subtracted); the admin fee refunds
+      -- charge is added on top; FBA fulfillment fees aren't refunded.
+      (COALESCE(s.fee_amz, 0) - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0) - COALESCE(r.fee_digital_services_refunded, 0))::numeric AS fee_amz,
+      (COALESCE(s.fee_fba, 0) + ${mcfFeeExpr})::numeric AS fee_fba,
+      (COALESCE(s.fee_amz, 0) + COALESCE(s.fee_fba, 0) + ${mcfFeeExpr} - COALESCE(r.fee_commission_refunded, 0) + COALESCE(r.fee_refund_admin, 0) - COALESCE(r.fee_digital_services_refunded, 0))::numeric AS fees
+    ${joinLines.join('\n    ')}
   `, [dateFrom, dateTo]);
   return result.rows;
 }
