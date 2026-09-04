@@ -18,6 +18,10 @@ const fmtDateFull = (d) => {
   if (!d) return '—';
   return new Date(d).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 };
+const fmtMonth = (d) => {
+  if (!d) return '—';
+  return new Date(d).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
+};
 
 const STAGES = [
   { id: 'new', label: 'New', hex: '#6da7ec' },
@@ -276,6 +280,41 @@ function StageChart({ skus }) {
   );
 }
 
+// ─── Monthly milestones: one card per calendar month, actual-or-forecast total vs the
+// SAME calendar month exactly one year earlier. A real YoY comparator, independent of
+// whatever actuals window / granularity the chart above is currently set to.
+function MilestoneStrip({ milestones, sym }) {
+  if (!milestones.length) return null;
+  return (
+    <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4 }}>
+      {milestones.map(m => {
+        const pct = m.growth_pct === null ? null : parseFloat(m.growth_pct);
+        const positive = pct !== null && pct >= 0;
+        return (
+          <div key={m.month} style={{
+            flex: '0 0 auto', minWidth: 132, borderRadius: 10, padding: '10px 12px',
+            background: 'var(--bg3)', border: '1px solid ' + (m.is_forecast ? 'var(--border2)' : 'var(--border)'),
+            borderStyle: m.is_forecast ? 'dashed' : 'solid',
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)' }}>{fmtMonth(m.month)}</span>
+              {m.is_forecast && <span style={{ fontSize: 9, color: 'var(--accent2)', fontWeight: 600, letterSpacing: '0.04em' }}>PROJ</span>}
+            </div>
+            <div style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', marginBottom: 4 }}>{fmtMoney(m.revenue, sym)}</div>
+            {pct === null ? (
+              <div style={{ fontSize: 10, color: 'var(--muted)' }}>No PY data</div>
+            ) : (
+              <div style={{ fontSize: 11, fontWeight: 600, color: positive ? 'var(--green)' : 'var(--red)' }}>
+                {positive ? '+' : ''}{pct.toFixed(1)}% vs PY
+              </div>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 const HISTORY_WINDOWS = [
   { id: 30, label: '30d' },
   { id: 60, label: '60d' },
@@ -301,6 +340,7 @@ export default function SalesForecast() {
   const forecast = data?.forecast || [];
   const skus = data?.skus || [];
   const skuSeries = data?.sku_series || [];
+  const milestones = data?.milestones || [];
   const hasForecast = !!data?.has_forecast;
 
   const skuSeriesBySku = useMemo(() => {
@@ -462,6 +502,14 @@ export default function SalesForecast() {
                 <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--accent)', opacity: 0.15, border: '1px solid var(--accent2)' }} />Uncertainty range
               </div>
             </div>
+          </div>
+
+          <div style={cardStyle}>
+            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Monthly milestones</div>
+            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.5 }}>
+              Each month's total (actual, or forecast where the month hasn't happened yet) vs. the same calendar month last year.
+            </div>
+            <MilestoneStrip milestones={milestones} sym={sym} />
           </div>
 
           <div style={cardStyle}>

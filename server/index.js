@@ -4621,7 +4621,7 @@ app.get('/api/sales-forecast', async (req, res) => {
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
-    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult] = await Promise.all([
+    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult] = await Promise.all([
       // "revenue" here means the same thing it means everywhere else in this app (Sales
       // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
       // for the period - not just v_sku_revenue.net_revenue on its own, which is
@@ -4742,6 +4742,54 @@ app.get('/api/sales-forecast', async (req, res) => {
         WHERE forecast_date::date >= CURRENT_DATE
         ORDER BY 1, 2
       `, [historyDays]),
+      // Monthly milestones: one row per calendar month from the start of the selected
+      // actuals window through the end of the forecast horizon, each compared against
+      // the SAME calendar month exactly one year earlier - a real PY comparator, not a
+      // rolling 30-day window. PY is always looked up from actual data regardless of how
+      // far back that falls, independent of $1 (history_days) - a month deep in the
+      // forecast horizon needs a PY month from over a year ago, well outside any
+      // reasonable "actuals window" a user would pick for the chart itself.
+      pool.query(`
+        WITH bounds AS (
+          SELECT date_trunc('month', CURRENT_DATE - $1::int)::date AS start_month,
+            date_trunc('month', CURRENT_DATE + INTERVAL '180 days')::date AS end_month
+        ),
+        months AS (
+          SELECT generate_series(start_month, end_month, INTERVAL '1 month')::date AS month FROM bounds
+        ),
+        actual_rev AS (
+          SELECT date_trunc('month', order_date::date)::date AS month,
+            SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE order_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months'
+          GROUP BY 1
+        ),
+        actual_ref AS (
+          SELECT date_trunc('month', refund_date::date)::date AS month,
+            SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE refund_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months'
+          GROUP BY 1
+        ),
+        actual_by_month AS (
+          SELECT COALESCE(r.month, f.month) AS month, (COALESCE(r.revenue, 0) - COALESCE(f.refunded, 0))::numeric(12,2) AS revenue
+          FROM actual_rev r FULL OUTER JOIN actual_ref f ON f.month = r.month
+        ),
+        forecast_by_month AS (
+          SELECT date_trunc('month', forecast_date::date)::date AS month, SUM(forecast_revenue)::numeric(12,2) AS revenue
+          FROM sales_forecast WHERE forecast_date::date >= CURRENT_DATE
+          GROUP BY 1
+        )
+        SELECT m.month,
+          COALESCE(a.revenue, 0) AS actual_revenue,
+          COALESCE(fc.revenue, 0) AS forecast_revenue,
+          py.revenue AS py_revenue
+        FROM months m
+        LEFT JOIN actual_by_month a ON a.month = m.month
+        LEFT JOIN forecast_by_month fc ON fc.month = m.month
+        LEFT JOIN actual_by_month py ON py.month = (m.month - INTERVAL '1 year')::date
+        ORDER BY m.month
+      `, [historyDays]),
     ]);
 
     res.json({
@@ -4758,6 +4806,18 @@ app.get('/api/sales-forecast', async (req, res) => {
         low: r.low === null ? null : fx(r.low).toFixed(2),
         high: r.high === null ? null : fx(r.high).toFixed(2),
       })),
+      milestones: milestonesResult.rows.map(r => {
+        const total = parseFloat(r.actual_revenue || 0) + parseFloat(r.forecast_revenue || 0);
+        const py = r.py_revenue === null ? null : parseFloat(r.py_revenue);
+        const growthPct = (py && py > 0) ? ((total - py) / py) * 100 : null;
+        return {
+          month: r.month,
+          revenue: fx(total).toFixed(2),
+          py_revenue: py === null ? null : fx(py).toFixed(2),
+          growth_pct: growthPct === null ? null : growthPct.toFixed(1),
+          is_forecast: parseFloat(r.forecast_revenue || 0) > 0,
+        };
+      }),
       skus: skuResult.rows.map(r => ({
         sku: r.sku,
         product_title: r.product_title,
