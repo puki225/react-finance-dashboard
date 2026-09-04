@@ -526,6 +526,15 @@ export default function PVM() {
   const { data: rowsData, loading: rowsLoading, error: rowsError } = useApi('/api/pvm', rowsParams);
   const contentLoading = loading || rowsLoading;
   const contentError = error || rowsError;
+  // showPct reflects what the user has SELECTED (metric/marginView), which updates
+  // synchronously on click - but `data` is fetched async and can briefly still hold the
+  // previous mode's shape (e.g. margin_pct_bridge: null right after switching away from
+  // Revenue) for the one render before `loading` flips true. Every render-time branch
+  // below uses canShowPct instead of raw showPct, so that transitional frame renders the
+  // still-valid old view instead of dereferencing a field the current payload doesn't
+  // have - which is what was crashing the page. showPct itself stays the source of truth
+  // for what to REQUEST (params, above) and for the toggle buttons' own active-state.
+  const canShowPct = showPct && !!data?.margin_pct_bridge;
   const sym = data?.currency_symbol || '£';
   const metricLabel = metric === 'margin' ? 'Gross Profit' : 'Net Revenue';
   const unitLabel = metric === 'margin' ? 'margin/unit' : 'price/unit';
@@ -840,13 +849,17 @@ export default function PVM() {
           {contentError}
         </div>
       )}
-      {contentLoading && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>}
+      {/* Only the FIRST load (no data at all yet) shows this full-page placeholder.
+          A later refetch (filter click, metric/view switch) instead dims the existing
+          content in place below - unmounting the whole block on every click was what
+          made the page look like it "reloaded" and jumped to the top each time. */}
+      {(!data || !rowsData) && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>}
 
-      {!contentLoading && data && rowsData && (
-        <>
+      {data && rowsData && (
+        <div style={{ opacity: contentLoading ? 0.55 : 1, transition: 'opacity 0.15s ease', pointerEvents: contentLoading ? 'none' : 'auto', display: 'flex', flexDirection: 'column', gap: isMobile ? 16 : 22 }}>
           {/* Summary stats */}
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
-            {showPct ? (
+            {canShowPct ? (
               <>
                 <StatCard label="S1 Margin %" value={fmtPct(data.margin_pct_bridge.scenario1_pct)} sub={`${data.scenario1.from} → ${data.scenario1.to}`} />
                 <StatCard label="S2 Margin %" value={fmtPct(data.margin_pct_bridge.scenario2_pct)} sub={`${data.scenario2.from} → ${data.scenario2.to}`} />
@@ -881,13 +894,13 @@ export default function PVM() {
               (see `effective` above), the full totals otherwise. */}
           <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: isMobile ? '18px 12px' : '24px 28px' }}>
             <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 20 }}>
-              {showPct ? 'Margin Rate Bridge' : `${metricLabel} Bridge`}
+              {canShowPct ? 'Margin Rate Bridge' : `${metricLabel} Bridge`}
               {selfSelectionActive && <span style={{ color: 'var(--accent2)', fontWeight: 700, marginLeft: 8, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em' }}>selected rows only</span>}
               <span style={{ color: 'var(--muted)', fontWeight: 400, marginLeft: 8, fontSize: 12 }}>
-                {showPct ? '— mix is the residual after the rate drivers' : '— mix is the residual after price and volume'}
+                {canShowPct ? '— mix is the residual after the rate drivers' : '— mix is the residual after price and volume'}
               </span>
             </div>
-            {showPct
+            {canShowPct
               ? <MarginPctWaterfall pctBridge={data.margin_pct_bridge} s1={data.scenario1} s2={data.scenario2} isMobile={isMobile} />
               : <Waterfall bridge={effective.bridge} s1={effective.scenario1} s2={effective.scenario2} sym={sym} isMobile={isMobile} showPctOfBase={metric === 'revenue'} showMarginDrivers={showMarginDrivers} />}
           </div>
@@ -903,10 +916,10 @@ export default function PVM() {
               </span>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table style={{ width: '100%', minWidth: (showProduct ? (showPct ? 1100 : 1180) : (showPct ? 1020 : 1100)) + (showMarginDrivers ? 480 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
+              <table style={{ width: '100%', minWidth: (showProduct ? (canShowPct ? 1100 : 1180) : (canShowPct ? 1020 : 1100)) + (showMarginDrivers ? 480 : 0), borderCollapse: 'collapse', fontSize: 12 }}>
                 <thead>
                   <tr style={{ background: 'var(--bg3)' }}>
-                    {(showPct ? [
+                    {(canShowPct ? [
                       { label: '' },
                       { label: 'S1 Units', key: 's1_units' },
                       { label: 'S1 Margin %', key: 's1_margin_pct' },
@@ -958,7 +971,7 @@ export default function PVM() {
                 </thead>
                 <tbody>
                   {displayRows.length === 0 && (
-                    <tr><td colSpan={(showPct ? 12 : 13) + (showMarginDrivers ? 4 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
+                    <tr><td colSpan={(canShowPct ? 12 : 13) + (showMarginDrivers ? 4 : 0)} style={{ padding: '40px 16px', textAlign: 'center', color: 'var(--muted)' }}>No data for this selection</td></tr>
                   )}
                   {displayRows.map(({ row: m, depth }) => {
                     const cell = (v, color) => (
@@ -1018,7 +1031,7 @@ export default function PVM() {
                             </span>
                           )}
                         </td>
-                        {showPct ? (
+                        {canShowPct ? (
                           <>
                             {cell(fmtNum(m.s1_units))}
                             {cell(fmtPct(m.s1_margin_pct), 'var(--muted)')}
@@ -1060,7 +1073,7 @@ export default function PVM() {
                   <tfoot>
                     <tr style={{ borderTop: '2px solid var(--border)', background: 'var(--bg3)', fontWeight: 700 }}>
                       <td style={{ padding: '11px 10px' }}>Total</td>
-                      {showPct ? (
+                      {canShowPct ? (
                         <>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)' }}>{fmtNum(data.scenario1.units)}</td>
                           <td style={{ padding: '11px 10px', textAlign: 'right', fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtPct(data.margin_pct_bridge.scenario1_pct)}</td>
@@ -1100,7 +1113,7 @@ export default function PVM() {
               </table>
             </div>
             <div style={{ padding: '10px 16px', borderTop: '1px solid var(--border)', fontSize: 11, color: 'var(--muted)' }}>
-              {showPct ? (
+              {canShowPct ? (
                 <>Rate is each row's own margin-rate change, weighted at its scenario-1 revenue share — it isolates
                   "did this row itself get more/less profitable" from "did the revenue mix shift toward it." Mix is
                   the residual, capturing that share shift. A row with revenue in only one scenario has no rate to
@@ -1113,7 +1126,7 @@ export default function PVM() {
               )}
             </div>
           </div>
-        </>
+        </div>
       )}
       <HoverTooltip tip={hoverTip} />
     </div>
