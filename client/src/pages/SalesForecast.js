@@ -18,10 +18,6 @@ const fmtDateFull = (d) => {
   if (!d) return '—';
   return new Date(d).toLocaleDateString('en-GB', { weekday: 'short', day: 'numeric', month: 'short', year: 'numeric' });
 };
-const fmtMonth = (d) => {
-  if (!d) return '—';
-  return new Date(d).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' });
-};
 
 const STAGES = [
   { id: 'new', label: 'New', hex: '#6da7ec' },
@@ -138,8 +134,22 @@ function pickTicks(n, todayIdx) {
   return [...want].sort((a, b) => a - b);
 }
 
+// Nearest-day lookup for placing a calendar-month milestone onto whatever x-position that
+// month's start date maps to in `days` - independent of the chart's current granularity
+// (days may already be weekly/monthly buckets, in which case this just finds the
+// containing bucket instead of an exact date match).
+function nearestDayIndex(days, dateStr) {
+  const target = new Date(dateStr).getTime();
+  let bestI = -1, bestDiff = Infinity;
+  days.forEach((d, i) => {
+    const diff = Math.abs(new Date(d.date).getTime() - target);
+    if (diff < bestDiff) { bestDiff = diff; bestI = i; }
+  });
+  return bestI;
+}
+
 // ─── Main chart: actual (solid) -> forecast (dashed) with uncertainty band ────────────
-function MainChart({ days, granularity, sym }) {
+function MainChart({ days, granularity, sym, milestones }) {
   const [hover, setHover] = useState(null);
   const W = 980, ML = 4, MR = 4, H = 220, XAXISH = 22;
 
@@ -182,6 +192,10 @@ function MainChart({ days, granularity, sym }) {
   const hoveredDay = hover ? days[hover.i] : null;
   const ticksX = pickTicks(N, todayIdx);
 
+  const milestoneMarks = (milestones || [])
+    .map(m => ({ i: nearestDayIndex(days, m.month), growth_pct: m.growth_pct }))
+    .filter(m => m.i >= 0);
+
   return (
     <div style={{ position: 'relative' }}>
       <svg viewBox={`0 0 ${W} ${H + XAXISH}`} width="100%" height={H + XAXISH} style={{ display: 'block', overflow: 'visible' }}
@@ -201,6 +215,18 @@ function MainChart({ days, granularity, sym }) {
             <text x={x(todayIdx)} y={12} fontFamily="var(--mono)" fontSize={10} fill="var(--muted)" textAnchor="middle">Today</text>
           </>
         )}
+        {milestoneMarks.map((m, idx) => {
+          const pct = m.growth_pct === null ? null : parseFloat(m.growth_pct);
+          const color = pct === null ? 'var(--muted)' : (pct >= 0 ? 'var(--green)' : 'var(--red)');
+          return (
+            <g key={idx}>
+              <line x1={x(m.i)} x2={x(m.i)} y1={0} y2={8} stroke="var(--border2)" strokeWidth={1} strokeDasharray="2,2" />
+              <text x={x(m.i)} y={24} fontFamily="var(--mono)" fontSize={9} fontWeight={600} fill={color} textAnchor="middle">
+                {pct === null ? '–' : `${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%`}
+              </text>
+            </g>
+          );
+        })}
         {areaPath && <path d={areaPath} fill="var(--accent)" opacity={0.12} />}
         <path d={actualPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
         {forecastPath && <path d={forecastPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeDasharray="5,4" strokeLinejoin="round" strokeLinecap="round" />}
@@ -277,41 +303,6 @@ function StageChart({ skus }) {
         );
       })}
     </svg>
-  );
-}
-
-// ─── Monthly milestones: one card per calendar month, actual-or-forecast total vs the
-// SAME calendar month exactly one year earlier. A real YoY comparator, independent of
-// whatever actuals window / granularity the chart above is currently set to.
-function MilestoneStrip({ milestones, sym }) {
-  if (!milestones.length) return null;
-  return (
-    <div style={{ display: 'flex', gap: 10, overflowX: 'auto', paddingBottom: 4 }}>
-      {milestones.map(m => {
-        const pct = m.growth_pct === null ? null : parseFloat(m.growth_pct);
-        const positive = pct !== null && pct >= 0;
-        return (
-          <div key={m.month} style={{
-            flex: '0 0 auto', minWidth: 132, borderRadius: 10, padding: '10px 12px',
-            background: 'var(--bg3)', border: '1px solid ' + (m.is_forecast ? 'var(--border2)' : 'var(--border)'),
-            borderStyle: m.is_forecast ? 'dashed' : 'solid',
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--text)' }}>{fmtMonth(m.month)}</span>
-              {m.is_forecast && <span style={{ fontSize: 9, color: 'var(--accent2)', fontWeight: 600, letterSpacing: '0.04em' }}>PROJ</span>}
-            </div>
-            <div style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', marginBottom: 4 }}>{fmtMoney(m.revenue, sym)}</div>
-            {pct === null ? (
-              <div style={{ fontSize: 10, color: 'var(--muted)' }}>No PY data</div>
-            ) : (
-              <div style={{ fontSize: 11, fontWeight: 600, color: positive ? 'var(--green)' : 'var(--red)' }}>
-                {positive ? '+' : ''}{pct.toFixed(1)}% vs PY
-              </div>
-            )}
-          </div>
-        );
-      })}
-    </div>
   );
 }
 
@@ -490,7 +481,7 @@ export default function SalesForecast() {
                 </div>
               </div>
             </div>
-            <MainChart days={bucketedDays} granularity={granularity} sym={sym} />
+            <MainChart days={bucketedDays} granularity={granularity} sym={sym} milestones={milestones} />
             <div style={{ display: 'flex', gap: 16, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 14, height: 2, background: 'var(--accent)' }} />Actual
@@ -501,15 +492,10 @@ export default function SalesForecast() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--accent)', opacity: 0.15, border: '1px solid var(--accent2)' }} />Uncertainty range
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+                <span style={{ fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--green)' }}>+X%</span>along the top = that month vs. the same month last year
+              </div>
             </div>
-          </div>
-
-          <div style={cardStyle}>
-            <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Monthly milestones</div>
-            <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.5 }}>
-              Each month's total (actual, or forecast where the month hasn't happened yet) vs. the same calendar month last year.
-            </div>
-            <MilestoneStrip milestones={milestones} sym={sym} />
           </div>
 
           <div style={cardStyle}>
