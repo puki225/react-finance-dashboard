@@ -4622,11 +4622,26 @@ app.get('/api/sales-forecast', async (req, res) => {
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
     const [historyResult, forecastResult, skuResult, latestGenResult] = await Promise.all([
+      // "revenue" here means the same thing it means everywhere else in this app (Sales
+      // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
+      // for the period - not just v_sku_revenue.net_revenue on its own, which is
+      // pre-refund and reads high against every other page's numbers.
       pool.query(`
-        SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
-        FROM v_sku_revenue
-        WHERE order_date::date >= CURRENT_DATE - $1::int
-        GROUP BY 1 ORDER BY 1
+        WITH rev AS (
+          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE order_date::date >= CURRENT_DATE - $1::int
+          GROUP BY 1
+        ),
+        ref AS (
+          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE refund_date::date >= CURRENT_DATE - $1::int
+          GROUP BY 1
+        )
+        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
+        ORDER BY 1
       `, [historyDays]),
       pool.query(`
         SELECT forecast_date::date AS date,
@@ -4640,11 +4655,21 @@ app.get('/api/sales-forecast', async (req, res) => {
       // Per-SKU: last 30d actual vs next 30d forecast, plus the stage/EOL config and any
       // outlier exclusions, so the UI can show why a number looks the way it does.
       pool.query(`
-        WITH last30 AS (
+        WITH last30_rev AS (
           SELECT sku, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
           WHERE order_date::date >= CURRENT_DATE - INTERVAL '30 days'
           GROUP BY sku
+        ),
+        last30_ref AS (
+          SELECT sku, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE refund_date::date >= CURRENT_DATE - INTERVAL '30 days' AND sku IS NOT NULL
+          GROUP BY sku
+        ),
+        last30 AS (
+          SELECT COALESCE(r.sku, f.sku) AS sku, (COALESCE(r.revenue, 0) - COALESCE(f.refunded, 0))::numeric(12,2) AS revenue
+          FROM last30_rev r FULL OUTER JOIN last30_ref f ON f.sku = r.sku
         ),
         next30 AS (
           SELECT sku, SUM(forecast_revenue)::numeric(12,2) AS revenue
