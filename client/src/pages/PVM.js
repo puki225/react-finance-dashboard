@@ -489,17 +489,18 @@ export default function PVM() {
 
   // Empty filter arrays must be omitted entirely — URLSearchParams would otherwise
   // serialise them as literal "" and the server would filter on that. The CURRENT
-  // level's own dimension is deliberately left off the request (except in %-mode, see
-  // below) so the table keeps listing every row at this level — letting you keep
+  // level's own dimension is deliberately left off the ROWS request below (regardless of
+  // mode) so the table keeps listing every row at this level — letting you keep
   // ctrl/cmd-clicking more of them — instead of narrowing away every sibling the moment
-  // one is picked. The £ Price/Volume/Mix bridge is then re-aggregated client-side from
-  // just the selected rows (see `effective` below), which is exact because those figures
-  // are plain per-member sums. The margin-RATE (%) bridge can't do the same trick — its
-  // Price/COGS/Freight/Fees drivers are weighted by each member's share of scenario-1
-  // REVENUE, so re-deriving them for an arbitrary subset needs the same server-side
-  // computation the full page uses — so in %-mode the self filter IS sent, and the table
-  // narrows immediately like any other filter.
-  const params = useMemo(() => {
+  // one is picked. In %-mode the self filter IS still sent, but only on a SEPARATE request
+  // (see rowsParams below) used purely for the bridge/KPI numbers - the margin-RATE (%)
+  // bridge can't be re-aggregated client-side like the £ one (its Price/COGS/Freight/Fees
+  // drivers are weighted by each member's share of scenario-1 REVENUE, so re-deriving them
+  // for an arbitrary subset needs the same server-side computation the full page uses).
+  // Splitting the two requests apart is what fixes ctrl/cmd-click in %-mode: if the table's
+  // own row list came from the self-filtered request, the very first click would already
+  // narrow it down to one row, leaving nothing else visible to click.
+  const buildParams = (includeSelfFilter) => {
     const p = {
       s1_from: periods.s1.from, s1_to: periods.s1.to,
       s2_from: periods.s2.from, s2_to: periods.s2.to,
@@ -510,13 +511,21 @@ export default function PVM() {
     // asin level, a member is identified by either 'asin' or 'sku' (see clickableFilterFor).
     const selfFields = level === 'country' ? ['country'] : level === 'brand' ? ['brand'] : ['asin', 'sku'];
     for (const field of ['country', 'brand', 'asin', 'sku']) {
-      if (!showPct && selfFields.includes(field)) continue;
+      if (!includeSelfFilter && selfFields.includes(field)) continue;
       if (filters[field].length) p[field] = filters[field].join(',');
     }
     return p;
-  }, [periods, metric, level, channel, filters, showPct, excludeVine]);
+  };
+  // Bridge/KPI numbers - reflects the current selection (self filter included in %-mode).
+  const params = useMemo(() => buildParams(showPct), [periods, metric, level, channel, filters, showPct, excludeVine]);
+  // Table rows/click targets/filter options - NEVER self-filtered, so every row at this
+  // level always stays visible and clickable no matter what's currently selected.
+  const rowsParams = useMemo(() => buildParams(false), [periods, metric, level, channel, filters, excludeVine]);
 
   const { data, loading, error } = useApi('/api/pvm', params);
+  const { data: rowsData, loading: rowsLoading, error: rowsError } = useApi('/api/pvm', rowsParams);
+  const contentLoading = loading || rowsLoading;
+  const contentError = error || rowsError;
   const sym = data?.currency_symbol || '£';
   const metricLabel = metric === 'margin' ? 'Gross Profit' : 'Net Revenue';
   const unitLabel = metric === 'margin' ? 'margin/unit' : 'price/unit';
@@ -524,12 +533,13 @@ export default function PVM() {
   // Margin rate is derived here rather than read off the server's own s1_margin_pct so
   // it exists in EVERY metric mode (the server only builds that field for the margin-%
   // bridge) and so one rule covers child rows, parent-group rows and the footer total.
-  const rawMembers = useMemo(() => (data?.members || []).map(m => ({
+  // Sourced from rowsData (never self-filtered) - see the comment above buildParams.
+  const rawMembers = useMemo(() => (rowsData?.members || []).map(m => ({
     ...m,
     s1_margin_pct: marginPct(m.s1_revenue, m.s1_profit),
     s2_margin_pct: marginPct(m.s2_revenue, m.s2_profit),
-  })), [data]);
-  const opts = data?.options || { countries: [], brands: [], asins: [] };
+  })), [rowsData]);
+  const opts = rowsData?.options || { countries: [], brands: [], asins: [] };
   const [hoverTip, setHoverTip] = useState(null);
   const showProduct = level === 'asin';
 
@@ -825,14 +835,14 @@ export default function PVM() {
         </div>
       )}
 
-      {error && (
+      {contentError && (
         <div style={{ background: '#f8717112', border: '1px solid #f8717140', borderRadius: 10, padding: '12px 16px', fontSize: 12, color: 'var(--red)' }}>
-          {error}
+          {contentError}
         </div>
       )}
-      {loading && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>}
+      {contentLoading && <div style={{ padding: '48px 20px', textAlign: 'center', color: 'var(--muted)', fontSize: 13 }}>Loading…</div>}
 
-      {!loading && data && (
+      {!contentLoading && data && rowsData && (
         <>
           {/* Summary stats */}
           <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
