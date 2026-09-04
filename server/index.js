@@ -4621,7 +4621,7 @@ app.get('/api/sales-forecast', async (req, res) => {
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
-    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult] = await Promise.all([
+    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult, pyDailyResult] = await Promise.all([
       // "revenue" here means the same thing it means everywhere else in this app (Sales
       // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
       // for the period - not just v_sku_revenue.net_revenue on its own, which is
@@ -4790,6 +4790,31 @@ app.get('/api/sales-forecast', async (req, res) => {
         LEFT JOIN actual_by_month py ON py.month = (m.month - INTERVAL '1 year')::date
         ORDER BY m.month
       `, [historyDays]),
+      // Daily actuals for the PY (prior-year) comparator, at DAY grain - so the tooltip's
+      // "vs PY" can compare a single hovered day (Daily granularity) or a summed week
+      // (Weekly) against the matching PY day/week, not just a whole month (`milestones`
+      // above already covers Monthly). Covers the same 364-days-back window the
+      // forecast-service's own PY blend uses (weekday-aligned, not a calendar year shift -
+      // see sales-forecast-service/forecast.py's PY_SHIFT_DAYS), across the full display
+      // range (actuals window back through the forecast horizon forward), independent of
+      // history_days the same way `milestones` is.
+      pool.query(`
+        WITH rev AS (
+          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE order_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+          GROUP BY 1
+        ),
+        ref AS (
+          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE refund_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+          GROUP BY 1
+        )
+        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
+        ORDER BY 1
+      `, [historyDays]),
     ]);
 
     res.json({
@@ -4818,6 +4843,7 @@ app.get('/api/sales-forecast', async (req, res) => {
           is_forecast: parseFloat(r.forecast_revenue || 0) > 0,
         };
       }),
+      py_history: pyDailyResult.rows.map(r => ({ date: r.date, revenue: fx(r.revenue).toFixed(2) })),
       skus: skuResult.rows.map(r => ({
         sku: r.sku,
         product_title: r.product_title,
