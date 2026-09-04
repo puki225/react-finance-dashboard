@@ -169,6 +169,49 @@ app.use(express.static(path.join(__dirname, '../client/build')));
   }
 })();
 
+// ─── SALES FORECAST: SCHEMA MIGRATION ───────────────────────────────────
+// sku_forecast_config holds the two user-editable overrides the Sales Forecast tab exposes
+// per SKU: a manual growth-stage override (auto-classification otherwise picks new/growth/
+// mature/plateau/declining) and an end-of-life flag (sell out remaining inventory at the
+// current run rate, then stop - no restock assumed). Both are read by the forecasting job,
+// not written by it, so a user's choice always survives the next nightly run.
+// sales_forecast holds that job's daily per-SKU output. stage_used/model_used are recorded
+// per row so the UI can show which model produced a given number without re-deriving it.
+// sales_forecast_exclusions records which historical dates were stripped as outliers before
+// fitting (e.g. a Prime Day spike), purely for UI transparency - not read by the model itself.
+(async function migrateSalesForecastSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS sku_forecast_config (
+        sku TEXT PRIMARY KEY,
+        stage_override TEXT CHECK (stage_override IN ('new','growth','mature','plateau','declining')),
+        is_end_of_life BOOLEAN NOT NULL DEFAULT false,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS sales_forecast (
+        sku TEXT NOT NULL,
+        forecast_date DATE NOT NULL,
+        forecast_revenue NUMERIC(12,2) NOT NULL,
+        low_revenue NUMERIC(12,2),
+        high_revenue NUMERIC(12,2),
+        stage_used TEXT,
+        model_used TEXT,
+        generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (sku, forecast_date)
+      );
+      CREATE INDEX IF NOT EXISTS idx_sales_forecast_date ON sales_forecast (forecast_date);
+      CREATE TABLE IF NOT EXISTS sales_forecast_exclusions (
+        sku TEXT NOT NULL,
+        excluded_date DATE NOT NULL,
+        reason TEXT,
+        PRIMARY KEY (sku, excluded_date)
+      );
+    `);
+  } catch (e) {
+    console.error('[db] Sales forecast schema migration failed:', e.message);
+  }
+})();
+
 // ─── VINE ORDER CLASSIFICATION ──────────────────────────────────────────
 // Amazon Vine gives away FBA inventory as free review copies - not real sales, but they
 // inflate units-sold/gross-sales figures with no matching revenue if left unclassified.
@@ -4646,6 +4689,147 @@ app.post('/api/sync-fee-estimates', async (req, res) => {
     console.error('[fee-estimates]', err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
+});
+
+// ─── SALES FORECAST ──────────────────────────────────────────────────────
+// Reads the output of the nightly forecast-service job (writes to sales_forecast /
+// sales_forecast_exclusions). If that job hasn't run yet, sales_forecast is just empty -
+// this still returns real historical actuals so the tab isn't blank, with has_forecast:false
+// telling the UI to show a "not generated yet" state for the projection itself.
+app.get('/api/sales-forecast', async (req, res) => {
+  const historyDays = Math.min(parseInt(req.query.history_days, 10) || 60, 365);
+  try {
+    const reportingCurrency = await getReportingCurrency();
+    const today = new Date().toISOString().split('T')[0];
+    const fxRate = await getFxRate('GBP', reportingCurrency, today);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+    const fx = (n) => (parseFloat(n || 0) * fxRate);
+
+    const [historyResult, forecastResult, skuResult, latestGenResult] = await Promise.all([
+      pool.query(`
+        SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+        FROM v_sku_revenue
+        WHERE order_date::date >= CURRENT_DATE - $1::int
+        GROUP BY 1 ORDER BY 1
+      `, [historyDays]),
+      pool.query(`
+        SELECT forecast_date::date AS date,
+          SUM(forecast_revenue)::numeric(12,2) AS revenue,
+          SUM(COALESCE(low_revenue, forecast_revenue))::numeric(12,2) AS low,
+          SUM(COALESCE(high_revenue, forecast_revenue))::numeric(12,2) AS high
+        FROM sales_forecast
+        WHERE forecast_date::date >= CURRENT_DATE
+        GROUP BY 1 ORDER BY 1
+      `),
+      // Per-SKU: last 30d actual vs next 30d forecast, plus the stage/EOL config and any
+      // outlier exclusions, so the UI can show why a number looks the way it does.
+      pool.query(`
+        WITH last30 AS (
+          SELECT sku, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE order_date::date >= CURRENT_DATE - INTERVAL '30 days'
+          GROUP BY sku
+        ),
+        next30 AS (
+          SELECT sku, SUM(forecast_revenue)::numeric(12,2) AS revenue
+          FROM sales_forecast
+          WHERE forecast_date::date > CURRENT_DATE AND forecast_date::date <= CURRENT_DATE + INTERVAL '30 days'
+          GROUP BY sku
+        ),
+        latest_stage AS (
+          SELECT DISTINCT ON (sku) sku, stage_used, model_used, generated_at
+          FROM sales_forecast
+          ORDER BY sku, forecast_date DESC
+        ),
+        exclusions AS (
+          SELECT sku, COUNT(*)::int AS excluded_count, MAX(excluded_date) AS last_excluded_date,
+            (ARRAY_AGG(reason ORDER BY excluded_date DESC))[1] AS last_reason
+          FROM sales_forecast_exclusions GROUP BY sku
+        ),
+        all_skus AS (
+          SELECT sku FROM last30
+          UNION SELECT sku FROM next30
+          UNION SELECT sku FROM sku_forecast_config
+        )
+        SELECT a.sku, COALESCE(sp.product_name, ot.title) AS product_title, sp.image_url, sp.asin,
+          cfg.stage_override, COALESCE(cfg.is_end_of_life, false) AS is_end_of_life,
+          ls.stage_used, ls.model_used, ls.generated_at,
+          COALESCE(l30.revenue, 0) AS last_30d_revenue,
+          COALESCE(n30.revenue, 0) AS next_30d_revenue,
+          COALESCE(ex.excluded_count, 0) AS excluded_count, ex.last_excluded_date, ex.last_reason
+        FROM all_skus a
+        LEFT JOIN last30 l30 ON l30.sku = a.sku
+        LEFT JOIN next30 n30 ON n30.sku = a.sku
+        LEFT JOIN sku_forecast_config cfg ON cfg.sku = a.sku
+        LEFT JOIN latest_stage ls ON ls.sku = a.sku
+        LEFT JOIN exclusions ex ON ex.sku = a.sku
+        LEFT JOIN sku_parameters sp ON sp.sku = a.sku
+        LEFT JOIN LATERAL (
+          SELECT title FROM amazon_order_lines WHERE sku = a.sku AND title IS NOT NULL
+          ORDER BY synced_at DESC LIMIT 1
+        ) ot ON true
+        ORDER BY n30.revenue DESC NULLS LAST, l30.revenue DESC NULLS LAST
+      `),
+      pool.query(`SELECT MAX(generated_at) AS generated_at FROM sales_forecast`),
+    ]);
+
+    res.json({
+      currency_symbol: sym,
+      has_forecast: forecastResult.rows.length > 0,
+      generated_at: latestGenResult.rows[0]?.generated_at || null,
+      history: historyResult.rows.map(r => ({ date: r.date, revenue: fx(r.revenue).toFixed(2) })),
+      forecast: forecastResult.rows.map(r => ({
+        date: r.date, revenue: fx(r.revenue).toFixed(2), low: fx(r.low).toFixed(2), high: fx(r.high).toFixed(2),
+      })),
+      skus: skuResult.rows.map(r => ({
+        sku: r.sku,
+        product_title: r.product_title,
+        image_url: r.image_url,
+        asin: r.asin,
+        stage: r.stage_override || r.stage_used || null,
+        stage_override: r.stage_override,
+        auto_stage: r.stage_used,
+        is_end_of_life: r.is_end_of_life,
+        model_used: r.model_used,
+        generated_at: r.generated_at,
+        last_30d_revenue: fx(r.last_30d_revenue).toFixed(2),
+        next_30d_revenue: fx(r.next_30d_revenue).toFixed(2),
+        excluded_count: r.excluded_count,
+        last_excluded_date: r.last_excluded_date,
+        last_exclusion_reason: r.last_reason,
+      })),
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// Sales Forecast — set a SKU's manual stage override and/or end-of-life flag. The nightly
+// job always reads this before (re)fitting, so a user's choice here survives the next run
+// until they change it again. Only the fields present in the body are touched - omitting
+// stage_override leaves it as-is; sending stage_override: null clears back to auto-classify.
+app.put('/api/sales-forecast/config/:sku', async (req, res) => {
+  const { sku } = req.params;
+  const VALID_STAGES = ['new', 'growth', 'mature', 'plateau', 'declining'];
+  const hasStage = Object.prototype.hasOwnProperty.call(req.body, 'stage_override');
+  const hasEol = Object.prototype.hasOwnProperty.call(req.body, 'is_end_of_life');
+  if (!hasStage && !hasEol) return res.status(400).json({ error: 'stage_override or is_end_of_life required' });
+  const stageOverride = hasStage ? (req.body.stage_override || null) : undefined;
+  if (stageOverride !== undefined && stageOverride !== null && !VALID_STAGES.includes(stageOverride)) {
+    return res.status(400).json({ error: `stage_override must be one of ${VALID_STAGES.join(', ')}, or null` });
+  }
+  const isEndOfLife = hasEol ? !!req.body.is_end_of_life : undefined;
+  try {
+    const existing = await pool.query('SELECT stage_override, is_end_of_life FROM sku_forecast_config WHERE sku = $1', [sku]);
+    const prev = existing.rows[0] || { stage_override: null, is_end_of_life: false };
+    const nextStage = hasStage ? stageOverride : prev.stage_override;
+    const nextEol = hasEol ? isEndOfLife : prev.is_end_of_life;
+    const result = await pool.query(`
+      INSERT INTO sku_forecast_config (sku, stage_override, is_end_of_life, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (sku) DO UPDATE SET stage_override = $2, is_end_of_life = $3, updated_at = NOW()
+      RETURNING sku, stage_override, is_end_of_life, updated_at
+    `, [sku, nextStage, nextEol]);
+    res.json({ ok: true, config: result.rows[0] });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
