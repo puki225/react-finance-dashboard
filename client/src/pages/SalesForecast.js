@@ -139,9 +139,29 @@ function monthKeyOf(dateStr) {
   const d = new Date(dateStr);
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
+const isoDate = (d) => d.toISOString().slice(0, 10);
+
+// PY comparator for a Daily or Weekly bucket - 364 days back (52 whole weeks, weekday-
+// aligned, same convention forecast-service's own PY blend uses), not a calendar year
+// shift. Monthly is handled separately via `milestones` (calendar-month-aligned, which
+// matters more at that grain than weekday alignment does). Weekly sums the matching
+// 7-day PY window so it's comparing week-total to week-total, not one day to a week.
+function pyValueForBucket(bucketDateStr, granularity, pyByDate) {
+  if (granularity === 'monthly') return undefined; // caller uses milestoneByMonth instead
+  const bucketDate = new Date(bucketDateStr);
+  const span = granularity === 'weekly' ? 7 : 1;
+  let sum = 0, found = false;
+  for (let i = 0; i < span; i++) {
+    const d = new Date(bucketDate);
+    d.setUTCDate(d.getUTCDate() - 364 + i);
+    const key = isoDate(d);
+    if (pyByDate.has(key)) { sum += pyByDate.get(key); found = true; }
+  }
+  return found ? sum : null;
+}
 
 // ─── Main chart: actual (solid) -> forecast (dashed) with uncertainty band ────────────
-function MainChart({ days, granularity, sym, milestones }) {
+function MainChart({ days, granularity, sym, milestones, pyByDate }) {
   const [hover, setHover] = useState(null);
   const W = 980, ML = 4, MR = 4, H = 220, XAXISH = 22;
 
@@ -188,8 +208,20 @@ function MainChart({ days, granularity, sym, milestones }) {
   const hoveredDay = hover ? days[hover.i] : null;
   const ticksX = pickTicks(N, todayIdx);
 
+  // vs-PY comparison for the hovered point, at whatever grain the chart is currently
+  // showing - a day compares to the same day last year, a week to the same week, a month
+  // to the same month (via `milestones`, calendar-month-aligned rather than a 364-day
+  // shift - matters more for months than weekday alignment does).
   const milestoneByMonth = new Map((milestones || []).map(m => [monthKeyOf(m.month), m.growth_pct]));
-  const hoveredMilestonePct = hoveredDay ? milestoneByMonth.get(monthKeyOf(hoveredDay.date)) : undefined;
+  let hoveredPyPct;
+  if (hoveredDay) {
+    if (granularity === 'monthly') {
+      hoveredPyPct = milestoneByMonth.get(monthKeyOf(hoveredDay.date));
+    } else {
+      const pyValue = pyValueForBucket(hoveredDay.date, granularity, pyByDate);
+      hoveredPyPct = pyValue === null ? null : (pyValue > 0 ? (((hoveredDay.value - pyValue) / pyValue) * 100).toFixed(1) : null);
+    }
+  }
 
   return (
     <div style={{ position: 'relative' }}>
@@ -251,11 +283,11 @@ function MainChart({ days, granularity, sym, milestones }) {
               <span>Range</span><span style={{ fontFamily: 'var(--mono)', fontWeight: 500 }}>{fmtMoney(hoveredDay.low, sym)} – {fmtMoney(hoveredDay.high, sym)}</span>
             </div>
           )}
-          {hoveredMilestonePct !== undefined && (
+          {hoveredPyPct !== undefined && (
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
-              <span>Month vs PY</span>
-              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: hoveredMilestonePct === null ? 'var(--muted)' : (parseFloat(hoveredMilestonePct) >= 0 ? 'var(--green)' : 'var(--red)') }}>
-                {hoveredMilestonePct === null ? 'No PY data' : `${parseFloat(hoveredMilestonePct) >= 0 ? '+' : ''}${parseFloat(hoveredMilestonePct).toFixed(1)}%`}
+              <span>{granularity === 'monthly' ? 'Month' : granularity === 'weekly' ? 'Week' : 'Day'} vs PY</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: hoveredPyPct === null ? 'var(--muted)' : (parseFloat(hoveredPyPct) >= 0 ? 'var(--green)' : 'var(--red)') }}>
+                {hoveredPyPct === null ? 'No PY data' : `${parseFloat(hoveredPyPct) >= 0 ? '+' : ''}${parseFloat(hoveredPyPct).toFixed(1)}%`}
               </span>
             </div>
           )}
@@ -323,7 +355,10 @@ export default function SalesForecast() {
   const skus = data?.skus || [];
   const skuSeries = data?.sku_series || [];
   const milestones = data?.milestones || [];
+  const pyHistory = data?.py_history || [];
   const hasForecast = !!data?.has_forecast;
+
+  const pyByDate = useMemo(() => new Map(pyHistory.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [pyHistory]);
 
   const skuSeriesBySku = useMemo(() => {
     const m = new Map();
@@ -472,7 +507,7 @@ export default function SalesForecast() {
                 </div>
               </div>
             </div>
-            <MainChart days={bucketedDays} granularity={granularity} sym={sym} milestones={milestones} />
+            <MainChart days={bucketedDays} granularity={granularity} sym={sym} milestones={milestones} pyByDate={pyByDate} />
             <div style={{ display: 'flex', gap: 16, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 14, height: 2, background: 'var(--accent)' }} />Actual
@@ -483,7 +518,7 @@ export default function SalesForecast() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--accent)', opacity: 0.15, border: '1px solid var(--accent2)' }} />Uncertainty range
               </div>
-              <div style={{ fontSize: 11, color: 'var(--muted)' }}>Hover a point for that day's revenue and how its month compares to the same month last year.</div>
+              <div style={{ fontSize: 11, color: 'var(--muted)' }}>Hover a point for its revenue and how it compares to the same day/week/month last year.</div>
             </div>
           </div>
 
