@@ -134,18 +134,10 @@ function pickTicks(n, todayIdx) {
   return [...want].sort((a, b) => a - b);
 }
 
-// Nearest-day lookup for placing a calendar-month milestone onto whatever x-position that
-// month's start date maps to in `days` - independent of the chart's current granularity
-// (days may already be weekly/monthly buckets, in which case this just finds the
-// containing bucket instead of an exact date match).
-function nearestDayIndex(days, dateStr) {
-  const target = new Date(dateStr).getTime();
-  let bestI = -1, bestDiff = Infinity;
-  days.forEach((d, i) => {
-    const diff = Math.abs(new Date(d.date).getTime() - target);
-    if (diff < bestDiff) { bestDiff = diff; bestI = i; }
-  });
-  return bestI;
+// "YYYY-MM" key so a hovered day can look up which calendar-month milestone it falls in.
+function monthKeyOf(dateStr) {
+  const d = new Date(dateStr);
+  return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}`;
 }
 
 // ─── Main chart: actual (solid) -> forecast (dashed) with uncertainty band ────────────
@@ -184,6 +176,10 @@ function MainChart({ days, granularity, sym, milestones }) {
   const handleMove = (e) => {
     const svg = e.currentTarget;
     const rect = svg.getBoundingClientRect();
+    // rect is the SVG's actual on-screen box; viewBox (W x H+XAXISH) maps onto it
+    // independently per axis (preserveAspectRatio="none" below) - relX/relY must divide
+    // by rect.width/rect.height respectively to match, not both by rect.width, or this
+    // drifts the moment the rendered box's aspect ratio differs from the viewBox's.
     const relX = (e.clientX - rect.left) / rect.width * W;
     let i = Math.round((relX - ML) / slot);
     i = Math.max(0, Math.min(N - 1, i));
@@ -192,13 +188,12 @@ function MainChart({ days, granularity, sym, milestones }) {
   const hoveredDay = hover ? days[hover.i] : null;
   const ticksX = pickTicks(N, todayIdx);
 
-  const milestoneMarks = (milestones || [])
-    .map(m => ({ i: nearestDayIndex(days, m.month), growth_pct: m.growth_pct }))
-    .filter(m => m.i >= 0);
+  const milestoneByMonth = new Map((milestones || []).map(m => [monthKeyOf(m.month), m.growth_pct]));
+  const hoveredMilestonePct = hoveredDay ? milestoneByMonth.get(monthKeyOf(hoveredDay.date)) : undefined;
 
   return (
     <div style={{ position: 'relative' }}>
-      <svg viewBox={`0 0 ${W} ${H + XAXISH}`} width="100%" height={H + XAXISH} style={{ display: 'block', overflow: 'visible' }}
+      <svg viewBox={`0 0 ${W} ${H + XAXISH}`} width="100%" height={H + XAXISH} preserveAspectRatio="none" style={{ display: 'block', overflow: 'visible' }}
         onMouseMove={handleMove} onMouseLeave={() => setHover(null)}>
         {ticks.map((v, idx) => {
           const yy = y(v);
@@ -215,18 +210,6 @@ function MainChart({ days, granularity, sym, milestones }) {
             <text x={x(todayIdx)} y={12} fontFamily="var(--mono)" fontSize={10} fill="var(--muted)" textAnchor="middle">Today</text>
           </>
         )}
-        {milestoneMarks.map((m, idx) => {
-          const pct = m.growth_pct === null ? null : parseFloat(m.growth_pct);
-          const color = pct === null ? 'var(--muted)' : (pct >= 0 ? 'var(--green)' : 'var(--red)');
-          return (
-            <g key={idx}>
-              <line x1={x(m.i)} x2={x(m.i)} y1={0} y2={8} stroke="var(--border2)" strokeWidth={1} strokeDasharray="2,2" />
-              <text x={x(m.i)} y={24} fontFamily="var(--mono)" fontSize={9} fontWeight={600} fill={color} textAnchor="middle">
-                {pct === null ? '–' : `${pct >= 0 ? '+' : ''}${pct.toFixed(0)}%`}
-              </text>
-            </g>
-          );
-        })}
         {areaPath && <path d={areaPath} fill="var(--accent)" opacity={0.12} />}
         <path d={actualPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
         {forecastPath && <path d={forecastPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeDasharray="5,4" strokeLinejoin="round" strokeLinecap="round" />}
@@ -266,6 +249,14 @@ function MainChart({ days, granularity, sym, milestones }) {
           {!hoveredDay.actual && hoveredDay.low !== undefined && (
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
               <span>Range</span><span style={{ fontFamily: 'var(--mono)', fontWeight: 500 }}>{fmtMoney(hoveredDay.low, sym)} – {fmtMoney(hoveredDay.high, sym)}</span>
+            </div>
+          )}
+          {hoveredMilestonePct !== undefined && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+              <span>Month vs PY</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: hoveredMilestonePct === null ? 'var(--muted)' : (parseFloat(hoveredMilestonePct) >= 0 ? 'var(--green)' : 'var(--red)') }}>
+                {hoveredMilestonePct === null ? 'No PY data' : `${parseFloat(hoveredMilestonePct) >= 0 ? '+' : ''}${parseFloat(hoveredMilestonePct).toFixed(1)}%`}
+              </span>
             </div>
           )}
         </div>
@@ -492,9 +483,7 @@ export default function SalesForecast() {
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--accent)', opacity: 0.15, border: '1px solid var(--accent2)' }} />Uncertainty range
               </div>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
-                <span style={{ fontFamily: 'var(--mono)', fontWeight: 600, color: 'var(--green)' }}>+X%</span>along the top = that month vs. the same month last year
-              </div>
+              <div style={{ fontSize: 11, color: 'var(--muted)' }}>Hover a point for that day's revenue and how its month compares to the same month last year.</div>
             </div>
           </div>
 
