@@ -4621,7 +4621,7 @@ app.get('/api/sales-forecast', async (req, res) => {
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
-    const [historyResult, forecastResult, skuResult, latestGenResult] = await Promise.all([
+    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult] = await Promise.all([
       // "revenue" here means the same thing it means everywhere else in this app (Sales
       // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
       // for the period - not just v_sku_revenue.net_revenue on its own, which is
@@ -4712,6 +4712,36 @@ app.get('/api/sales-forecast', async (req, res) => {
         ORDER BY n30.revenue DESC NULLS LAST, l30.revenue DESC NULLS LAST
       `),
       pool.query(`SELECT MAX(generated_at) AS generated_at FROM sales_forecast`),
+      // Per-SKU, per-day series (actual within the same history window, plus every
+      // forecast row) - lets the tab re-aggregate the chart down to just the SKUs a user
+      // has selected without a round trip, instead of only ever showing the full-catalog
+      // aggregate the other four queries above compute.
+      pool.query(`
+        WITH actual_rev AS (
+          SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE sku IS NOT NULL AND order_date::date >= CURRENT_DATE - $1::int
+          GROUP BY sku, order_date::date
+        ),
+        actual_ref AS (
+          SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE sku IS NOT NULL AND refund_date::date >= CURRENT_DATE - $1::int
+          GROUP BY sku, refund_date::date
+        ),
+        actual_by_sku AS (
+          SELECT COALESCE(r.sku, f.sku) AS sku, COALESCE(r.date, f.date) AS date,
+            (COALESCE(r.revenue, 0) - COALESCE(f.refunded, 0))::numeric(12,2) AS revenue
+          FROM actual_rev r FULL OUTER JOIN actual_ref f ON f.sku = r.sku AND f.date = r.date
+        )
+        SELECT sku, date, revenue, NULL::numeric AS low, NULL::numeric AS high, true AS actual
+        FROM actual_by_sku
+        UNION ALL
+        SELECT sku, forecast_date AS date, forecast_revenue AS revenue, low_revenue AS low, high_revenue AS high, false AS actual
+        FROM sales_forecast
+        WHERE forecast_date::date >= CURRENT_DATE
+        ORDER BY 1, 2
+      `, [historyDays]),
     ]);
 
     res.json({
@@ -4721,6 +4751,12 @@ app.get('/api/sales-forecast', async (req, res) => {
       history: historyResult.rows.map(r => ({ date: r.date, revenue: fx(r.revenue).toFixed(2) })),
       forecast: forecastResult.rows.map(r => ({
         date: r.date, revenue: fx(r.revenue).toFixed(2), low: fx(r.low).toFixed(2), high: fx(r.high).toFixed(2),
+      })),
+      sku_series: skuSeriesResult.rows.map(r => ({
+        sku: r.sku, date: r.date, actual: r.actual,
+        revenue: fx(r.revenue).toFixed(2),
+        low: r.low === null ? null : fx(r.low).toFixed(2),
+        high: r.high === null ? null : fx(r.high).toFixed(2),
       })),
       skus: skuResult.rows.map(r => ({
         sku: r.sku,
