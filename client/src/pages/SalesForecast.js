@@ -181,7 +181,7 @@ function StageChart({ skus }) {
 }
 
 export default function SalesForecast() {
-  const { data, loading, refetch } = useApi('/api/sales-forecast', { history_days: 60 });
+  const { data, loading, error, refetch } = useApi('/api/sales-forecast', { history_days: 60 });
   const [savingSku, setSavingSku] = useState(null);
   const sym = data?.currency_symbol || '£';
   const history = data?.history || [];
@@ -226,6 +226,10 @@ export default function SalesForecast() {
 
       {loading ? (
         <div style={{ padding: 40, textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>
+      ) : error ? (
+        <div style={{ padding: '10px 14px', borderRadius: 8, background: 'var(--red)15', border: '1px solid var(--red)', fontSize: 13, color: 'var(--red)' }}>
+          Failed to load: {error}
+        </div>
       ) : (
         <>
           {!hasForecast && (
