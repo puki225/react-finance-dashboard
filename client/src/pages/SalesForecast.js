@@ -417,10 +417,12 @@ export default function SalesForecast() {
   const milestones = data?.milestones || [];
   const pyHistory = data?.py_history || [];
   const py2History = data?.py2_history || [];
+  const pySkuSeries = data?.py_sku_series || [];
+  const py2SkuSeries = data?.py2_sku_series || [];
   const hasForecast = !!data?.has_forecast;
 
-  const pyByDate = useMemo(() => new Map(pyHistory.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [pyHistory]);
-  const py2ByDate = useMemo(() => new Map(py2History.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [py2History]);
+  const fullPyByDate = useMemo(() => new Map(pyHistory.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [pyHistory]);
+  const fullPy2ByDate = useMemo(() => new Map(py2History.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [py2History]);
 
   const skuSeriesBySku = useMemo(() => {
     const m = new Map();
@@ -430,6 +432,43 @@ export default function SalesForecast() {
     }
     return m;
   }, [skuSeries]);
+
+  // Same grouping as skuSeriesBySku, for the PY/PY-2 reference lines - lets those lines
+  // re-aggregate down to whichever SKUs are selected instead of always showing the
+  // whole-catalog total (the bug: selecting a SKU narrowed the actual/forecast line but
+  // left PY/PY-2 unchanged).
+  const pySkuSeriesBySku = useMemo(() => {
+    const m = new Map();
+    for (const r of pySkuSeries) {
+      if (!m.has(r.sku)) m.set(r.sku, []);
+      m.get(r.sku).push(r);
+    }
+    return m;
+  }, [pySkuSeries]);
+
+  const py2SkuSeriesBySku = useMemo(() => {
+    const m = new Map();
+    for (const r of py2SkuSeries) {
+      if (!m.has(r.sku)) m.set(r.sku, []);
+      m.get(r.sku).push(r);
+    }
+    return m;
+  }, [py2SkuSeries]);
+
+  function selectionAwareByDate(fullByDate, bySku) {
+    if (selectedSkus.size === 0) return fullByDate;
+    const byDate = new Map();
+    for (const sku of selectedSkus) {
+      for (const r of (bySku.get(sku) || [])) {
+        const key = r.date.slice(0, 10);
+        byDate.set(key, (byDate.get(key) || 0) + parseFloat(r.revenue));
+      }
+    }
+    return byDate;
+  }
+
+  const pyByDate = useMemo(() => selectionAwareByDate(fullPyByDate, pySkuSeriesBySku), [fullPyByDate, pySkuSeriesBySku, selectedSkus]);
+  const py2ByDate = useMemo(() => selectionAwareByDate(fullPy2ByDate, py2SkuSeriesBySku), [fullPy2ByDate, py2SkuSeriesBySku, selectedSkus]);
 
   const fullDays = useMemo(() => buildDays(history, forecast), [history, forecast]);
 
