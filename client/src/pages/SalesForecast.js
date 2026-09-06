@@ -499,15 +499,85 @@ export default function SalesForecast() {
   const flaggedCount = useMemo(() => skus.filter(s => s.excluded_count > 0 || (s.stage === 'plateau' && !s.stage_override)).length, [skus]);
   const sortedSkus = useMemo(() => [...skus].sort((a, b) => parseFloat(b.next_30d_revenue || 0) - parseFloat(a.next_30d_revenue || 0)), [skus]);
 
-  function toggleSkuSelection(sku, additive) {
-    setSelectedSkus(prev => {
+  // Parent-ASIN grouping (same pattern as PVM's own ASIN-level grouping): variants of one
+  // product (same parent ASIN) collapse into a single expandable row, summing the
+  // additive £ columns. Only where a parent actually has 2+ children in the current list -
+  // a "group" wrapping a single SKU would just be a row with a chevron that reveals
+  // itself, same reasoning PVM already applies.
+  const [expandedParents, setExpandedParents] = useState(() => new Set());
+  const toggleParent = (parentAsin) => {
+    setExpandedParents(prev => {
       const next = new Set(prev);
+      if (next.has(parentAsin)) next.delete(parentAsin); else next.add(parentAsin);
+      return next;
+    });
+  };
+
+  const displayRows = useMemo(() => {
+    const byParent = new Map();
+    const loose = [];
+    for (const s of sortedSkus) {
+      if (s.parent_asin && s.parent_asin !== s.asin) {
+        if (!byParent.has(s.parent_asin)) byParent.set(s.parent_asin, []);
+        byParent.get(s.parent_asin).push(s);
+      } else {
+        loose.push(s);
+      }
+    }
+
+    const entries = [];
+    for (const s of loose) entries.push({ row: s, isGroup: false, depth: 0 });
+    for (const [parentAsin, children] of byParent) {
+      if (children.length < 2) {
+        entries.push({ row: children[0], isGroup: false, depth: 0 });
+        continue;
+      }
+      const last30 = children.reduce((t, c) => t + parseFloat(c.last_30d_revenue || 0), 0);
+      const next30 = children.reduce((t, c) => t + parseFloat(c.next_30d_revenue || 0), 0);
+      const excludedCount = children.reduce((t, c) => t + (c.excluded_count || 0), 0);
+      const group = {
+        parent_asin: parentAsin,
+        sku: parentAsin,
+        asin: parentAsin,
+        // Variants of one product share artwork, so the first child's image represents
+        // the group - there's no parent-level image_url in sku_parameters.
+        image_url: children.find(c => c.image_url)?.image_url || null,
+        product_title: children[0]?.product_title || parentAsin,
+        children,
+        last_30d_revenue: last30,
+        next_30d_revenue: next30,
+        excluded_count: excludedCount,
+      };
+      entries.push({ row: group, isGroup: true, depth: 0 });
+    }
+
+    // Same next-30d sort the flat list already uses, applied to groups by their summed
+    // total so a group sits where its aggregate total would put it.
+    entries.sort((a, b) => parseFloat(b.row.next_30d_revenue || 0) - parseFloat(a.row.next_30d_revenue || 0));
+
+    const out = [];
+    for (const entry of entries) {
+      out.push(entry);
+      if (entry.isGroup && expandedParents.has(entry.row.parent_asin)) {
+        for (const child of entry.row.children) out.push({ row: child, isGroup: false, depth: 1 });
+      }
+    }
+    return out;
+  }, [sortedSkus, expandedParents]);
+
+  // `skuOrSkus` is a single SKU for an ordinary row, or an array of SKUs for a
+  // parent-ASIN group row (selects/deselects every variant together).
+  function toggleSkuSelection(skuOrSkus, additive) {
+    const skus = Array.isArray(skuOrSkus) ? skuOrSkus : [skuOrSkus];
+    setSelectedSkus(prev => {
       if (additive) {
-        if (next.has(sku)) next.delete(sku); else next.add(sku);
+        const next = new Set(prev);
+        const allSelected = skus.every(s => next.has(s));
+        for (const s of skus) { if (allSelected) next.delete(s); else next.add(s); }
         return next;
       }
-      const onlyThis = prev.size === 1 && prev.has(sku);
-      return onlyThis ? new Set() : new Set([sku]);
+      const onlyThese = prev.size === skus.length && skus.every(s => prev.has(s));
+      return onlyThese ? new Set() : new Set(skus);
     });
   }
 
@@ -655,25 +725,38 @@ export default function SalesForecast() {
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedSkus.map(s => {
+                    {displayRows.map(({ row: s, isGroup, depth }) => {
                       const last30 = parseFloat(s.last_30d_revenue || 0);
                       const next30 = parseFloat(s.next_30d_revenue || 0);
                       const delta = last30 > 0 ? ((next30 - last30) / last30) * 100 : null;
                       const meta = stageMeta(s.stage);
                       const saving = savingSku === s.sku;
-                      const isSelected = selectedSkus.has(s.sku);
+                      const rowSkus = isGroup ? s.children.map(c => c.sku) : [s.sku];
+                      const isSelected = rowSkus.length > 0 && rowSkus.every(sk => selectedSkus.has(sk));
+                      const expanded = isGroup && expandedParents.has(s.parent_asin);
                       return (
                         <tr
-                          key={s.sku}
-                          onClick={e => toggleSkuSelection(s.sku, e.ctrlKey || e.metaKey)}
+                          key={isGroup ? `parent:${s.parent_asin}` : s.sku}
+                          onClick={e => toggleSkuSelection(rowSkus, e.ctrlKey || e.metaKey)}
                           style={{
-                            borderBottom: '1px solid var(--border)', opacity: saving ? 0.5 : 1, cursor: 'pointer',
-                            background: isSelected ? 'var(--accent)12' : 'transparent',
+                            borderBottom: depth > 0 ? '1px solid var(--border)' : '1px solid var(--border)',
+                            opacity: saving ? 0.5 : 1, cursor: 'pointer',
+                            background: isSelected ? 'var(--accent)12' : depth > 0 ? '#ffffff04' : 'transparent',
                             boxShadow: isSelected ? 'inset 2px 0 0 var(--accent)' : 'none',
                           }}
                         >
                           <td style={{ padding: '9px 10px', fontSize: 12 }}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingLeft: depth > 0 ? 22 : 0 }}>
+                              {isGroup ? (
+                                <button
+                                  onClick={e => { e.stopPropagation(); toggleParent(s.parent_asin); }}
+                                  title={expanded ? 'Collapse variants' : 'Expand variants'}
+                                  style={{
+                                    background: 'none', border: 'none', color: 'var(--muted)', cursor: 'pointer',
+                                    fontSize: 10, padding: '2px 4px', width: 18, flexShrink: 0, fontFamily: 'inherit',
+                                  }}
+                                >{expanded ? '▼' : '▶'}</button>
+                              ) : depth === 0 && <span style={{ width: 18, flexShrink: 0 }} />}
                               <ProductImage
                                 imageUrl={s.image_url} asin={s.asin} sku={s.sku}
                                 onEnter={e => {
@@ -684,9 +767,13 @@ export default function SalesForecast() {
                                 onLeave={() => setTip(null)}
                               />
                               <div style={{ minWidth: 0 }}>
-                                <div style={{ fontWeight: 600, fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{s.sku || '—'}</div>
-                                <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>{s.asin || '—'}</div>
-                                {s.excluded_count > 0 && (
+                                <div style={{ fontWeight: isGroup ? 700 : 600, fontFamily: 'var(--mono)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                  {isGroup ? s.parent_asin : (s.sku || '—')}
+                                </div>
+                                <div style={{ fontSize: 10, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>
+                                  {isGroup ? `${s.children.length} variants` : (s.asin || '—')}
+                                </div>
+                                {!isGroup && s.excluded_count > 0 && (
                                   <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 2 }}>
                                     ⚑ {s.excluded_count} period{s.excluded_count > 1 ? 's' : ''} excluded{s.last_exclusion_reason ? ` — ${s.last_exclusion_reason}` : ''}
                                   </div>
@@ -695,27 +782,33 @@ export default function SalesForecast() {
                             </div>
                           </td>
                           <td style={{ padding: '9px 10px' }} onClick={e => e.stopPropagation()}>
-                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                              <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: meta.hex }} />
-                              <select
-                                value={s.stage_override || ''}
-                                disabled={saving}
-                                onChange={e => updateConfig(s.sku, { stage_override: e.target.value || null })}
-                                style={{ background: 'var(--bg3)', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--text)', fontSize: 11, fontFamily: 'var(--font)', padding: '4px 6px' }}
-                              >
-                                <option value="">Auto{s.auto_stage ? ` (${stageMeta(s.auto_stage).label})` : ''}</option>
-                                {STAGES.map(st => <option key={st.id} value={st.id}>{st.label}</option>)}
-                              </select>
-                            </div>
+                            {isGroup ? (
+                              <span style={{ fontSize: 11, color: 'var(--muted)' }}>—</span>
+                            ) : (
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                <span style={{ width: 8, height: 8, borderRadius: '50%', flexShrink: 0, background: meta.hex }} />
+                                <select
+                                  value={s.stage_override || ''}
+                                  disabled={saving}
+                                  onChange={e => updateConfig(s.sku, { stage_override: e.target.value || null })}
+                                  style={{ background: 'var(--bg3)', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--text)', fontSize: 11, fontFamily: 'var(--font)', padding: '4px 6px' }}
+                                >
+                                  <option value="">Auto{s.auto_stage ? ` (${stageMeta(s.auto_stage).label})` : ''}</option>
+                                  {STAGES.map(st => <option key={st.id} value={st.id}>{st.label}</option>)}
+                                </select>
+                              </div>
+                            )}
                           </td>
                           <td style={{ padding: '9px 10px' }} onClick={e => e.stopPropagation()}>
-                            <input
-                              type="checkbox"
-                              checked={!!s.is_end_of_life}
-                              disabled={saving}
-                              onChange={e => updateConfig(s.sku, { is_end_of_life: e.target.checked })}
-                              style={{ width: 16, height: 16, cursor: 'pointer' }}
-                            />
+                            {!isGroup && (
+                              <input
+                                type="checkbox"
+                                checked={!!s.is_end_of_life}
+                                disabled={saving}
+                                onChange={e => updateConfig(s.sku, { is_end_of_life: e.target.checked })}
+                                style={{ width: 16, height: 16, cursor: 'pointer' }}
+                              />
+                            )}
                           </td>
                           <td style={{ padding: '9px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtMoney(last30, sym)}</td>
                           <td style={{ padding: '9px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', color: hasForecast ? 'var(--text)' : 'var(--muted)' }}>
