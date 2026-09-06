@@ -212,6 +212,37 @@ app.use(express.static(path.join(__dirname, '../client/build')));
   }
 })();
 
+// ─── CASH FLOW: SCHEMA MIGRATION ─────────────────────────────────────────
+// Single-row table (no natural business key - the GET route below creates the one row on
+// first read if it's missing) holding the manual assumptions the Cash Flow tab's projection
+// can't derive from synced data alone: how long Amazon/Shopify actually take to pay out,
+// supplier payment terms, planned near-term inventory spend, and any other known outflows
+// (salaries, rent, etc. - see known_outflows' shape in GET /api/cashflow-assumptions'
+// comment). Everything else the projection needs (the sales forecast, historical payout
+// ratios, channel mix) is derived live from tables this app already syncs.
+(async function migrateCashflowSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS cashflow_assumptions (
+        id SERIAL PRIMARY KEY,
+        supplier_payment_terms_days SMALLINT DEFAULT 30,
+        amazon_payout_lag_days SMALLINT DEFAULT 14,
+        shopify_payout_lag_days SMALLINT DEFAULT 3,
+        planned_spend_30d NUMERIC DEFAULT 0,
+        planned_spend_60d NUMERIC DEFAULT 0,
+        planned_spend_90d NUMERIC DEFAULT 0,
+        known_outflows JSONB,
+        minimum_cash_threshold NUMERIC DEFAULT 5000,
+        opening_bank_balance NUMERIC DEFAULT 0,
+        balance_as_of_date DATE,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+  } catch (e) {
+    console.error('[db] Cash flow schema migration failed:', e.message);
+  }
+})();
+
 // ─── VINE ORDER CLASSIFICATION ──────────────────────────────────────────
 // Amazon Vine gives away FBA inventory as free review copies - not real sales, but they
 // inflate units-sold/gross-sales figures with no matching revenue if left unclassified.
@@ -3470,6 +3501,74 @@ app.get('/api/brands', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Cash flow assumptions — the manual inputs GET /api/cashflow blends with the sales
+// forecast and synced payout history. Single row, created on first read if missing (the
+// table has no natural business key to seed a row with at migration time).
+//
+// known_outflows shape: a JSON array of
+//   { id, label, amount, type: 'one_time' | 'monthly', date, day_of_month, start_date, end_date }
+// - 'one_time': amount lands once, on `date`.
+// - 'monthly': amount recurs on `day_of_month` (1-28, so it exists in every month) from
+//   `start_date` through `end_date` (end_date null = indefinitely) - covers salaries, rent,
+//   and other recurring commitments GET /api/cashflow expands into occurrences within
+//   whatever horizon it's asked for.
+app.get('/api/cashflow-assumptions', async (req, res) => {
+  try {
+    let result = await pool.query('SELECT * FROM cashflow_assumptions ORDER BY id LIMIT 1');
+    if (result.rows.length === 0) {
+      result = await pool.query('INSERT INTO cashflow_assumptions DEFAULT VALUES RETURNING *');
+    }
+    res.json(result.rows[0]);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/cashflow-assumptions', async (req, res) => {
+  const {
+    supplier_payment_terms_days, amazon_payout_lag_days, shopify_payout_lag_days,
+    planned_spend_30d, planned_spend_60d, planned_spend_90d, known_outflows,
+    minimum_cash_threshold, opening_bank_balance, balance_as_of_date,
+  } = req.body;
+  const smallint = (v) => (v === undefined ? undefined : parseInt(v, 10));
+  const numeric = (v) => (v === undefined ? undefined : parseFloat(v));
+  for (const [name, v] of [['supplier_payment_terms_days', supplier_payment_terms_days], ['amazon_payout_lag_days', amazon_payout_lag_days], ['shopify_payout_lag_days', shopify_payout_lag_days]]) {
+    if (v !== undefined && (isNaN(parseInt(v, 10)) || parseInt(v, 10) < 0)) {
+      return res.status(400).json({ error: `${name} must be a non-negative integer` });
+    }
+  }
+  if (known_outflows !== undefined && known_outflows !== null && !Array.isArray(known_outflows)) {
+    return res.status(400).json({ error: 'known_outflows must be an array' });
+  }
+  try {
+    let existing = await pool.query('SELECT id FROM cashflow_assumptions ORDER BY id LIMIT 1');
+    if (existing.rows.length === 0) {
+      existing = await pool.query('INSERT INTO cashflow_assumptions DEFAULT VALUES RETURNING id');
+    }
+    const result = await pool.query(`
+      UPDATE cashflow_assumptions SET
+        supplier_payment_terms_days = COALESCE($1, supplier_payment_terms_days),
+        amazon_payout_lag_days = COALESCE($2, amazon_payout_lag_days),
+        shopify_payout_lag_days = COALESCE($3, shopify_payout_lag_days),
+        planned_spend_30d = COALESCE($4, planned_spend_30d),
+        planned_spend_60d = COALESCE($5, planned_spend_60d),
+        planned_spend_90d = COALESCE($6, planned_spend_90d),
+        known_outflows = COALESCE($7::jsonb, known_outflows),
+        minimum_cash_threshold = COALESCE($8, minimum_cash_threshold),
+        opening_bank_balance = COALESCE($9, opening_bank_balance),
+        balance_as_of_date = COALESCE($10, balance_as_of_date),
+        updated_at = NOW()
+      WHERE id = $11
+      RETURNING *
+    `, [
+      smallint(supplier_payment_terms_days) ?? null, smallint(amazon_payout_lag_days) ?? null, smallint(shopify_payout_lag_days) ?? null,
+      numeric(planned_spend_30d) ?? null, numeric(planned_spend_60d) ?? null, numeric(planned_spend_90d) ?? null,
+      known_outflows !== undefined ? JSON.stringify(known_outflows) : null,
+      numeric(minimum_cash_threshold) ?? null, numeric(opening_bank_balance) ?? null, balance_as_of_date ?? null,
+      existing.rows[0].id,
+    ]);
+    res.json(result.rows[0]);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Inventory — latest FBA stock snapshot per SKU
 app.get('/api/inventory', async (req, res) => {
   try {
@@ -4934,6 +5033,208 @@ app.put('/api/sales-forecast/config/:sku', async (req, res) => {
       RETURNING sku, stage_override, is_end_of_life, updated_at
     `, [sku, nextStage, nextEol]);
     res.json({ ok: true, config: result.rows[0] });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+// ─── CASH FLOW ────────────────────────────────────────────────────────────
+// Daily projected cash position: the Sales Forecast tab's own output, converted from
+// "revenue as it's earned" into "cash as it actually lands in the bank" (marketplace
+// payout lag + a real historical fee/payout ratio, not the full top line), minus the
+// manual assumptions from GET/PUT /api/cashflow-assumptions (planned inventory spend,
+// known recurring/one-off outflows), running forward from a manually-entered opening
+// balance. Must stay ABOVE the app.get('*', ...) SPA fallback below - same reasoning as
+// the Sales Forecast routes above.
+app.get('/api/cashflow', async (req, res) => {
+  // sales_forecast itself only goes out 180 days (pipeline.HORIZON_DAYS in the forecast
+  // service) - asking this endpoint to project further than its own input data covers
+  // would just silently zero-fill the extra days, which reads as "no more sales ever"
+  // rather than "we didn't ask the model to look that far".
+  const horizonDays = Math.min(Math.max(parseInt(req.query.horizon_days, 10) || 180, 1), 180);
+  try {
+    const reportingCurrency = await getReportingCurrency();
+    const todayStr = new Date().toISOString().split('T')[0];
+    const fxRate = await getFxRate('GBP', reportingCurrency, todayStr);
+    const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
+    const fx = (n) => (parseFloat(n || 0) * fxRate);
+    const isoDate = (d) => (typeof d === 'string' ? d.slice(0, 10) : d.toISOString().slice(0, 10));
+    const addDays = (dateStr, n) => {
+      const d = new Date(dateStr + 'T00:00:00Z');
+      d.setUTCDate(d.getUTCDate() + n);
+      return d.toISOString().slice(0, 10);
+    };
+
+    let assumptionsResult = await pool.query('SELECT * FROM cashflow_assumptions ORDER BY id LIMIT 1');
+    if (assumptionsResult.rows.length === 0) {
+      assumptionsResult = await pool.query('INSERT INTO cashflow_assumptions DEFAULT VALUES RETURNING *');
+    }
+    const a = assumptionsResult.rows[0];
+    const amazonLag = a.amazon_payout_lag_days ?? 14;
+    const shopifyLag = a.shopify_payout_lag_days ?? 3;
+    const supplierTermsDays = a.supplier_payment_terms_days ?? 30;
+    const lookbackDays = Math.max(amazonLag, shopifyLag, 1);
+
+    const [historyResult, forecastResult, channelMixResult, amazonRatioResult, shopifyRatioResult] = await Promise.all([
+      // Actual (refund-adjusted) revenue for the lookback window before "today" - a payout
+      // landing in the next `amazon_payout_lag_days` is driven by sales that ALREADY
+      // happened, not by the forecast, so the first stretch of projected inflow needs real
+      // history, not forecast_date rows (sales_forecast only has forecast_date >= today).
+      pool.query(`
+        WITH rev AS (
+          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          FROM v_sku_revenue
+          WHERE order_date::date >= CURRENT_DATE - $1::int AND order_date::date < CURRENT_DATE
+          GROUP BY 1
+        ),
+        ref AS (
+          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          FROM v_refunds_by_date
+          WHERE refund_date::date >= CURRENT_DATE - $1::int AND refund_date::date < CURRENT_DATE
+          GROUP BY 1
+        )
+        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
+        ORDER BY 1
+      `, [lookbackDays]),
+      pool.query(`
+        SELECT forecast_date::date AS date, SUM(forecast_revenue)::numeric(12,2) AS revenue
+        FROM sales_forecast
+        WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
+        GROUP BY 1 ORDER BY 1
+      `, [horizonDays]),
+      // Trailing 90-day channel split - sales_forecast isn't itself channel-split, so a
+      // single blended forecast total is divided between Amazon/Shopify by how revenue has
+      // actually split recently, before each half is lagged by its own channel's payout timing.
+      pool.query(`
+        SELECT channel, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+        FROM v_sku_revenue
+        WHERE order_date::date >= CURRENT_DATE - 90 AND channel IN ('amazon', 'shopify')
+        GROUP BY channel
+      `),
+      // Trailing (180d) fee ratio, NOT net_transfer/total_sales - net_transfer also carries
+      // whatever a settlement period's beginning_balance happened to be, and an account that
+      // ever goes through Amazon's reserve-hold/release cycle (near-zero payouts for months
+      // while a rolling balance builds, then one lump-sum release) makes that ratio swing
+      // wildly depending purely on whether a release fell inside the trailing window -
+      // checked live against this account's real payout history: net_transfer/total_sales
+      // ranged from 11% to 111%+ across different window lengths, while total_fees/total_sales
+      // (both period-own figures, neither touched by reserve carryover) stayed 50-55% across
+      // every window tried. Fees, not the balance-contaminated transfer amount, are what
+      // actually scales with a period's own revenue.
+      pool.query(`SELECT SUM(total_fees) AS fees, SUM(total_sales) AS gross FROM amazon_payouts WHERE fund_transfer_date >= CURRENT_DATE - 180`),
+      // Shopify doesn't hold a rolling reserve the way Amazon's account above does, so
+      // `amount` (the actual paid-out figure: gross_sales less fees/refunds/adjustments -
+      // `net_amount` is a separate column the sync never populates, always 0) is a stable
+      // basis here without the same caveat.
+      pool.query(`SELECT SUM(amount) AS paid, SUM(gross_sales) AS gross FROM shopify_payouts WHERE payout_date >= CURRENT_DATE - 180`),
+    ]);
+
+    const revenueByDate = new Map();
+    for (const r of historyResult.rows) revenueByDate.set(isoDate(r.date), parseFloat(r.revenue));
+    for (const r of forecastResult.rows) revenueByDate.set(isoDate(r.date), parseFloat(r.revenue));
+
+    const channelRevenue = { amazon: 0, shopify: 0 };
+    for (const r of channelMixResult.rows) channelRevenue[r.channel] = parseFloat(r.revenue);
+    const totalChannelRevenue = channelRevenue.amazon + channelRevenue.shopify;
+    // No channel history at all yet (a brand new catalog) - default Amazon-only rather
+    // than an arbitrary 50/50 guess, since every account synced by this app so far sells
+    // there first.
+    const amazonShare = totalChannelRevenue > 0 ? channelRevenue.amazon / totalChannelRevenue : 1;
+    const shopifyShare = totalChannelRevenue > 0 ? channelRevenue.shopify / totalChannelRevenue : 0;
+
+    // Clamped the same way this app's forecast model bounds its own growth-factor ratios -
+    // a thin or noisy trailing window shouldn't be able to imply an absurd payout multiple.
+    const clipRatio = (r) => Math.min(Math.max(r, 0.3), 1.1);
+    const amazonRow = amazonRatioResult.rows[0];
+    const amazonGross = parseFloat(amazonRow.gross || 0);
+    const amazonPayoutRatio = amazonGross > 0 ? clipRatio(1 - parseFloat(amazonRow.fees || 0) / amazonGross) : 0.7;
+    const shopifyRow = shopifyRatioResult.rows[0];
+    const shopifyGross = parseFloat(shopifyRow.gross || 0);
+    const shopifyPayoutRatio = shopifyGross > 0 ? clipRatio(parseFloat(shopifyRow.paid || 0) / shopifyGross) : 0.95;
+
+    // known_outflows expanded into concrete dated occurrences within the horizon - see the
+    // shape documented on GET /api/cashflow-assumptions.
+    const outflowsByDate = new Map();
+    const addOutflow = (dateStr, amount) => outflowsByDate.set(dateStr, (outflowsByDate.get(dateStr) || 0) + amount);
+    for (const o of (a.known_outflows || [])) {
+      const amount = parseFloat(o.amount || 0);
+      if (!amount) continue;
+      if (o.type === 'one_time') {
+        if (o.date && o.date >= todayStr && o.date < addDays(todayStr, horizonDays)) addOutflow(o.date, amount);
+      } else if (o.type === 'monthly') {
+        const day = Math.min(Math.max(parseInt(o.day_of_month, 10) || 1, 1), 28);
+        for (let i = 0; i < horizonDays; i++) {
+          const d = addDays(todayStr, i);
+          if (parseInt(d.slice(8, 10), 10) !== day) continue;
+          if (o.start_date && d < o.start_date) continue;
+          if (o.end_date && d > o.end_date) continue;
+          addOutflow(d, amount);
+        }
+      }
+    }
+
+    // Planned inventory/supplier spend: planned_spend_Nd is spread evenly across a "we
+    // expect to commit to this much new spend" window (days 1-30, 31-60, 61-90 from
+    // today), then the actual CASH outflow for a day's worth of commitment lands
+    // `supplier_payment_terms_days` later - the whole reason that assumption exists
+    // alongside the three spend buckets rather than being a bare £ figure on its own.
+    const spendBuckets = [
+      { from: 1, to: 30, total: parseFloat(a.planned_spend_30d || 0) },
+      { from: 31, to: 60, total: parseFloat(a.planned_spend_60d || 0) },
+      { from: 61, to: 90, total: parseFloat(a.planned_spend_90d || 0) },
+    ];
+    for (const b of spendBuckets) {
+      const days = b.to - b.from + 1;
+      if (!b.total || days <= 0) continue;
+      const perDay = b.total / days;
+      for (let commitDay = b.from; commitDay <= b.to; commitDay++) {
+        const cashDay = commitDay + supplierTermsDays;
+        if (cashDay >= horizonDays) continue;
+        addOutflow(addDays(todayStr, cashDay), perDay);
+      }
+    }
+
+    let balance = fx(a.opening_bank_balance || 0);
+    const daily = [];
+    let minBalance = balance, minBalanceDate = todayStr;
+    let thresholdBreachDate = null;
+    const threshold = fx(a.minimum_cash_threshold || 0);
+    for (let i = 0; i < horizonDays; i++) {
+      const date = addDays(todayStr, i);
+      const amazonSourceDate = addDays(date, -amazonLag);
+      const shopifySourceDate = addDays(date, -shopifyLag);
+      const amazonInflow = (revenueByDate.get(amazonSourceDate) || 0) * amazonShare * amazonPayoutRatio;
+      const shopifyInflow = (revenueByDate.get(shopifySourceDate) || 0) * shopifyShare * shopifyPayoutRatio;
+      const inflow = fx(amazonInflow + shopifyInflow);
+      const outflow = fx(outflowsByDate.get(date) || 0);
+      balance += inflow - outflow;
+      if (balance < minBalance) { minBalance = balance; minBalanceDate = date; }
+      if (thresholdBreachDate === null && balance < threshold) thresholdBreachDate = date;
+      daily.push({
+        date, inflow: inflow.toFixed(2), outflow: outflow.toFixed(2),
+        net: (inflow - outflow).toFixed(2), balance: balance.toFixed(2),
+      });
+    }
+
+    const balanceAsOfDate = a.balance_as_of_date ? isoDate(a.balance_as_of_date) : null;
+    const staleDays = balanceAsOfDate ? Math.round((new Date(todayStr) - new Date(balanceAsOfDate)) / 86400000) : null;
+
+    res.json({
+      currency_symbol: sym,
+      today: todayStr,
+      has_forecast: forecastResult.rows.length > 0,
+      assumptions: {
+        ...a,
+        opening_bank_balance: fx(a.opening_bank_balance || 0).toFixed(2),
+        minimum_cash_threshold: fx(a.minimum_cash_threshold || 0).toFixed(2),
+      },
+      balance_stale_days: staleDays,
+      channel_mix: { amazon: amazonShare, shopify: shopifyShare },
+      payout_ratios: { amazon: amazonPayoutRatio, shopify: shopifyPayoutRatio },
+      daily,
+      min_balance: minBalance.toFixed(2),
+      min_balance_date: minBalanceDate,
+      threshold_breach_date: thresholdBreachDate,
+    });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 

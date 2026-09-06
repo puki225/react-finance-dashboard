@@ -26,7 +26,7 @@ const COGS_FIELDS = [
 const SUBTABS = [
   { id: 'cogs',      label: 'COGS' },
   { id: 'reporting', label: 'Reporting' },
-  { id: 'cashflow',  label: 'Cash Flow', soon: true },
+  { id: 'cashflow',  label: 'Cash Flow' },
   { id: 'channels',  label: 'Channels',  soon: true },
 ];
 
@@ -678,6 +678,189 @@ function ReportingSettings() {
     </div>
   );
 }
+
+let outflowIdCounter = 0;
+function newOutflowId() { return `new-${Date.now()}-${outflowIdCounter++}`; }
+
+function emptyOutflow() {
+  return { id: newOutflowId(), label: '', amount: '', type: 'monthly', date: today(), day_of_month: 1, start_date: today(), end_date: '' };
+}
+
+// Cash Flow assumptions — the manual inputs the Cash Flow tab's projection blends with the
+// sales forecast and synced payout history: how long marketplaces actually take to pay out,
+// planned near-term inventory spend, and any other known outflows (salaries, rent, etc).
+function CashFlowSettings() {
+  const { data: assumptions, refetch } = useApi('/api/cashflow-assumptions');
+  const [form, setForm] = useState(null);
+  const [outflows, setOutflows] = useState([]);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+
+  useEffect(() => {
+    if (assumptions && form === null) {
+      setForm({
+        opening_bank_balance: fmtDisplay(assumptions.opening_bank_balance),
+        balance_as_of_date: assumptions.balance_as_of_date ? assumptions.balance_as_of_date.slice(0, 10) : today(),
+        minimum_cash_threshold: fmtDisplay(assumptions.minimum_cash_threshold),
+        amazon_payout_lag_days: assumptions.amazon_payout_lag_days ?? 14,
+        shopify_payout_lag_days: assumptions.shopify_payout_lag_days ?? 3,
+        supplier_payment_terms_days: assumptions.supplier_payment_terms_days ?? 30,
+        planned_spend_30d: fmtDisplay(assumptions.planned_spend_30d),
+        planned_spend_60d: fmtDisplay(assumptions.planned_spend_60d),
+        planned_spend_90d: fmtDisplay(assumptions.planned_spend_90d),
+      });
+      setOutflows((assumptions.known_outflows || []).map(o => ({ ...o, id: o.id || newOutflowId() })));
+    }
+  }, [assumptions, form]);
+
+  if (!form) return <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>;
+
+  const setField = (key, val) => { setForm(f => ({ ...f, [key]: val })); setSaved(false); };
+  const setOutflow = (id, patch) => { setOutflows(rows => rows.map(r => r.id === id ? { ...r, ...patch } : r)); setSaved(false); };
+  const removeOutflow = (id) => { setOutflows(rows => rows.filter(r => r.id !== id)); setSaved(false); };
+  const addOutflow = () => setOutflows(rows => [...rows, emptyOutflow()]);
+
+  const handleSave = async () => {
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const body = {
+        ...form,
+        known_outflows: outflows
+          .filter(o => o.label && parseFloat(o.amount) > 0)
+          .map(o => o.type === 'monthly'
+            ? { id: o.id, label: o.label, amount: parseFloat(o.amount), type: 'monthly', day_of_month: parseInt(o.day_of_month, 10) || 1, start_date: o.start_date || null, end_date: o.end_date || null }
+            : { id: o.id, label: o.label, amount: parseFloat(o.amount), type: 'one_time', date: o.date }),
+      };
+      const resp = await fetch('/api/cashflow-assumptions', {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      const d = await resp.json();
+      if (!resp.ok) throw new Error(d.error || 'Save failed');
+      setSaved(true);
+      refetch();
+    } catch (e) { setError(e.message); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      <div>
+        <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Cash Flow Assumptions</h2>
+        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
+          The Cash Flow tab projects forward from the sales forecast and your real payout history —
+          these are the manual inputs it can't derive on its own: your current bank position,
+          how long Amazon/Shopify actually take to pay out, planned inventory spend, and any other
+          known outflows like salaries or rent. All monetary figures here are entered in GBP
+          (converted to your reporting currency for display elsewhere), unlike other pages in
+          Settings that let you pick a currency per entry.
+        </p>
+      </div>
+
+      <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 24, display: 'flex', flexDirection: 'column', gap: 18 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+          <div>
+            <label style={labelStyle}>Opening Bank Balance (£ GBP)</label>
+            <input type="number" step="0.01" style={inputStyle} value={form.opening_bank_balance} onChange={e => setField('opening_bank_balance', e.target.value)} />
+          </div>
+          <div>
+            <label style={labelStyle}>As Of Date</label>
+            <input type="date" style={inputStyle} value={form.balance_as_of_date} onChange={e => setField('balance_as_of_date', e.target.value)} />
+          </div>
+          <div>
+            <label style={labelStyle}>Minimum Cash Threshold (£ GBP)</label>
+            <input type="number" step="0.01" style={inputStyle} value={form.minimum_cash_threshold} onChange={e => setField('minimum_cash_threshold', e.target.value)} />
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 10 }}>Payout Timing</div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+            <div>
+              <label style={labelStyle}>Amazon Payout Lag (days)</label>
+              <input type="number" min="0" style={inputStyle} value={form.amazon_payout_lag_days} onChange={e => setField('amazon_payout_lag_days', e.target.value)} />
+            </div>
+            <div>
+              <label style={labelStyle}>Shopify Payout Lag (days)</label>
+              <input type="number" min="0" style={inputStyle} value={form.shopify_payout_lag_days} onChange={e => setField('shopify_payout_lag_days', e.target.value)} />
+            </div>
+            <div>
+              <label style={labelStyle}>Supplier Payment Terms (days)</label>
+              <input type="number" min="0" style={inputStyle} value={form.supplier_payment_terms_days} onChange={e => setField('supplier_payment_terms_days', e.target.value)} />
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>Planned Inventory Spend</div>
+          <p style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, lineHeight: 1.5 }}>
+            Spend you expect to commit to over each window — the actual cash outflow lands
+            {' '}{form.supplier_payment_terms_days} days after it's committed, per your supplier terms above.
+          </p>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
+            <div>
+              <label style={labelStyle}>Next 30 Days (£ GBP)</label>
+              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_30d} onChange={e => setField('planned_spend_30d', e.target.value)} />
+            </div>
+            <div>
+              <label style={labelStyle}>Next 60 Days (£ GBP)</label>
+              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_60d} onChange={e => setField('planned_spend_60d', e.target.value)} />
+            </div>
+            <div>
+              <label style={labelStyle}>Next 90 Days (£ GBP)</label>
+              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_90d} onChange={e => setField('planned_spend_90d', e.target.value)} />
+            </div>
+          </div>
+        </div>
+
+        <div>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <div>
+              <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)' }}>Known Outflows</div>
+              <p style={{ fontSize: 11, color: 'var(--muted)', marginTop: 2 }}>Salaries, rent, insurance — recurring monthly or one-off.</p>
+            </div>
+            <button onClick={addOutflow} style={{ padding: '6px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: '1px solid var(--accent)', background: 'transparent', color: 'var(--accent2)', cursor: 'pointer', fontFamily: 'var(--font)' }}>+ Add</button>
+          </div>
+          {outflows.length === 0 && <div style={{ fontSize: 12, color: 'var(--muted)', padding: '8px 0' }}>None configured.</div>}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            {outflows.map(o => (
+              <div key={o.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', background: 'var(--bg3)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 10px' }}>
+                <input placeholder="Label (e.g. Salaries)" style={{ ...inputStyle, flex: '2 1 160px' }} value={o.label} onChange={e => setOutflow(o.id, { label: e.target.value })} />
+                <input type="number" step="0.01" placeholder="Amount (£)" style={{ ...inputStyle, flex: '1 1 100px' }} value={o.amount} onChange={e => setOutflow(o.id, { amount: e.target.value })} />
+                <select style={{ ...inputStyle, flex: '1 1 110px' }} value={o.type} onChange={e => setOutflow(o.id, { type: e.target.value })}>
+                  <option value="monthly">Monthly</option>
+                  <option value="one_time">One-time</option>
+                </select>
+                {o.type === 'monthly' ? (
+                  <>
+                    <div style={{ flex: '1 1 90px' }}>
+                      <input type="number" min="1" max="28" placeholder="Day" style={inputStyle} value={o.day_of_month} onChange={e => setOutflow(o.id, { day_of_month: e.target.value })} title="Day of month (1-28)" />
+                    </div>
+                    <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.start_date || ''} onChange={e => setOutflow(o.id, { start_date: e.target.value })} title="Starts" />
+                    <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.end_date || ''} onChange={e => setOutflow(o.id, { end_date: e.target.value })} title="Ends (optional)" placeholder="No end" />
+                  </>
+                ) : (
+                  <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.date || ''} onChange={e => setOutflow(o.id, { date: e.target.value })} />
+                )}
+                <button onClick={() => removeOutflow(o.id)} style={{ background: 'none', border: 'none', color: 'var(--red)', cursor: 'pointer', fontSize: 13, padding: '4px 8px' }} title="Remove">✕</button>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 10, paddingTop: 4 }}>
+          {saved && <span style={{ fontSize: 12, color: 'var(--green)' }}>✓ Saved</span>}
+          {error && <span style={{ fontSize: 12, color: 'var(--red)' }}>{error}</span>}
+          <button onClick={handleSave} disabled={saving}
+            style={{ padding: '9px 22px', borderRadius: 8, fontSize: 13, fontWeight: 600, border: '1px solid var(--accent)', background: 'var(--accent)', color: '#fff', cursor: saving ? 'not-allowed' : 'pointer', fontFamily: 'var(--font)', opacity: saving ? 0.6 : 1 }}>
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function Settings() {
   const isMobile = useIsMobile();
   const [subtab, setSubtab] = useState('cogs');
@@ -753,6 +936,7 @@ export default function Settings() {
         </div>
       )}
       {subtab === 'reporting' && <ReportingSettings />}
+      {subtab === 'cashflow' && <CashFlowSettings />}
     </div>
   );
 }
