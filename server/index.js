@@ -4692,7 +4692,7 @@ app.get('/api/sales-forecast', async (req, res) => {
           UNION SELECT sku FROM next30
           UNION SELECT sku FROM sku_forecast_config
         )
-        SELECT a.sku, COALESCE(sp.product_name, ot.title) AS product_title, sp.image_url, sp.asin,
+        SELECT a.sku, COALESCE(sp.product_name, ot.title) AS product_title, sp.image_url, sp.asin, sp.parent_asin,
           cfg.stage_override, COALESCE(cfg.is_end_of_life, false) AS is_end_of_life,
           ls.stage_used, ls.model_used, ls.generated_at,
           COALESCE(l30.revenue, 0) AS last_30d_revenue,
@@ -4890,6 +4890,7 @@ app.get('/api/sales-forecast', async (req, res) => {
         product_title: r.product_title,
         image_url: r.image_url,
         asin: r.asin,
+        parent_asin: r.parent_asin,
         stage: r.stage_override || r.stage_used || null,
         stage_override: r.stage_override,
         auto_stage: r.stage_used,
