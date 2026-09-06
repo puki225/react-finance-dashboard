@@ -237,6 +237,18 @@ app.use(express.static(path.join(__dirname, '../client/build')));
         balance_as_of_date DATE,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
+      -- Replenishment assumptions, one row per parent ASIN (variants of one product share
+      -- the same manufacturer/shipping lane, so lead time and payment terms are set once
+      -- per product, not once per SKU). GET /api/cashflow uses these to simulate when each
+      -- child SKU will actually need reordering (from its own current stock + forecasted
+      -- velocity) and when the resulting cash leaves - see that route's own comment for the
+      -- full reorder-point/order-quantity/payment-timing logic.
+      CREATE TABLE IF NOT EXISTS procurement_assumptions (
+        parent_asin TEXT PRIMARY KEY,
+        procurement_lead_days SMALLINT NOT NULL DEFAULT 90,
+        payment_days_before_arrival SMALLINT NOT NULL DEFAULT 0,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
     `);
   } catch (e) {
     console.error('[db] Cash flow schema migration failed:', e.message);
@@ -3569,6 +3581,69 @@ app.put('/api/cashflow-assumptions', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Procurement assumptions — one row per parent ASIN. Lists every parent ASIN with any
+// child SKU (so the Settings page has something to configure even before a row exists -
+// unconfigured ones come back with the table's own defaults, not a missing entry), along
+// with enough product context (name/image, variant count, current combined sellable stock)
+// for the Settings list to be readable without a second round trip.
+app.get('/api/procurement-assumptions', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH latest_stock AS (
+        SELECT DISTINCT ON (sku) sku, fulfillable_quantity FROM amazon_inventory_snapshots ORDER BY sku, snapshot_date DESC
+      ),
+      -- sku_parameters.product_name is often unpopulated - fall back to the real Amazon
+      -- listing title captured per order line, same convention used elsewhere (Inventory,
+      -- Sales Forecast).
+      order_title AS (
+        SELECT DISTINCT ON (sku) sku, title FROM amazon_order_lines WHERE title IS NOT NULL ORDER BY sku, synced_at DESC
+      ),
+      parents AS (
+        SELECT sp.parent_asin,
+          COUNT(*)::int AS sku_count,
+          (ARRAY_AGG(COALESCE(sp.product_name, ot.title) ORDER BY sp.sku) FILTER (WHERE COALESCE(sp.product_name, ot.title) IS NOT NULL))[1] AS product_name,
+          (ARRAY_AGG(sp.image_url ORDER BY sp.sku) FILTER (WHERE sp.image_url IS NOT NULL))[1] AS image_url,
+          COALESCE(SUM(ls.fulfillable_quantity), 0)::int AS sellable_units
+        FROM sku_parameters sp
+        LEFT JOIN latest_stock ls ON ls.sku = sp.sku
+        LEFT JOIN order_title ot ON ot.sku = sp.sku
+        WHERE sp.parent_asin IS NOT NULL
+        GROUP BY sp.parent_asin
+      )
+      SELECT p.parent_asin, p.sku_count, p.product_name, p.image_url, p.sellable_units,
+        COALESCE(pa.procurement_lead_days, 90) AS procurement_lead_days,
+        COALESCE(pa.payment_days_before_arrival, 0) AS payment_days_before_arrival,
+        (pa.parent_asin IS NOT NULL) AS configured
+      FROM parents p
+      LEFT JOIN procurement_assumptions pa ON pa.parent_asin = p.parent_asin
+      ORDER BY p.sellable_units DESC, p.parent_asin
+    `);
+    res.json(result.rows);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
+app.put('/api/procurement-assumptions/:parent_asin', async (req, res) => {
+  const { parent_asin } = req.params;
+  const leadDays = parseInt(req.body.procurement_lead_days, 10);
+  const payBefore = parseInt(req.body.payment_days_before_arrival, 10);
+  if (isNaN(leadDays) || leadDays <= 0) {
+    return res.status(400).json({ error: 'procurement_lead_days must be a positive integer' });
+  }
+  if (isNaN(payBefore) || payBefore < 0 || payBefore > leadDays) {
+    return res.status(400).json({ error: 'payment_days_before_arrival must be between 0 and procurement_lead_days' });
+  }
+  try {
+    const result = await pool.query(`
+      INSERT INTO procurement_assumptions (parent_asin, procurement_lead_days, payment_days_before_arrival, updated_at)
+      VALUES ($1, $2, $3, NOW())
+      ON CONFLICT (parent_asin) DO UPDATE SET
+        procurement_lead_days = $2, payment_days_before_arrival = $3, updated_at = NOW()
+      RETURNING *
+    `, [parent_asin, leadDays, payBefore]);
+    res.json(result.rows[0]);
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Inventory — latest FBA stock snapshot per SKU
 app.get('/api/inventory', async (req, res) => {
   try {
@@ -5193,6 +5268,108 @@ app.get('/api/cashflow', async (req, res) => {
       }
     }
 
+    // Procurement: for every SKU whose parent ASIN has configured replenishment
+    // assumptions (Settings -> Cash Flow -> Procurement), simulate day by day when it'll
+    // need reordering and add the resulting cash outflow - a data-driven replacement for
+    // guessing planned_spend_Nd on products this precise, still available as a manual
+    // fallback for anything left unconfigured.
+    const [skuInputsResult, procurementAssumptionsResult] = await Promise.all([
+      pool.query(`
+        SELECT sp.sku, sp.parent_asin,
+          COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
+          lp.last_price,
+          COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
+        FROM sku_parameters sp
+        LEFT JOIN LATERAL (
+          SELECT fulfillable_quantity FROM amazon_inventory_snapshots
+          WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
+        ) ls ON true
+        LEFT JOIN v_sku_last_price lp ON lp.sku = sp.sku
+        LEFT JOIN LATERAL (
+          -- unit_cogs is entered in cogs_entries.cogs_currency (GBP/USD/EUR) - convert to
+          -- GBP at today's rate (this is a forward-looking cost estimate, not a historical
+          -- order match, so "today" is the right anchor, not an order date) before it's
+          -- combined with the GBP-native forecast/inflow figures elsewhere in this route.
+          SELECT ce0.unit_cogs * COALESCE(fx.rate, 1) AS unit_cogs
+          FROM cogs_entries ce0
+          LEFT JOIN LATERAL (
+            SELECT rate FROM exchange_rates
+            WHERE base_currency = ce0.cogs_currency AND target_currency = 'GBP'
+              AND date <= CURRENT_DATE
+            ORDER BY date DESC LIMIT 1
+          ) fx ON ce0.cogs_currency IS DISTINCT FROM 'GBP'
+          WHERE ce0.sku = sp.sku AND ce0.effective_from <= CURRENT_DATE
+            AND (ce0.effective_to IS NULL OR ce0.effective_to >= CURRENT_DATE)
+          ORDER BY ce0.effective_from DESC LIMIT 1
+        ) ce ON true
+        WHERE sp.parent_asin IS NOT NULL
+      `),
+      pool.query('SELECT * FROM procurement_assumptions'),
+    ]);
+    const procurementByParent = new Map(procurementAssumptionsResult.rows.map(r => [r.parent_asin, r]));
+    // Per-SKU forecast, day by day - the same rows forecastResult already summed, but kept
+    // per-SKU here since each SKU has its own stock/velocity/cost and needs its own
+    // simulation, only sharing the parent's lead-time/payment-timing assumption.
+    const perSkuForecastResult = await pool.query(`
+      SELECT sku, forecast_date::date AS date, forecast_revenue
+      FROM sales_forecast
+      WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
+    `, [horizonDays]);
+    const forecastBySku = new Map();
+    for (const r of perSkuForecastResult.rows) {
+      if (!forecastBySku.has(r.sku)) forecastBySku.set(r.sku, new Map());
+      forecastBySku.get(r.sku).set(isoDate(r.date), parseFloat(r.forecast_revenue));
+    }
+
+    const SAFETY_BUFFER = 1.10; // 10% timing buffer on the reorder trigger only (not the
+    // order quantity) - under steady demand this settles into a permanent safety-stock
+    // floor of ~10% of lead-time demand, rather than being consumed every cycle.
+    const procurementOrders = []; // surfaced in the response so a cash outflow isn't a
+    // mystery number - same "always show why" convention as Sales Forecast's exclusions.
+    for (const row of skuInputsResult.rows) {
+      const pa = procurementByParent.get(row.parent_asin);
+      if (!pa) continue; // unconfigured - falls back to the manual planned_spend buckets above
+      const asp = parseFloat(row.last_price || 0);
+      const unitCost = parseFloat(row.unit_cogs || 0);
+      if (asp <= 0 || unitCost <= 0) continue; // no price/cost basis to convert £ forecast -> units or units -> £
+      const skuForecast = forecastBySku.get(row.sku);
+      const dailyVelocity = Array.from({ length: horizonDays }, (_, i) => {
+        const rev = skuForecast ? skuForecast.get(addDays(todayStr, i)) : undefined;
+        return rev ? rev / asp : 0;
+      });
+      const leadDays = pa.procurement_lead_days;
+      const paymentDaysBeforeArrival = pa.payment_days_before_arrival;
+
+      let stock = row.sellable;
+      const pendingArrivals = [];
+      for (let day = 0; day < horizonDays; day++) {
+        for (let i = pendingArrivals.length - 1; i >= 0; i--) {
+          if (pendingArrivals[i].day === day) { stock += pendingArrivals[i].qty; pendingArrivals.splice(i, 1); }
+        }
+        stock = Math.max(0, stock - dailyVelocity[day]);
+        if (pendingArrivals.length > 0) continue; // one order in flight at a time
+        const windowEnd = Math.min(day + leadDays, horizonDays);
+        let sumV = 0, n = 0;
+        for (let d = day; d < windowEnd; d++) { sumV += dailyVelocity[d]; n++; }
+        const avgVelocity = n > 0 ? sumV / n : 0;
+        if (avgVelocity <= 0) continue;
+        const reorderPoint = SAFETY_BUFFER * leadDays * avgVelocity;
+        if (stock > reorderPoint) continue;
+        const orderQty = leadDays * avgVelocity;
+        const arrivalDay = day + leadDays;
+        pendingArrivals.push({ day: arrivalDay, qty: orderQty });
+        const paymentDay = arrivalDay - paymentDaysBeforeArrival;
+        const amount = orderQty * unitCost;
+        if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount);
+        procurementOrders.push({
+          sku: row.sku, parent_asin: row.parent_asin,
+          trigger_date: addDays(todayStr, day), arrival_date: addDays(todayStr, arrivalDay),
+          payment_date: addDays(todayStr, paymentDay),
+          order_qty: Math.round(orderQty), amount: fx(amount).toFixed(2),
+        });
+      }
+    }
+
     let balance = fx(a.opening_bank_balance || 0);
     const daily = [];
     let minBalance = balance, minBalanceDate = todayStr;
@@ -5234,6 +5411,7 @@ app.get('/api/cashflow', async (req, res) => {
       min_balance: minBalance.toFixed(2),
       min_balance_date: minBalanceDate,
       threshold_breach_date: thresholdBreachDate,
+      procurement_orders: procurementOrders.sort((x, y) => x.payment_date.localeCompare(y.payment_date)),
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
