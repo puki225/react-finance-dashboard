@@ -4790,49 +4790,54 @@ app.get('/api/sales-forecast', async (req, res) => {
         LEFT JOIN actual_by_month py ON py.month = (m.month - INTERVAL '1 year')::date
         ORDER BY m.month
       `, [historyDays]),
-      // Daily actuals for the PY (prior-year) comparator, at DAY grain - so the tooltip's
-      // "vs PY" can compare a single hovered day (Daily granularity) or a summed week
-      // (Weekly) against the matching PY day/week, not just a whole month (`milestones`
-      // above already covers Monthly). Covers the same 364-days-back window the
+      // Daily actuals for the PY (prior-year) comparator, at DAY grain AND per-SKU - so the
+      // tooltip's "vs PY" can compare a single hovered day (Daily granularity) or a summed
+      // week (Weekly) against the matching PY day/week, not just a whole month (`milestones`
+      // above already covers Monthly), and so the chart's PY/PY-2 reference lines can be
+      // re-aggregated down to a SKU selection the same way `sku_series` already lets the
+      // actual/forecast line do (rather than always showing the whole-catalog total
+      // regardless of which SKUs are selected). Covers the same 364-days-back window the
       // forecast-service's own PY blend uses (weekday-aligned, not a calendar year shift -
       // see sales-forecast-service/forecast.py's PY_SHIFT_DAYS), across the full display
       // range (actuals window back through the forecast horizon forward), independent of
       // history_days the same way `milestones` is.
       pool.query(`
         WITH rev AS (
-          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
-          WHERE order_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
-          GROUP BY 1
+          WHERE sku IS NOT NULL AND order_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+          GROUP BY sku, 2
         ),
         ref AS (
-          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
-          WHERE refund_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
-          GROUP BY 1
+          WHERE sku IS NOT NULL AND refund_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+          GROUP BY sku, 2
         )
-        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
-        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
-        ORDER BY 1
+        SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.date, ref.date) AS date,
+          (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
+        ORDER BY 1, 2
       `, [historyDays]),
       // Same as the PY query above, shifted a further 364 days back (728 total - two
       // whole years, weekday-aligned) - the chart's "PY-2" reference line.
       pool.query(`
         WITH rev AS (
-          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
-          WHERE order_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
-          GROUP BY 1
+          WHERE sku IS NOT NULL AND order_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
+          GROUP BY sku, 2
         ),
         ref AS (
-          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
-          WHERE refund_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
-          GROUP BY 1
+          WHERE sku IS NOT NULL AND refund_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
+          GROUP BY sku, 2
         )
-        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
-        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
-        ORDER BY 1
+        SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.date, ref.date) AS date,
+          (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
+        ORDER BY 1, 2
       `, [historyDays]),
     ]);
 
@@ -4862,8 +4867,24 @@ app.get('/api/sales-forecast', async (req, res) => {
           is_forecast: parseFloat(r.forecast_revenue || 0) > 0,
         };
       }),
-      py_history: pyDailyResult.rows.map(r => ({ date: r.date, revenue: fx(r.revenue).toFixed(2) })),
-      py2_history: py2DailyResult.rows.map(r => ({ date: r.date, revenue: fx(r.revenue).toFixed(2) })),
+      // Whole-catalog totals (used when no SKU is selected) - sum the per-sku rows below
+      // rather than a separate query, so there's exactly one source of truth for this data.
+      py_history: Object.entries(pyDailyResult.rows.reduce((acc, r) => {
+        const d = typeof r.date === 'string' ? r.date : r.date.toISOString().slice(0, 10);
+        acc[d] = (acc[d] || 0) + parseFloat(r.revenue || 0);
+        return acc;
+      }, {})).map(([date, revenue]) => ({ date, revenue: fx(revenue).toFixed(2) })),
+      py2_history: Object.entries(py2DailyResult.rows.reduce((acc, r) => {
+        const d = typeof r.date === 'string' ? r.date : r.date.toISOString().slice(0, 10);
+        acc[d] = (acc[d] || 0) + parseFloat(r.revenue || 0);
+        return acc;
+      }, {})).map(([date, revenue]) => ({ date, revenue: fx(revenue).toFixed(2) })),
+      // Per-SKU rows, mirroring sku_series' shape - lets the chart's PY/PY-2 reference
+      // lines re-aggregate down to a SKU selection the same way the actual/forecast line
+      // already does, instead of always showing the whole-catalog total regardless of
+      // which SKUs are selected.
+      py_sku_series: pyDailyResult.rows.map(r => ({ sku: r.sku, date: r.date, revenue: fx(r.revenue).toFixed(2) })),
+      py2_sku_series: py2DailyResult.rows.map(r => ({ sku: r.sku, date: r.date, revenue: fx(r.revenue).toFixed(2) })),
       skus: skuResult.rows.map(r => ({
         sku: r.sku,
         product_title: r.product_title,
