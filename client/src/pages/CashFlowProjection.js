@@ -198,6 +198,38 @@ export default function CashFlowProjection() {
           <AssumptionsSummary data={data} />
         </div>
       </div>
+
+      {data.procurement_orders?.length > 0 && (
+        <div style={cardStyle}>
+          <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Projected replenishment orders</div>
+          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.5 }}>
+            Automatically triggered from current stock, forecasted velocity, and your Procurement lead-time/payment assumptions (Settings → Procurement) — each of these is already included as a cash outflow above.
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 640 }}>
+              <thead>
+                <tr style={{ borderBottom: '1px solid var(--border)' }}>
+                  {['SKU', 'Order placed', 'Arrives', 'Cash out', 'Qty', 'Amount'].map((h, i) => (
+                    <th key={h} style={{ padding: '8px 10px', textAlign: i >= 3 ? 'right' : 'left', fontSize: 10, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.05em', textTransform: 'uppercase', whiteSpace: 'nowrap' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {data.procurement_orders.map((o, i) => (
+                  <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
+                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)' }}>{o.sku}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.trigger_date)}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.arrival_date)}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtDate(o.payment_date)}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{o.order_qty.toLocaleString()}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 600 }}>{fmtMoney(o.amount, sym)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

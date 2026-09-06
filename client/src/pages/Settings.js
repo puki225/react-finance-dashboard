@@ -24,10 +24,11 @@ const COGS_FIELDS = [
   { key: 'cogs_other',     label: 'Other',                placeholder: 'Any other landed cost' },
 ];
 const SUBTABS = [
-  { id: 'cogs',      label: 'COGS' },
-  { id: 'reporting', label: 'Reporting' },
-  { id: 'cashflow',  label: 'Cash Flow' },
-  { id: 'channels',  label: 'Channels',  soon: true },
+  { id: 'cogs',        label: 'COGS' },
+  { id: 'reporting',   label: 'Reporting' },
+  { id: 'cashflow',    label: 'Cash Flow' },
+  { id: 'procurement', label: 'Procurement' },
+  { id: 'channels',    label: 'Channels',  soon: true },
 ];
 
 const inputStyle = {
@@ -861,6 +862,96 @@ function CashFlowSettings() {
   );
 }
 
+function ProcurementRow({ row, onRefresh }) {
+  const [leadDays, setLeadDays] = useState(row.procurement_lead_days);
+  const [payBefore, setPayBefore] = useState(row.payment_days_before_arrival);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState(null);
+
+  const dirty = parseInt(leadDays, 10) !== row.procurement_lead_days || parseInt(payBefore, 10) !== row.payment_days_before_arrival;
+
+  const handleSave = async () => {
+    const lead = parseInt(leadDays, 10);
+    const before = parseInt(payBefore, 10);
+    if (isNaN(lead) || lead <= 0) { setError('Lead time must be a positive number of days'); return; }
+    if (isNaN(before) || before < 0 || before > lead) { setError('Payment days before arrival must be between 0 and the lead time'); return; }
+    setSaving(true); setError(null); setSaved(false);
+    try {
+      const resp = await fetch(`/api/procurement-assumptions/${encodeURIComponent(row.parent_asin)}`, {
+        method: 'PUT', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ procurement_lead_days: lead, payment_days_before_arrival: before }),
+      });
+      const d = await resp.json();
+      if (!resp.ok) throw new Error(d.error || 'Save failed');
+      setSaved(true);
+      onRefresh();
+    } catch (e) { setError(e.message); }
+    setSaving(false);
+  };
+
+  return (
+    <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap', marginBottom: 10 }}>
+      {row.image_url
+        ? <img src={row.image_url} alt={row.parent_asin} style={{ width: 44, height: 44, objectFit: 'contain', borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg3)', flexShrink: 0 }} />
+        : <div style={{ width: 44, height: 44, borderRadius: 8, border: '1px solid var(--border)', background: 'var(--bg3)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 16, opacity: 0.3, flexShrink: 0 }}>◉</div>
+      }
+      <div style={{ flex: '2 1 220px', minWidth: 0 }}>
+        <div style={{ fontSize: 13, fontWeight: 700, color: 'var(--text)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{row.product_name || row.parent_asin}</div>
+        <div style={{ fontSize: 11, color: 'var(--muted)', fontFamily: 'var(--mono)', marginTop: 2 }}>{row.parent_asin} · {row.sku_count} SKU{row.sku_count > 1 ? 's' : ''} · {row.sellable_units} sellable units</div>
+      </div>
+      <div style={{ flex: '1 1 140px' }}>
+        <label style={labelStyle}>Lead Time (days)</label>
+        <input type="number" min="1" style={inputStyle} value={leadDays} onChange={e => { setLeadDays(e.target.value); setSaved(false); }} />
+      </div>
+      <div style={{ flex: '1 1 160px' }}>
+        <label style={labelStyle}>Pay N Days Before Arrival</label>
+        <input type="number" min="0" style={inputStyle} value={payBefore} onChange={e => { setPayBefore(e.target.value); setSaved(false); }} />
+      </div>
+      <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
+        {saved && !dirty && <span style={{ fontSize: 11, color: 'var(--green)' }}>✓ Saved</span>}
+        {error && <span style={{ fontSize: 11, color: 'var(--red)' }}>{error}</span>}
+        <button onClick={handleSave} disabled={saving || !dirty}
+          style={{ padding: '7px 16px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: '1px solid ' + (dirty ? 'var(--accent)' : 'var(--border)'), background: dirty ? 'var(--accent)' : 'transparent', color: dirty ? '#fff' : 'var(--muted)', cursor: dirty ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)' }}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        {!row.configured && !dirty && <span style={{ fontSize: 10, color: 'var(--amber)' }}>Using defaults</span>}
+      </div>
+    </div>
+  );
+}
+
+// Procurement — replenishment lead time and payment timing, one set of inputs per parent
+// ASIN (variants share a manufacturer/shipping lane). The Cash Flow projection uses these,
+// together with each SKU's own current stock and forecasted velocity, to work out when a
+// reorder is actually needed and when the resulting cash leaves - see GET /api/cashflow's
+// own comment for the full reorder-point/quantity/payment-timing logic. A parent ASIN left
+// unconfigured just falls back to the general "Planned Inventory Spend" buckets in the
+// Cash Flow tab above, rather than being modeled automatically.
+function ProcurementSettings() {
+  const { data: parents, loading, error, refetch } = useApi('/api/procurement-assumptions');
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
+      <div>
+        <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Procurement</h2>
+        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
+          How long manufacturing + shipping takes, and how far ahead of arrival you actually pay your supplier, per product.
+          Once set, the Cash Flow tab automatically works out when each product will need reordering — from its current stock
+          and forecasted sales velocity — and schedules the resulting cash outflow, instead of you having to guess it.
+          A 10% timing buffer is built into the reorder trigger automatically, so there's always a little safety stock in hand.
+        </p>
+      </div>
+      {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>}
+      {error && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--red)' }}>{error}</div>}
+      {!loading && !error && (!parents || parents.length === 0) && (
+        <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>No products with a parent ASIN found.</div>
+      )}
+      {!loading && parents?.map(row => <ProcurementRow key={row.parent_asin} row={row} onRefresh={refetch} />)}
+    </div>
+  );
+}
+
 export default function Settings() {
   const isMobile = useIsMobile();
   const [subtab, setSubtab] = useState('cogs');
@@ -937,6 +1028,7 @@ export default function Settings() {
       )}
       {subtab === 'reporting' && <ReportingSettings />}
       {subtab === 'cashflow' && <CashFlowSettings />}
+      {subtab === 'procurement' && <ProcurementSettings />}
     </div>
   );
 }
