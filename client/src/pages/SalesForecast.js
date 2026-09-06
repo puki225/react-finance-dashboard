@@ -160,8 +160,48 @@ function pyValueForBucket(bucketDateStr, granularity, pyByDate) {
   return found ? sum : null;
 }
 
+// PY/PY-2 reference lines, aligned to the SAME buckets as the main series (`days`) at
+// whatever granularity it's currently at - offsetDays back (364 = PY, 728 = PY-2),
+// summed over the bucket's span (1 day / 7 days / the calendar month's day count).
+// Approximate at Monthly grain (364/728 isn't exactly 1/2 calendar years, so a month
+// bucket's PY sum can bleed a day or two into the adjacent month) - fine for a reference
+// line whose job is showing the shape, not the exact number; the tooltip's "Month vs PY"
+// stays on the precise calendar-month-aligned `milestones` figure regardless.
+function buildPyLine(days, granularity, offsetDays, byDate) {
+  return days.map(d => {
+    const bucketDate = new Date(d.date);
+    const span = granularity === 'monthly'
+      ? new Date(Date.UTC(bucketDate.getUTCFullYear(), bucketDate.getUTCMonth() + 1, 0)).getUTCDate()
+      : granularity === 'weekly' ? 7 : 1;
+    let sum = 0, found = false;
+    for (let i = 0; i < span; i++) {
+      const d2 = new Date(bucketDate);
+      d2.setUTCDate(d2.getUTCDate() - offsetDays + i);
+      const key = isoDate(d2);
+      if (byDate.has(key)) { sum += byDate.get(key); found = true; }
+    }
+    return found ? sum : null;
+  });
+}
+
+// Builds an SVG path from a value array that may contain nulls (no PY data for that
+// bucket) - breaks the line into separate segments across a gap instead of connecting
+// straight through it or erroring.
+function buildGappedPath(values, x, y) {
+  let path = '', drawing = false;
+  values.forEach((v, i) => {
+    if (v === null || v === undefined) { drawing = false; return; }
+    path += (drawing ? 'L' : 'M') + x(i) + ',' + y(v) + ' ';
+    drawing = true;
+  });
+  return path;
+}
+
+const PY_COLOR = '#38bdf8';
+const PY2_COLOR = '#fb923c';
+
 // ─── Main chart: actual (solid) -> forecast (dashed) with uncertainty band ────────────
-function MainChart({ days, granularity, sym, milestones, pyByDate }) {
+function MainChart({ days, granularity, sym, milestones, pyByDate, py2ByDate }) {
   const [hover, setHover] = useState(null);
   const W = 980, ML = 4, MR = 4, H = 220, XAXISH = 22;
 
@@ -173,8 +213,12 @@ function MainChart({ days, granularity, sym, milestones, pyByDate }) {
   const slot = N > 1 ? plotW / (N - 1) : plotW;
   const x = (i) => ML + i * slot;
 
-  const vals = days.map(d => (d.actual ? d.value : (d.high ?? d.value)));
-  const lowVals = days.map(d => (d.actual ? d.value : (d.low ?? d.value)));
+  const pyLine = buildPyLine(days, granularity, 364, pyByDate);
+  const py2Line = buildPyLine(days, granularity, 728, py2ByDate);
+  const pyVals = [...pyLine, ...py2Line].filter(v => v !== null);
+
+  const vals = days.map(d => (d.actual ? d.value : (d.high ?? d.value))).concat(pyVals);
+  const lowVals = days.map(d => (d.actual ? d.value : (d.low ?? d.value))).concat(pyVals);
   const yMin = Math.min(...lowVals, 0) * (Math.min(...lowVals) < 0 ? 1.1 : 0.9);
   const yMax = Math.max(...vals) * 1.08 || 1;
   const y = (v) => H - ((v - yMin) / (yMax - yMin || 1)) * H;
@@ -192,6 +236,8 @@ function MainChart({ days, granularity, sym, milestones, pyByDate }) {
   for (let i = 0; i <= todayIdx; i++) actualPath += (i === 0 ? 'M' : 'L') + x(i) + ',' + y(days[i].value) + ' ';
   let forecastPath = '';
   for (let i = Math.max(todayIdx, 0); i < N; i++) forecastPath += (i === Math.max(todayIdx, 0) ? 'M' : 'L') + x(i) + ',' + y(days[i].value) + ' ';
+  const pyPath = buildGappedPath(pyLine, x, y);
+  const py2Path = buildGappedPath(py2Line, x, y);
 
   const handleMove = (e) => {
     const svg = e.currentTarget;
@@ -242,6 +288,8 @@ function MainChart({ days, granularity, sym, milestones, pyByDate }) {
             <text x={x(todayIdx)} y={12} fontFamily="var(--mono)" fontSize={10} fill="var(--muted)" textAnchor="middle">Today</text>
           </>
         )}
+        {py2Path && <path d={py2Path} fill="none" stroke={PY2_COLOR} strokeWidth={1.5} opacity={0.85} strokeLinejoin="round" strokeLinecap="round" />}
+        {pyPath && <path d={pyPath} fill="none" stroke={PY_COLOR} strokeWidth={1.5} opacity={0.85} strokeLinejoin="round" strokeLinecap="round" />}
         {areaPath && <path d={areaPath} fill="var(--accent)" opacity={0.12} />}
         <path d={actualPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
         {forecastPath && <path d={forecastPath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeDasharray="5,4" strokeLinejoin="round" strokeLinecap="round" />}
@@ -289,6 +337,18 @@ function MainChart({ days, granularity, sym, milestones, pyByDate }) {
               <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: hoveredPyPct === null ? 'var(--muted)' : (parseFloat(hoveredPyPct) >= 0 ? 'var(--green)' : 'var(--red)') }}>
                 {hoveredPyPct === null ? 'No PY data' : `${parseFloat(hoveredPyPct) >= 0 ? '+' : ''}${parseFloat(hoveredPyPct).toFixed(1)}%`}
               </span>
+            </div>
+          )}
+          {pyLine[hover.i] !== null && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+              <span style={{ color: PY_COLOR }}>PY</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500 }}>{fmtMoney(pyLine[hover.i], sym)}</span>
+            </div>
+          )}
+          {py2Line[hover.i] !== null && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+              <span style={{ color: PY2_COLOR }}>PY-2</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500 }}>{fmtMoney(py2Line[hover.i], sym)}</span>
             </div>
           )}
         </div>
@@ -356,9 +416,11 @@ export default function SalesForecast() {
   const skuSeries = data?.sku_series || [];
   const milestones = data?.milestones || [];
   const pyHistory = data?.py_history || [];
+  const py2History = data?.py2_history || [];
   const hasForecast = !!data?.has_forecast;
 
   const pyByDate = useMemo(() => new Map(pyHistory.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [pyHistory]);
+  const py2ByDate = useMemo(() => new Map(py2History.map(d => [d.date.slice(0, 10), parseFloat(d.revenue)])), [py2History]);
 
   const skuSeriesBySku = useMemo(() => {
     const m = new Map();
@@ -507,7 +569,7 @@ export default function SalesForecast() {
                 </div>
               </div>
             </div>
-            <MainChart days={bucketedDays} granularity={granularity} sym={sym} milestones={milestones} pyByDate={pyByDate} />
+            <MainChart days={bucketedDays} granularity={granularity} sym={sym} milestones={milestones} pyByDate={pyByDate} py2ByDate={py2ByDate} />
             <div style={{ display: 'flex', gap: 16, marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)', flexWrap: 'wrap' }}>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 14, height: 2, background: 'var(--accent)' }} />Actual
@@ -517,6 +579,12 @@ export default function SalesForecast() {
               </div>
               <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
                 <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--accent)', opacity: 0.15, border: '1px solid var(--accent2)' }} />Uncertainty range
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+                <span style={{ width: 14, height: 2, background: PY_COLOR }} />PY
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+                <span style={{ width: 14, height: 2, background: PY2_COLOR }} />PY-2
               </div>
               <div style={{ fontSize: 11, color: 'var(--muted)' }}>Hover a point for its revenue and how it compares to the same day/week/month last year.</div>
             </div>
