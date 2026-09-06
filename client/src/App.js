@@ -5,6 +5,7 @@ import PnL from './pages/PnL';
 import PVM from './pages/PVM';
 import Inventory from './pages/Inventory';
 import CashFlow from './pages/CashFlow';
+import CashFlowProjection from './pages/CashFlowProjection';
 import SalesForecast from './pages/SalesForecast';
 import Settings from './pages/Settings';
 import { useIsMobile } from './hooks/useIsMobile';
@@ -16,8 +17,11 @@ const NAV = [
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: true },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
   { id: 'salesforecast', label: 'Sales Forecast',   icon: '◕', active: true },
-  { id: 'cashrecon', label: 'Cash Reconciliation',  icon: '◒', active: true },
-  { id: 'cashflow',  label: 'Cash Flow',            icon: '◔', active: false },
+  // 'cashrecon' (Cash Reconciliation) is deliberately left OUT of NAV, not just set
+  // active:false - that flag renders a grayed-out "SOON" row, which reads as "not built
+  // yet" for a tab that's fully working and just hidden by request. Its render branch
+  // below is untouched, so re-adding this one line brings it straight back.
+  { id: 'cashflow',  label: 'Cash Flow',            icon: '◔', active: true },
   { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
 ];
 
@@ -155,7 +159,7 @@ export default function App() {
         {active === 'inventory' && <Inventory />}
         {active === 'salesforecast' && <SalesForecast />}
         {active === 'cashrecon' && <CashFlow />}
-        {active === 'cashflow'  && <Placeholder label="Cash Flow & Working Capital" />}
+        {active === 'cashflow'  && <CashFlowProjection />}
         {active === 'settings'  && <Settings />}
       </div>
     </div>
