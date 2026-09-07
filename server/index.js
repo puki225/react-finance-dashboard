@@ -5453,7 +5453,7 @@ app.get('/api/cashflow', async (req, res) => {
       pool.query(`
         SELECT sp.sku, sp.parent_asin,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
-          lp.last_price,
+          COALESCE(avg30.avg_price, lp.last_price) AS asp,
           COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
         FROM sku_parameters sp
         LEFT JOIN LATERAL (
@@ -5461,6 +5461,16 @@ app.get('/api/cashflow', async (req, res) => {
           WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
         ) ls ON true
         LEFT JOIN v_sku_last_price lp ON lp.sku = sp.sku
+        -- Average selling price over the trailing 30 days, not a single last transaction's
+        -- price - one order (a multi-buy line, a mid-window price change, a heavy discount)
+        -- can make the single "last price" a noisy, unrepresentative basis for converting a
+        -- revenue forecast into units. Falls back to the single last price for a SKU with no
+        -- sales in the last 30 days (too new, or too slow-moving) rather than going unpriced.
+        LEFT JOIN LATERAL (
+          SELECT SUM(gross_sales) / NULLIF(SUM(quantity), 0) AS avg_price
+          FROM v_sku_revenue
+          WHERE sku = sp.sku AND order_date::date >= CURRENT_DATE - 30
+        ) avg30 ON true
         LEFT JOIN LATERAL (
           -- unit_cogs is entered in cogs_entries.cogs_currency (GBP/USD/EUR) - convert to
           -- GBP at today's rate (this is a forward-looking cost estimate, not a historical
@@ -5497,7 +5507,7 @@ app.get('/api/cashflow', async (req, res) => {
     for (const row of skuInputsResult.rows) {
       const pa = procurementByParent.get(row.parent_asin);
       if (!pa) continue; // unconfigured - no procurement outflow modeled for this SKU yet
-      const asp = parseFloat(row.last_price || 0);
+      const asp = parseFloat(row.asp || 0);
       const unitCost = parseFloat(row.unit_cogs || 0);
       if (asp <= 0 || unitCost <= 0) continue; // no price/cost basis to convert £ forecast -> units or units -> £
       const skuForecast = forecastBySku.get(row.sku);
