@@ -5484,9 +5484,14 @@ app.get('/api/cashflow', async (req, res) => {
     ]);
     const procurementByParent = new Map(procurementAssumptionsResult.rows.map(r => [r.parent_asin, r]));
 
-    const SAFETY_BUFFER = 1.10; // 10% timing buffer on the reorder trigger only (not the
-    // order quantity) - under steady demand this settles into a permanent safety-stock
-    // floor of ~10% of lead-time demand, rather than being consumed every cycle.
+    // Flat 2-week safety-stock cushion on the reorder TRIGGER only (not the order quantity)
+    // - a percentage-of-lead-time buffer (the original 10% design) gives almost no real
+    // cushion for a short lead time and an oversized one for a long lead time; an absolute
+    // number of days' worth of extra stock is what "keep 2 weeks to a month of safety
+    // stock" actually means, independent of how long the product takes to arrive. Global
+    // for now (applies to every SKU); can move to a per-parent-ASIN setting later if a
+    // specific product needs its own buffer.
+    const SAFETY_STOCK_DAYS = 14;
     const procurementOrders = []; // surfaced in the response so a cash outflow isn't a
     // mystery number - same "always show why" convention as Sales Forecast's exclusions.
     for (const row of skuInputsResult.rows) {
@@ -5516,7 +5521,7 @@ app.get('/api/cashflow', async (req, res) => {
         for (let d = day; d < windowEnd; d++) { sumV += dailyVelocity[d]; n++; }
         const avgVelocity = n > 0 ? sumV / n : 0;
         if (avgVelocity <= 0) continue;
-        const reorderPoint = SAFETY_BUFFER * leadDays * avgVelocity;
+        const reorderPoint = (leadDays + SAFETY_STOCK_DAYS) * avgVelocity;
         if (stock > reorderPoint) continue;
         const orderQty = leadDays * avgVelocity;
         const arrivalDay = day + leadDays;

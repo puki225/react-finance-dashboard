@@ -896,7 +896,7 @@ function ProcurementSettings() {
           How long manufacturing + shipping takes, and how far ahead of arrival you actually pay your supplier, per product.
           Once set, the Cash Flow tab automatically works out when each product will need reordering — from its current stock
           and forecasted sales velocity — and schedules the resulting cash outflow, instead of you having to guess it.
-          A 10% timing buffer is built into the reorder trigger automatically, so there's always a little safety stock in hand.
+          A 2-week safety-stock cushion is built into the reorder trigger automatically, so there's still buffer left when the new stock arrives.
         </p>
       </div>
       {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>}
