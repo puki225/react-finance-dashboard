@@ -5453,7 +5453,7 @@ app.get('/api/cashflow', async (req, res) => {
       pool.query(`
         SELECT sp.sku, sp.parent_asin,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
-          lp.last_price,
+          COALESCE(avg30.avg_price, lp.last_price) AS asp,
           COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
         FROM sku_parameters sp
         LEFT JOIN LATERAL (
@@ -5461,6 +5461,16 @@ app.get('/api/cashflow', async (req, res) => {
           WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
         ) ls ON true
         LEFT JOIN v_sku_last_price lp ON lp.sku = sp.sku
+        -- Average selling price over the trailing 30 days, not a single last transaction's
+        -- price - one order (a multi-buy line, a mid-window price change, a heavy discount)
+        -- can make the single "last price" a noisy, unrepresentative basis for converting a
+        -- revenue forecast into units. Falls back to the single last price for a SKU with no
+        -- sales in the last 30 days (too new, or too slow-moving) rather than going unpriced.
+        LEFT JOIN LATERAL (
+          SELECT SUM(gross_sales) / NULLIF(SUM(quantity), 0) AS avg_price
+          FROM v_sku_revenue
+          WHERE sku = sp.sku AND order_date::date >= CURRENT_DATE - 30
+        ) avg30 ON true
         LEFT JOIN LATERAL (
           -- unit_cogs is entered in cogs_entries.cogs_currency (GBP/USD/EUR) - convert to
           -- GBP at today's rate (this is a forward-looking cost estimate, not a historical
@@ -5484,15 +5494,20 @@ app.get('/api/cashflow', async (req, res) => {
     ]);
     const procurementByParent = new Map(procurementAssumptionsResult.rows.map(r => [r.parent_asin, r]));
 
-    const SAFETY_BUFFER = 1.10; // 10% timing buffer on the reorder trigger only (not the
-    // order quantity) - under steady demand this settles into a permanent safety-stock
-    // floor of ~10% of lead-time demand, rather than being consumed every cycle.
+    // Flat 2-week safety-stock cushion on the reorder TRIGGER only (not the order quantity)
+    // - a percentage-of-lead-time buffer (the original 10% design) gives almost no real
+    // cushion for a short lead time and an oversized one for a long lead time; an absolute
+    // number of days' worth of extra stock is what "keep 2 weeks to a month of safety
+    // stock" actually means, independent of how long the product takes to arrive. Global
+    // for now (applies to every SKU); can move to a per-parent-ASIN setting later if a
+    // specific product needs its own buffer.
+    const SAFETY_STOCK_DAYS = 14;
     const procurementOrders = []; // surfaced in the response so a cash outflow isn't a
     // mystery number - same "always show why" convention as Sales Forecast's exclusions.
     for (const row of skuInputsResult.rows) {
       const pa = procurementByParent.get(row.parent_asin);
       if (!pa) continue; // unconfigured - no procurement outflow modeled for this SKU yet
-      const asp = parseFloat(row.last_price || 0);
+      const asp = parseFloat(row.asp || 0);
       const unitCost = parseFloat(row.unit_cogs || 0);
       if (asp <= 0 || unitCost <= 0) continue; // no price/cost basis to convert £ forecast -> units or units -> £
       const skuForecast = forecastBySku.get(row.sku);
@@ -5516,7 +5531,7 @@ app.get('/api/cashflow', async (req, res) => {
         for (let d = day; d < windowEnd; d++) { sumV += dailyVelocity[d]; n++; }
         const avgVelocity = n > 0 ? sumV / n : 0;
         if (avgVelocity <= 0) continue;
-        const reorderPoint = SAFETY_BUFFER * leadDays * avgVelocity;
+        const reorderPoint = (leadDays + SAFETY_STOCK_DAYS) * avgVelocity;
         if (stock > reorderPoint) continue;
         const orderQty = leadDays * avgVelocity;
         const arrivalDay = day + leadDays;
