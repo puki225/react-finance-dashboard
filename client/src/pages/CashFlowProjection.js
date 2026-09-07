@@ -32,27 +32,55 @@ function HoverTooltip({ tip }) {
   );
 }
 
-const W = 980, H = 260, PAD_L = 8, PAD_R = 8, PAD_T = 16, PAD_B = 28;
+const W = 980, PAD_L = 6, PAD_R = 6;
+const P1H = 190, GAP = 30, P2H = 90, XAXIS_H = 22;
+const TOTAL_H = P1H + GAP + P2H + XAXIS_H;
 
-function BalanceChart({ daily, sym, threshold, breachDate }) {
+// One rounded-corner rect path per bar - corners round toward whichever end is away from
+// the zero baseline, matching a normal bar chart's "grows away from zero" reading.
+function roundedBarPath(cx, yTop, yBottom, w, positive) {
+  const r = Math.min(4, w / 2, Math.abs(yBottom - yTop));
+  const left = cx - w / 2, right = cx + w / 2;
+  if (positive) {
+    return `M${left},${yBottom} L${left},${yTop + r} Q${left},${yTop} ${left + r},${yTop} L${right - r},${yTop} Q${right},${yTop} ${right},${yTop + r} L${right},${yBottom} Z`;
+  }
+  return `M${left},${yTop} L${right},${yTop} L${right},${yBottom - r} Q${right},${yBottom} ${right - r},${yBottom} L${left + r},${yBottom} Q${left},${yBottom} ${left},${yBottom - r} Z`;
+}
+
+// Two stacked panels sharing one x-axis and one hover crosshair: balance (the headline -
+// "am I safe on any given day") on top, daily net in/out (the explanation - "why did it
+// move") below. Deliberately not one dual-axis combo chart - that needs its bar and line
+// scales picked independently just to make both fit, which means any visual correlation
+// between them is arbitrary, not real (the #1 charting mistake). Sharing an x-axis and a
+// crosshair instead still reads as one cohesive chart - a dip up top lines up exactly with
+// its cause below - without inventing a fake relationship between two unrelated scales.
+function CashFlowChart({ daily, sym, threshold, breachDate }) {
   const [hover, setHover] = useState(null);
   const svgRef = React.useRef(null);
-
-  const values = daily.map(d => parseFloat(d.balance));
-  const allVals = threshold > 0 ? [...values, threshold] : values;
-  const yMin = Math.min(0, ...allVals);
-  const yMax = Math.max(...allVals) * 1.08 || 1;
   const n = daily.length;
+
+  const balances = daily.map(d => parseFloat(d.balance));
+  const balVals = threshold > 0 ? [...balances, threshold] : balances;
+  const balMin = Math.min(0, ...balVals) - Math.abs(Math.max(...balVals) - Math.min(...balVals)) * 0.08;
+  const balMax = Math.max(...balVals) + Math.abs(Math.max(...balVals) - Math.min(...balVals)) * 0.08 || 1;
   const x = (i) => PAD_L + (i / Math.max(n - 1, 1)) * (W - PAD_L - PAD_R);
-  const y = (v) => PAD_T + (1 - (v - yMin) / (yMax - yMin || 1)) * (H - PAD_T - PAD_B);
+  const y1 = (v) => (balMax === balMin ? P1H / 2 : P1H - (v - balMin) / (balMax - balMin) * P1H);
 
-  const linePath = useMemo(() => values.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' '), [values, n, yMin, yMax]);
-  const zeroY = y(0);
-  const thresholdY = threshold > 0 ? y(threshold) : null;
+  const linePath = useMemo(() => balances.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y1(v).toFixed(1)}`).join(' '), [daily, balMin, balMax]); // eslint-disable-line
+  const thresholdY = threshold > 0 ? y1(threshold) : null;
+  const areaPath = `${linePath} L${x(n - 1).toFixed(1)},${P1H} L${x(0).toFixed(1)},${P1H} Z`;
 
-  // Area below zero shaded red-ish, above zero the normal accent fill, so a dip into
-  // negative balance is visually distinct without needing a second series/color.
-  const areaPath = `${linePath} L${x(n - 1).toFixed(1)},${zeroY.toFixed(1)} L${x(0).toFixed(1)},${zeroY.toFixed(1)} Z`;
+  let lowIdx = 0;
+  daily.forEach((d, i) => { if (parseFloat(d.balance) < parseFloat(daily[lowIdx].balance)) lowIdx = i; });
+  const belowThreshold = threshold > 0 && parseFloat(daily[lowIdx].balance) < threshold;
+
+  const nets = daily.map(d => parseFloat(d.net));
+  const maxAbsNet = Math.max(...nets.map(Math.abs), 1) * 1.15;
+  const p2Y0 = P1H + GAP;
+  const y2 = (v) => p2Y0 + P2H / 2 - (v / maxAbsNet) * (P2H / 2);
+  const baseline2 = p2Y0 + P2H / 2;
+  const slot = (W - PAD_L - PAD_R) / Math.max(n - 1, 1);
+  const barW = Math.max(1, Math.min(24, slot - 2));
 
   const ticks = useMemo(() => {
     const step = Math.max(1, Math.round(n / 6));
@@ -65,7 +93,7 @@ function BalanceChart({ daily, sym, threshold, breachDate }) {
   function handleMove(e) {
     const rect = svgRef.current.getBoundingClientRect();
     const relX = (e.clientX - rect.left) / rect.width * W;
-    let i = Math.round(((relX - PAD_L) / (W - PAD_L - PAD_R)) * (n - 1));
+    let i = Math.round((relX - PAD_L) / (W - PAD_L - PAD_R) * (n - 1));
     i = Math.max(0, Math.min(n - 1, i));
     const d = daily[i];
     setHover({
@@ -76,6 +104,9 @@ function BalanceChart({ daily, sym, threshold, breachDate }) {
         <div>
           <div style={{ fontWeight: 700, marginBottom: 4 }}>{fmtDateFull(d.date)}</div>
           <div>Balance: <b style={{ fontFamily: 'var(--mono)' }}>{fmtMoney(d.balance, sym)}</b></div>
+          <div style={{ color: parseFloat(d.net) >= 0 ? 'var(--green)' : 'var(--red)' }}>
+            Net: <b style={{ fontFamily: 'var(--mono)' }}>{parseFloat(d.net) >= 0 ? '+' : ''}{fmtMoney(d.net, sym)}</b>
+          </div>
           <div style={{ color: 'var(--green)' }}>Inflow: {fmtMoney(d.inflow, sym)}</div>
           <div style={{ color: 'var(--red)' }}>Outflow: {fmtMoney(d.outflow, sym)}</div>
         </div>
@@ -85,32 +116,51 @@ function BalanceChart({ daily, sym, threshold, breachDate }) {
 
   return (
     <div style={{ position: 'relative' }}>
-      <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} width="100%" height={H} preserveAspectRatio="none"
+      <svg ref={svgRef} viewBox={`0 0 ${W} ${TOTAL_H}`} width="100%" height={TOTAL_H} preserveAspectRatio="none"
         onMouseMove={handleMove} onMouseLeave={() => setHover(null)} style={{ display: 'block', cursor: 'crosshair' }}>
-        {/* gridlines */}
-        {[0.25, 0.5, 0.75].map(f => (
-          <line key={f} x1={PAD_L} x2={W - PAD_R} y1={PAD_T + f * (H - PAD_T - PAD_B)} y2={PAD_T + f * (H - PAD_T - PAD_B)} stroke="var(--border)" strokeWidth={1} opacity={0.5} />
+        <text x={PAD_L} y={10} fontSize={10} fontFamily="var(--mono)" fill="var(--muted)" letterSpacing="0.05em">PROJECTED CASH BALANCE</text>
+
+        {/* Panel 1: balance line */}
+        {[0, 0.5, 1].map(f => (
+          <line key={f} x1={PAD_L} x2={W - PAD_R} y1={f * P1H} y2={f * P1H} stroke="var(--border)" strokeWidth={1} opacity={0.5} />
         ))}
-        {/* zero line */}
-        <line x1={PAD_L} x2={W - PAD_R} y1={zeroY} y2={zeroY} stroke="var(--border2)" strokeWidth={1} />
-        {/* minimum-threshold reference line - a status color (amber), not a categorical
-            hue, since it marks a state (danger zone) rather than a data series */}
         {thresholdY !== null && (
           <>
             <line x1={PAD_L} x2={W - PAD_R} y1={thresholdY} y2={thresholdY} stroke="var(--amber)" strokeWidth={1.5} strokeDasharray="4,4" opacity={0.8} />
-            <text x={W - PAD_R} y={thresholdY - 5} textAnchor="end" fontSize={10} fill="var(--amber)" fontFamily="var(--mono)">Minimum threshold</text>
+            <text x={W - PAD_R} y={thresholdY - 5} textAnchor="end" fontSize={10} fill="var(--amber)" fontFamily="var(--mono)">Min threshold {fmtMoney(threshold, sym)}</text>
           </>
         )}
-        <path d={areaPath} fill="var(--accent)" opacity={0.08} />
-        <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth={2} />
-        {/* breach marker */}
-        {breachDate && daily.some(d => d.date === breachDate) && (
-          <circle cx={x(daily.findIndex(d => d.date === breachDate))} cy={y(parseFloat(daily.find(d => d.date === breachDate).balance))} r={4} fill="var(--red)" />
+        <path d={areaPath} fill="var(--accent)" opacity={0.1} />
+        <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+        <circle cx={x(lowIdx)} cy={y1(parseFloat(daily[lowIdx].balance))} r={5} fill={belowThreshold ? 'var(--red)' : 'var(--accent)'} stroke="var(--bg2)" strokeWidth={2} />
+        <text x={x(lowIdx)} y={y1(parseFloat(daily[lowIdx].balance)) - 12} textAnchor={lowIdx > n - 12 ? 'end' : 'middle'} fontSize={11} fontFamily="var(--mono)" fontWeight={600} fill={belowThreshold ? 'var(--red)' : 'var(--text)'}>
+          Low {fmtMoney(daily[lowIdx].balance, sym)} · {fmtDate(daily[lowIdx].date)}
+        </text>
+        {breachDate && daily.some(d => d.date === breachDate) && breachDate !== daily[lowIdx].date && (
+          <circle cx={x(daily.findIndex(d => d.date === breachDate))} cy={y1(parseFloat(daily.find(d => d.date === breachDate).balance))} r={4} fill="var(--red)" />
         )}
-        {hover && <line x1={x(hover.i)} x2={x(hover.i)} y1={PAD_T} y2={H - PAD_B} stroke="var(--muted)" strokeWidth={1} opacity={0.4} />}
-        {hover && <circle cx={x(hover.i)} cy={y(values[hover.i])} r={3.5} fill="var(--accent)" />}
+
+        {/* Panel 2: daily net flow, green/red columns */}
+        <text x={PAD_L} y={p2Y0 - 8} fontSize={10} fontFamily="var(--mono)" fill="var(--muted)" letterSpacing="0.05em">DAILY NET FLOW</text>
+        <line x1={PAD_L} x2={W - PAD_R} y1={baseline2} y2={baseline2} stroke="var(--border)" strokeWidth={1} opacity={0.5} />
+        {daily.map((d, i) => {
+          const net = parseFloat(d.net);
+          if (Math.abs(net) < 0.01) return null;
+          const positive = net > 0;
+          const yv = y2(net);
+          return (
+            <path key={i} d={roundedBarPath(x(i), positive ? yv : baseline2, positive ? baseline2 : yv, barW, positive)}
+              fill={positive ? 'var(--green)' : 'var(--red)'} opacity={0.9} />
+          );
+        })}
+
+        {/* shared crosshair across both panels */}
+        {hover && <line x1={x(hover.i)} x2={x(hover.i)} y1={0} y2={p2Y0 + P2H} stroke="var(--muted)" strokeWidth={1} opacity={0.4} />}
+        {hover && <circle cx={x(hover.i)} cy={y1(balances[hover.i])} r={3.5} fill="var(--accent)" stroke="var(--bg2)" strokeWidth={1.5} />}
+
+        {/* shared x-axis */}
         {ticks.map(i => (
-          <text key={i} x={x(i)} y={H - 8} textAnchor="middle" fontSize={10} fill="var(--muted)" fontFamily="var(--mono)">{fmtDate(daily[i].date)}</text>
+          <text key={i} x={x(i)} y={p2Y0 + P2H + 16} textAnchor={i === 0 ? 'start' : i === n - 1 ? 'end' : 'middle'} fontSize={10} fill="var(--muted)" fontFamily="var(--mono)">{fmtDate(daily[i].date)}</text>
         ))}
       </svg>
       <HoverTooltip tip={hover} />
@@ -193,7 +243,15 @@ export default function CashFlowProjection() {
 
       <div style={cardStyle}>
         <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>Projected balance</div>
-        <BalanceChart daily={daily} sym={sym} threshold={threshold} breachDate={data.threshold_breach_date} />
+        <CashFlowChart daily={daily} sym={sym} threshold={threshold} breachDate={data.threshold_breach_date} />
+        <div style={{ display: 'flex', gap: 16, marginTop: 4 }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--green)' }} />Cash in
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+            <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--red)' }} />Cash out
+          </div>
+        </div>
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
           <AssumptionsSummary data={data} />
         </div>
