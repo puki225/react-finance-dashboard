@@ -3599,11 +3599,14 @@ app.put('/api/cashflow-assumptions', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Procurement assumptions — one row per parent ASIN. Lists every parent ASIN with any
-// child SKU (so the Settings page has something to configure even before a row exists -
-// unconfigured ones come back with the table's own defaults, not a missing entry), along
-// with enough product context (name/image, variant count, current combined sellable stock)
-// for the Settings list to be readable without a second round trip.
+// Procurement assumptions — one row per product family, keyed by parent ASIN for a SKU
+// that's part of a variant family, or by the SKU's own ASIN for a standalone listing with
+// no parent_asin (a family of one) - so a loose ASIN still gets a row instead of silently
+// having no way to configure procurement at all. Lists every family with any SKU (so the
+// Settings page has something to configure even before a row exists - unconfigured ones
+// come back with the table's own defaults, not a missing entry), along with enough product
+// context (name/image, variant count, current combined sellable stock) for the Settings
+// list to be readable without a second round trip.
 app.get('/api/procurement-assumptions', async (req, res) => {
   try {
     const result = await pool.query(`
@@ -3617,7 +3620,10 @@ app.get('/api/procurement-assumptions', async (req, res) => {
         SELECT DISTINCT ON (sku) sku, title FROM amazon_order_lines WHERE title IS NOT NULL ORDER BY sku, synced_at DESC
       ),
       parents AS (
-        SELECT sp.parent_asin,
+        -- A SKU with no parent_asin is a standalone listing (not part of a variant family) -
+        -- its own ASIN is its family of one, so it still gets a row here instead of being
+        -- silently dropped from Procurement entirely.
+        SELECT COALESCE(sp.parent_asin, sp.asin) AS parent_asin,
           COUNT(*)::int AS sku_count,
           (ARRAY_AGG(COALESCE(sp.product_name, ot.title) ORDER BY sp.sku) FILTER (WHERE COALESCE(sp.product_name, ot.title) IS NOT NULL))[1] AS product_name,
           (ARRAY_AGG(sp.image_url ORDER BY sp.sku) FILTER (WHERE sp.image_url IS NOT NULL))[1] AS image_url,
@@ -3625,8 +3631,8 @@ app.get('/api/procurement-assumptions', async (req, res) => {
         FROM sku_parameters sp
         LEFT JOIN latest_stock ls ON ls.sku = sp.sku
         LEFT JOIN order_title ot ON ot.sku = sp.sku
-        WHERE sp.parent_asin IS NOT NULL
-        GROUP BY sp.parent_asin
+        WHERE COALESCE(sp.parent_asin, sp.asin) IS NOT NULL
+        GROUP BY COALESCE(sp.parent_asin, sp.asin)
       )
       SELECT p.parent_asin, p.sku_count, p.product_name, p.image_url, p.sellable_units,
         COALESCE(pa.procurement_lead_days, 90) AS procurement_lead_days,
@@ -5451,7 +5457,10 @@ app.get('/api/cashflow', async (req, res) => {
     // cashflow_assumptions, dropped as redundant once this per-product simulation existed).
     const [skuInputsResult, procurementAssumptionsResult] = await Promise.all([
       pool.query(`
-        SELECT sp.sku, sp.parent_asin,
+        -- A SKU with no parent_asin is a standalone listing, not part of a variant family -
+        -- its own ASIN is its family of one, matching GET /api/procurement-assumptions so a
+        -- loose ASIN configured there actually gets simulated here too.
+        SELECT sp.sku, COALESCE(sp.parent_asin, sp.asin) AS parent_asin,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
           COALESCE(avg30.avg_price, lp.last_price) AS asp,
           COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
@@ -5488,7 +5497,7 @@ app.get('/api/cashflow', async (req, res) => {
             AND (ce0.effective_to IS NULL OR ce0.effective_to >= CURRENT_DATE)
           ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
-        WHERE sp.parent_asin IS NOT NULL
+        WHERE COALESCE(sp.parent_asin, sp.asin) IS NOT NULL
       `),
       pool.query('SELECT * FROM procurement_assumptions'),
     ]);
