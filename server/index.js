@@ -5169,10 +5169,23 @@ app.get('/api/cashflow', async (req, res) => {
     const SETTLEMENT_LOOKBACK_DAYS = 180;
     const AMAZON_CADENCE_FALLBACK_DAYS = 14;
     const SHOPIFY_CADENCE_FALLBACK_DAYS = 7;
+    // Recurring costs that don't scale with sales at all - PPC spend tracks ad decisions,
+    // not order volume, and storage/subscription/disposal fees track inventory volume and
+    // time, billed roughly monthly regardless of that period's sales. Modeled as a flat
+    // daily run-rate (trailing 2-week average) projected across the whole horizon, instead
+    // of being smeared into a sales-proportional ratio the way order-level fees are below.
+    const RECURRING_COST_LOOKBACK_DAYS = 14;
+    // FBA storage/disposal fees and the account subscription fee - the "account-level,
+    // not-sales-driven" slice of ServiceFeeEventList (see amazon-spapi-proxy's finance
+    // sync). Reserve debit/credit and coupon/deal participation fees are deliberately left
+    // out: reserve movements are balance-sheet noise (they net to ~0 and aren't a real
+    // cost), and coupon/deal fees are promo-decision-driven, not a steady run-rate like these.
+    const ACCOUNT_FEE_TYPES = ['FBAStorageFee', 'FBALongTermStorageFee', 'FBADisposalFee', 'Subscription'];
 
     const [
       perSkuHistoryResult, perSkuForecastResult, perSkuChannelMixResult,
       amazonRatioResult, shopifyRatioResult, amazonSettlementResult, shopifySettlementResult,
+      accountFeesRatioWindowResult, accountFeesRecentResult, ppcRecentResult,
     ] = await Promise.all([
       // Real (refund-netted) revenue, per SKU per channel, for the recent history window -
       // this is the exact truth for what already sold where, so the historical portion of
@@ -5239,6 +5252,20 @@ app.get('/api/cashflow', async (req, res) => {
       // almost exactly every 14 days (lump sums), Shopify's payouts are sparse and irregular.
       pool.query(`SELECT DISTINCT fund_transfer_date::date AS date FROM amazon_payouts WHERE fund_transfer_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
       pool.query(`SELECT DISTINCT payout_date::date AS date FROM shopify_payouts WHERE status = 'paid' AND payout_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
+      // Account-level fees (storage/disposal/subscription) over the SAME trailing window as
+      // the Amazon fee ratio below, so their amount can be subtracted out of that ratio's fee
+      // total - they're about to be modeled as their own explicit outflow, and would be
+      // double-counted if left blended into the sales-proportional ratio too.
+      pool.query(`SELECT COALESCE(SUM(ABS(amount)), 0) AS total FROM amazon_account_fees WHERE fee_type = ANY($1::text[]) AND posted_date >= CURRENT_DATE - 180`, [ACCOUNT_FEE_TYPES]),
+      // Same fee types, trailing RECURRING_COST_LOOKBACK_DAYS only - this is the recent
+      // run-rate actually projected forward as a daily outflow.
+      pool.query(`SELECT COALESCE(SUM(ABS(amount)), 0) AS total FROM amazon_account_fees WHERE fee_type = ANY($1::text[]) AND posted_date::date >= CURRENT_DATE - $2::int AND posted_date::date < CURRENT_DATE`, [ACCOUNT_FEE_TYPES, RECURRING_COST_LOOKBACK_DAYS]),
+      // PPC (TACoS) spend - real ad cost, confirmed NOT deducted from the Amazon settlement
+      // for this account (amazon_payouts.total_other, where Amazon would fold
+      // ProductAdsPaymentEventList if it billed ads that way, is £0 on every settlement) -
+      // it's charged separately, so it's a genuinely separate outflow, not part of the
+      // payout ratio at all.
+      pool.query(`SELECT COALESCE(SUM(cost), 0) AS total FROM amazon_ppc_product_performance WHERE report_date::date >= CURRENT_DATE - $1::int AND report_date::date < CURRENT_DATE`, [RECURRING_COST_LOOKBACK_DAYS]),
     ]);
 
     // Clamped the same way this app's forecast model bounds its own growth-factor ratios -
@@ -5246,10 +5273,25 @@ app.get('/api/cashflow', async (req, res) => {
     const clipRatio = (r) => Math.min(Math.max(r, 0.3), 1.1);
     const amazonRow = amazonRatioResult.rows[0];
     const amazonGross = parseFloat(amazonRow.gross || 0);
-    const amazonPayoutRatio = amazonGross > 0 ? clipRatio(1 - parseFloat(amazonRow.fees || 0) / amazonGross) : 0.7;
+    // total_fees (from amazon_payouts) bundles order-level fees (referral, FBA fulfillment,
+    // etc. - these genuinely scale with sales, so a ratio-of-settled-revenue is a reasonable
+    // model for them) together with account-level fees like storage, which do NOT scale with
+    // sales. Subtract the account-level slice back out so the ratio only represents the
+    // sales-proportional part; the account-level part is added back as its own flat outflow
+    // below (accountFeeDailyOutflow), timed by its own recent run-rate instead.
+    const accountFeesInRatioWindow = parseFloat(accountFeesRatioWindowResult.rows[0].total || 0);
+    const amazonOrderLevelFees = Math.max(0, parseFloat(amazonRow.fees || 0) - accountFeesInRatioWindow);
+    const amazonPayoutRatio = amazonGross > 0 ? clipRatio(1 - amazonOrderLevelFees / amazonGross) : 0.7;
     const shopifyRow = shopifyRatioResult.rows[0];
     const shopifyGross = parseFloat(shopifyRow.gross || 0);
     const shopifyPayoutRatio = shopifyGross > 0 ? clipRatio(parseFloat(shopifyRow.paid || 0) / shopifyGross) : 0.95;
+
+    // Flat daily run-rate for PPC + storage/account fees, from the trailing 2-week actual -
+    // projected across the whole horizon and added as an outflow below (not deducted from
+    // inflow directly: neither is part of the Amazon/Shopify settlement itself for this
+    // account, they're separate cash leaving the business).
+    const ppcDailyOutflow = parseFloat(ppcRecentResult.rows[0].total || 0) / RECURRING_COST_LOOKBACK_DAYS;
+    const accountFeeDailyOutflow = parseFloat(accountFeesRecentResult.rows[0].total || 0) / RECURRING_COST_LOOKBACK_DAYS;
 
     // Per-SKU forecast, keyed for lookup - shared by the channel split right below and by
     // the Procurement simulation further down.
@@ -5394,6 +5436,12 @@ app.get('/api/cashflow', async (req, res) => {
       }
     }
 
+    // PPC + storage/account fees, projected forward at their trailing 2-week daily run rate.
+    if (ppcDailyOutflow > 0 || accountFeeDailyOutflow > 0) {
+      for (let i = 0; i < horizonDays; i++) {
+        addOutflow(addDays(todayStr, i), ppcDailyOutflow + accountFeeDailyOutflow);
+      }
+    }
 
     // Procurement: for every SKU whose parent ASIN has configured replenishment
     // assumptions (Settings -> Procurement), simulate day by day when it'll need
@@ -5531,6 +5579,13 @@ app.get('/api/cashflow', async (req, res) => {
           last_settlement_date: shopifySettlementDates.length ? shopifySettlementDates[shopifySettlementDates.length - 1] : null,
           next_settlement_date: addDays(todayStr, shopifySettlementOffsets[0]),
         },
+      },
+      // Recurring, non-sales-proportional costs projected forward at their trailing 2-week
+      // daily run rate and folded into the outflow above - surfaced here so that outflow
+      // isn't a mystery number, same "always show why" convention as procurement_orders.
+      recurring_costs: {
+        ppc: { daily_amount: fx(ppcDailyOutflow).toFixed(2), lookback_days: RECURRING_COST_LOOKBACK_DAYS },
+        storage_and_account_fees: { daily_amount: fx(accountFeeDailyOutflow).toFixed(2), lookback_days: RECURRING_COST_LOOKBACK_DAYS },
       },
       daily,
       min_balance: minBalance.toFixed(2),
