@@ -14,6 +14,52 @@ const cardStyle = { background: 'var(--bg2)', border: '1px solid var(--border)',
 const statCardStyle = { ...cardStyle, flex: 1, minWidth: 200, padding: '16px 18px' };
 const cardLabel = { fontSize: 11, fontWeight: 600, color: 'var(--muted)', letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 8 };
 const cardValue = { fontSize: 22, fontWeight: 700, fontFamily: 'var(--mono)' };
+const toggleBtn = (active) => ({
+  padding: '5px 11px', borderRadius: 6, fontSize: 11, fontWeight: 600, cursor: 'pointer',
+  border: '1px solid ' + (active ? 'var(--accent)' : 'var(--border2)'),
+  background: active ? 'var(--accent)25' : 'transparent',
+  color: active ? 'var(--accent2)' : 'var(--muted)',
+  fontFamily: 'var(--font)',
+});
+
+const WINDOWS = [
+  { id: 30, label: '30d' },
+  { id: 60, label: '60d' },
+  { id: 90, label: '90d' },
+  { id: 180, label: '6mo' },
+];
+const GRANULARITIES = [
+  { id: 'daily', label: 'Daily' },
+  { id: 'weekly', label: 'Weekly' },
+];
+
+// Calendar-week-aligned (Monday start) - same convention Sales Forecast's own weekly
+// bucketing already uses. £ figures (inflow/outflow/net) sum across the week; balance is a
+// point-in-time reading, not additive, so it takes the last day actually present in that
+// week rather than a sum or average.
+function weekKey(dateStr) {
+  const d = new Date(dateStr);
+  const day = d.getUTCDay();
+  const diffToMonday = (day === 0 ? -6 : 1) - day;
+  const monday = new Date(d); monday.setUTCDate(d.getUTCDate() + diffToMonday);
+  return monday.toISOString().slice(0, 10);
+}
+function bucketWeekly(daily) {
+  const buckets = new Map();
+  for (const d of daily) {
+    const key = weekKey(d.date);
+    const cur = buckets.get(key) || { key, inflow: 0, outflow: 0, net: 0, balance: d.balance, date: d.date };
+    cur.inflow += parseFloat(d.inflow);
+    cur.outflow += parseFloat(d.outflow);
+    cur.net += parseFloat(d.net);
+    cur.balance = d.balance; // daily arrives date-ascending, so the last write wins
+    cur.date = d.date;
+    buckets.set(key, cur);
+  }
+  return [...buckets.values()]
+    .sort((a, b) => (a.key < b.key ? -1 : 1))
+    .map(b => ({ date: b.date, inflow: b.inflow.toFixed(2), outflow: b.outflow.toFixed(2), net: b.net.toFixed(2), balance: b.balance }));
+}
 
 // Same fast custom tooltip pattern as Sales Forecast/PVM - native `title` has a fixed OS
 // delay; portalled to document.body so it can't get clipped by a card's own overflow.
@@ -54,7 +100,7 @@ function roundedBarPath(cx, yTop, yBottom, w, positive) {
 // between them is arbitrary, not real (the #1 charting mistake). Sharing an x-axis and a
 // crosshair instead still reads as one cohesive chart - a dip up top lines up exactly with
 // its cause below - without inventing a fake relationship between two unrelated scales.
-function CashFlowChart({ daily, sym, threshold, breachDate }) {
+function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
   const [hover, setHover] = useState(null);
   const svgRef = React.useRef(null);
   const n = daily.length;
@@ -141,7 +187,7 @@ function CashFlowChart({ daily, sym, threshold, breachDate }) {
         )}
 
         {/* Panel 2: daily net flow, green/red columns */}
-        <text x={PAD_L} y={p2Y0 - 8} fontSize={10} fontFamily="var(--mono)" fill="var(--muted)" letterSpacing="0.05em">DAILY NET FLOW</text>
+        <text x={PAD_L} y={p2Y0 - 8} fontSize={10} fontFamily="var(--mono)" fill="var(--muted)" letterSpacing="0.05em">{granularity === 'weekly' ? 'WEEKLY' : 'DAILY'} NET FLOW</text>
         <line x1={PAD_L} x2={W - PAD_R} y1={baseline2} y2={baseline2} stroke="var(--border)" strokeWidth={1} opacity={0.5} />
         {daily.map((d, i) => {
           const net = parseFloat(d.net);
@@ -176,23 +222,27 @@ function AssumptionsSummary({ data }) {
       <span>·</span>
       <span>Shopify payout lag: <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{a.shopify_payout_lag_days}d</b></span>
       <span>·</span>
-      <span>Amazon payout ratio (trailing 12mo): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{(data.payout_ratios.amazon * 100).toFixed(0)}%</b></span>
-      <span>·</span>
-      <span>Supplier terms: <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{a.supplier_payment_terms_days}d</b></span>
+      <span>Amazon payout ratio (trailing 180d): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{(data.payout_ratios.amazon * 100).toFixed(0)}%</b></span>
     </div>
   );
 }
 
 export default function CashFlowProjection() {
-  const { data, loading, error } = useApi('/api/cashflow');
+  const [windowDays, setWindowDays] = useState(90);
+  const [granularity, setGranularity] = useState('daily');
+  const { data, loading, error } = useApi('/api/cashflow', { horizon_days: windowDays });
   const sym = data?.currency_symbol || '£';
+
+  const daily = useMemo(() => {
+    const raw = data?.daily || [];
+    return granularity === 'weekly' ? bucketWeekly(raw) : raw;
+  }, [data, granularity]);
 
   if (loading) return <div style={{ padding: 32, textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>;
   if (error) return <div style={{ padding: 32, textAlign: 'center', color: 'var(--red)' }}>{error}</div>;
   if (!data) return null;
 
-  const daily = data.daily || [];
-  const todayBalance = daily[0]?.balance;
+  const todayBalance = data.daily?.[0]?.balance;
   const threshold = parseFloat(data.assumptions.minimum_cash_threshold || 0);
   const willBreach = !!data.threshold_breach_date;
   const stale = data.balance_stale_days !== null && data.balance_stale_days > 7;
@@ -202,8 +252,8 @@ export default function CashFlowProjection() {
       <div>
         <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>Cash Flow</h1>
         <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>
-          Projected daily cash position — sales forecast converted to actual payout timing, minus planned spend and known outflows.
-          Configure assumptions under Settings → Cash Flow.
+          Projected cash position — sales forecast converted to actual payout timing, minus procurement replenishment and known outflows.
+          Configure payout assumptions under Settings → Cash Flow, and per-product lead times under Settings → Procurement.
         </p>
       </div>
 
@@ -242,8 +292,22 @@ export default function CashFlowProjection() {
       </div>
 
       <div style={cardStyle}>
-        <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 12 }}>Projected balance</div>
-        <CashFlowChart daily={daily} sym={sym} threshold={threshold} breachDate={data.threshold_breach_date} />
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12, marginBottom: 12 }}>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>Projected balance</div>
+          <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {WINDOWS.map(w => (
+                <button key={w.id} style={toggleBtn(windowDays === w.id)} onClick={() => setWindowDays(w.id)}>{w.label}</button>
+              ))}
+            </div>
+            <div style={{ display: 'flex', gap: 4 }}>
+              {GRANULARITIES.map(g => (
+                <button key={g.id} style={toggleBtn(granularity === g.id)} onClick={() => setGranularity(g.id)}>{g.label}</button>
+              ))}
+            </div>
+          </div>
+        </div>
+        <CashFlowChart daily={daily} sym={sym} threshold={threshold} breachDate={data.threshold_breach_date} granularity={granularity} />
         <div style={{ display: 'flex', gap: 16, marginTop: 4 }}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
             <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--green)' }} />Cash in
