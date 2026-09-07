@@ -225,8 +225,6 @@ app.use(express.static(path.join(__dirname, '../client/build')));
     await pool.query(`
       CREATE TABLE IF NOT EXISTS cashflow_assumptions (
         id SERIAL PRIMARY KEY,
-        amazon_payout_lag_days SMALLINT DEFAULT 14,
-        shopify_payout_lag_days SMALLINT DEFAULT 3,
         known_outflows JSONB,
         minimum_cash_threshold NUMERIC DEFAULT 5000,
         opening_bank_balance NUMERIC DEFAULT 0,
@@ -244,6 +242,15 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_30d;
       ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_60d;
       ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_90d;
+      -- amazon_payout_lag_days/shopify_payout_lag_days were a manual guess at a flat
+      -- per-day settlement lag - superseded by GET /api/cashflow detecting each channel's
+      -- REAL settlement cadence from amazon_payouts.fund_transfer_date/shopify_payouts.
+      -- payout_date history and batching revenue into lump-sum inflow events on the actual
+      -- (or projected) settlement dates, matching how Amazon/Shopify really pay out
+      -- (biweekly lump sums, not a smooth daily trickle) - same "drop the redundant manual
+      -- field once a real one exists" reasoning as the columns above.
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS amazon_payout_lag_days;
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS shopify_payout_lag_days;
       -- Replenishment assumptions, one row per parent ASIN (variants of one product share
       -- the same manufacturer/shipping lane, so lead time and payment terms are set once
       -- per product, not once per SKU). GET /api/cashflow uses these to simulate when each
@@ -3562,16 +3569,10 @@ app.get('/api/cashflow-assumptions', async (req, res) => {
 
 app.put('/api/cashflow-assumptions', async (req, res) => {
   const {
-    amazon_payout_lag_days, shopify_payout_lag_days, known_outflows,
+    known_outflows,
     minimum_cash_threshold, opening_bank_balance, balance_as_of_date,
   } = req.body;
-  const smallint = (v) => (v === undefined ? undefined : parseInt(v, 10));
   const numeric = (v) => (v === undefined ? undefined : parseFloat(v));
-  for (const [name, v] of [['amazon_payout_lag_days', amazon_payout_lag_days], ['shopify_payout_lag_days', shopify_payout_lag_days]]) {
-    if (v !== undefined && (isNaN(parseInt(v, 10)) || parseInt(v, 10) < 0)) {
-      return res.status(400).json({ error: `${name} must be a non-negative integer` });
-    }
-  }
   if (known_outflows !== undefined && known_outflows !== null && !Array.isArray(known_outflows)) {
     return res.status(400).json({ error: 'known_outflows must be an array' });
   }
@@ -3582,17 +3583,14 @@ app.put('/api/cashflow-assumptions', async (req, res) => {
     }
     const result = await pool.query(`
       UPDATE cashflow_assumptions SET
-        amazon_payout_lag_days = COALESCE($1, amazon_payout_lag_days),
-        shopify_payout_lag_days = COALESCE($2, shopify_payout_lag_days),
-        known_outflows = COALESCE($3::jsonb, known_outflows),
-        minimum_cash_threshold = COALESCE($4, minimum_cash_threshold),
-        opening_bank_balance = COALESCE($5, opening_bank_balance),
-        balance_as_of_date = COALESCE($6, balance_as_of_date),
+        known_outflows = COALESCE($1::jsonb, known_outflows),
+        minimum_cash_threshold = COALESCE($2, minimum_cash_threshold),
+        opening_bank_balance = COALESCE($3, opening_bank_balance),
+        balance_as_of_date = COALESCE($4, balance_as_of_date),
         updated_at = NOW()
-      WHERE id = $7
+      WHERE id = $5
       RETURNING *
     `, [
-      smallint(amazon_payout_lag_days) ?? null, smallint(shopify_payout_lag_days) ?? null,
       known_outflows !== undefined ? JSON.stringify(known_outflows) : null,
       numeric(minimum_cash_threshold) ?? null, numeric(opening_bank_balance) ?? null, balance_as_of_date ?? null,
       existing.rows[0].id,
@@ -5163,46 +5161,62 @@ app.get('/api/cashflow', async (req, res) => {
       assumptionsResult = await pool.query('INSERT INTO cashflow_assumptions DEFAULT VALUES RETURNING *');
     }
     const a = assumptionsResult.rows[0];
-    const amazonLag = a.amazon_payout_lag_days ?? 14;
-    const shopifyLag = a.shopify_payout_lag_days ?? 3;
-    const lookbackDays = Math.max(amazonLag, shopifyLag, 1);
 
-    const [historyResult, forecastResult, channelMixResult, amazonRatioResult, shopifyRatioResult] = await Promise.all([
-      // Actual (refund-adjusted) revenue for the lookback window before "today" - a payout
-      // landing in the next `amazon_payout_lag_days` is driven by sales that ALREADY
-      // happened, not by the forecast, so the first stretch of projected inflow needs real
-      // history, not forecast_date rows (sales_forecast only has forecast_date >= today).
+    // How far back real per-SKU-per-channel history needs to reach: far enough to cover
+    // the gap since the last real settlement on the slower-paying channel (Shopify's is
+    // irregular and can run several weeks between payouts), with margin.
+    const CHANNEL_LOOKBACK_DAYS = 60;
+    const SETTLEMENT_LOOKBACK_DAYS = 180;
+    const AMAZON_CADENCE_FALLBACK_DAYS = 14;
+    const SHOPIFY_CADENCE_FALLBACK_DAYS = 7;
+
+    const [
+      perSkuHistoryResult, perSkuForecastResult, perSkuChannelMixResult,
+      amazonRatioResult, shopifyRatioResult, amazonSettlementResult, shopifySettlementResult,
+    ] = await Promise.all([
+      // Real (refund-netted) revenue, per SKU per channel, for the recent history window -
+      // this is the exact truth for what already sold where, so the historical portion of
+      // the inflow model needs no channel-mix ratio at all (only the forward FORECAST
+      // portion below does, since sales_forecast has no channel column).
       pool.query(`
         WITH rev AS (
-          SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+          SELECT sku, channel, order_date::date AS date,
+            SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
           WHERE order_date::date >= CURRENT_DATE - $1::int AND order_date::date < CURRENT_DATE
-          GROUP BY 1
+            AND channel IN ('amazon', 'shopify')
+          GROUP BY sku, channel, 3
         ),
         ref AS (
-          SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
+          SELECT sku, channel, refund_date::date AS date,
+            SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
           WHERE refund_date::date >= CURRENT_DATE - $1::int AND refund_date::date < CURRENT_DATE
-          GROUP BY 1
+            AND channel IN ('amazon', 'shopify')
+          GROUP BY sku, channel, 3
         )
-        SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
-        FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
-        ORDER BY 1
-      `, [lookbackDays]),
+        SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.channel, ref.channel) AS channel,
+          COALESCE(rev.date, ref.date) AS date,
+          (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
+        FROM rev FULL OUTER JOIN ref
+          ON ref.sku = rev.sku AND ref.channel = rev.channel AND ref.date = rev.date
+      `, [CHANNEL_LOOKBACK_DAYS]),
+      // Per-SKU forecast, day by day - shared below by both the channel split and the
+      // Procurement simulation further down, which each need this same per-SKU/per-day shape.
       pool.query(`
-        SELECT forecast_date::date AS date, SUM(forecast_revenue)::numeric(12,2) AS revenue
+        SELECT sku, forecast_date::date AS date, forecast_revenue
         FROM sales_forecast
         WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
-        GROUP BY 1 ORDER BY 1
       `, [horizonDays]),
-      // Trailing 90-day channel split - sales_forecast isn't itself channel-split, so a
-      // single blended forecast total is divided between Amazon/Shopify by how revenue has
-      // actually split recently, before each half is lagged by its own channel's payout timing.
+      // Trailing 180-day channel split, PER SKU - a single catalog-wide ratio would hide
+      // real per-SKU variation (checked live against this account: per-SKU Shopify share
+      // ranges from 0% to ~14% of that SKU's own revenue), so each SKU's channel-blind
+      // forecast is split by its OWN trailing mix, not one blended catalog-wide number.
       pool.query(`
-        SELECT channel, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
+        SELECT sku, channel, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
         FROM v_sku_revenue
-        WHERE order_date::date >= CURRENT_DATE - 90 AND channel IN ('amazon', 'shopify')
-        GROUP BY channel
+        WHERE order_date::date >= CURRENT_DATE - 180 AND channel IN ('amazon', 'shopify')
+        GROUP BY sku, channel
       `),
       // Trailing (180d) fee ratio, NOT net_transfer/total_sales - net_transfer also carries
       // whatever a settlement period's beginning_balance happened to be, and an account that
@@ -5220,20 +5234,12 @@ app.get('/api/cashflow', async (req, res) => {
       // `net_amount` is a separate column the sync never populates, always 0) is a stable
       // basis here without the same caveat.
       pool.query(`SELECT SUM(amount) AS paid, SUM(gross_sales) AS gross FROM shopify_payouts WHERE payout_date >= CURRENT_DATE - 180`),
+      // Real settlement dates, to detect each channel's ACTUAL payout cadence instead of
+      // assuming a smooth daily lag - checked live against this account: Amazon settles
+      // almost exactly every 14 days (lump sums), Shopify's payouts are sparse and irregular.
+      pool.query(`SELECT DISTINCT fund_transfer_date::date AS date FROM amazon_payouts WHERE fund_transfer_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
+      pool.query(`SELECT DISTINCT payout_date::date AS date FROM shopify_payouts WHERE status = 'paid' AND payout_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
     ]);
-
-    const revenueByDate = new Map();
-    for (const r of historyResult.rows) revenueByDate.set(isoDate(r.date), parseFloat(r.revenue));
-    for (const r of forecastResult.rows) revenueByDate.set(isoDate(r.date), parseFloat(r.revenue));
-
-    const channelRevenue = { amazon: 0, shopify: 0 };
-    for (const r of channelMixResult.rows) channelRevenue[r.channel] = parseFloat(r.revenue);
-    const totalChannelRevenue = channelRevenue.amazon + channelRevenue.shopify;
-    // No channel history at all yet (a brand new catalog) - default Amazon-only rather
-    // than an arbitrary 50/50 guess, since every account synced by this app so far sells
-    // there first.
-    const amazonShare = totalChannelRevenue > 0 ? channelRevenue.amazon / totalChannelRevenue : 1;
-    const shopifyShare = totalChannelRevenue > 0 ? channelRevenue.shopify / totalChannelRevenue : 0;
 
     // Clamped the same way this app's forecast model bounds its own growth-factor ratios -
     // a thin or noisy trailing window shouldn't be able to imply an absurd payout multiple.
@@ -5244,6 +5250,128 @@ app.get('/api/cashflow', async (req, res) => {
     const shopifyRow = shopifyRatioResult.rows[0];
     const shopifyGross = parseFloat(shopifyRow.gross || 0);
     const shopifyPayoutRatio = shopifyGross > 0 ? clipRatio(parseFloat(shopifyRow.paid || 0) / shopifyGross) : 0.95;
+
+    // Per-SKU forecast, keyed for lookup - shared by the channel split right below and by
+    // the Procurement simulation further down.
+    const forecastBySku = new Map();
+    for (const r of perSkuForecastResult.rows) {
+      if (!forecastBySku.has(r.sku)) forecastBySku.set(r.sku, new Map());
+      forecastBySku.get(r.sku).set(isoDate(r.date), parseFloat(r.forecast_revenue));
+    }
+
+    // Per-SKU trailing channel mix, with a catalog-wide fallback for a SKU with no channel
+    // history of its own yet (too new, or not yet listed on that channel).
+    const skuChannelRevenue = new Map();
+    for (const r of perSkuChannelMixResult.rows) {
+      if (!skuChannelRevenue.has(r.sku)) skuChannelRevenue.set(r.sku, { amazon: 0, shopify: 0 });
+      skuChannelRevenue.get(r.sku)[r.channel] = parseFloat(r.revenue);
+    }
+    let catalogAmazonRevenue = 0, catalogShopifyRevenue = 0;
+    for (const v of skuChannelRevenue.values()) { catalogAmazonRevenue += v.amazon; catalogShopifyRevenue += v.shopify; }
+    const catalogTotalRevenue = catalogAmazonRevenue + catalogShopifyRevenue;
+    // No channel history at all yet (a brand new catalog) - default Amazon-only rather
+    // than an arbitrary 50/50 guess, since every account synced by this app so far sells
+    // there first.
+    const catalogAmazonShare = catalogTotalRevenue > 0 ? catalogAmazonRevenue / catalogTotalRevenue : 1;
+    const catalogShopifyShare = catalogTotalRevenue > 0 ? catalogShopifyRevenue / catalogTotalRevenue : 0;
+    const skuChannelShare = (sku) => {
+      const v = skuChannelRevenue.get(sku);
+      const total = v ? v.amazon + v.shopify : 0;
+      if (total <= 0) return { amazon: catalogAmazonShare, shopify: catalogShopifyShare };
+      return { amazon: v.amazon / total, shopify: v.shopify / total };
+    };
+
+    // Catalog-wide per-channel revenue by date: real per-SKU-per-channel history (exact, no
+    // ratio needed) for the past, each SKU's forecast split by ITS OWN trailing channel mix
+    // for the future (sales_forecast itself carries no channel column).
+    const amazonRevenueByDate = new Map();
+    const shopifyRevenueByDate = new Map();
+    const addRevenue = (map, date, amount) => map.set(date, (map.get(date) || 0) + amount);
+    for (const r of perSkuHistoryResult.rows) {
+      const date = isoDate(r.date);
+      const amount = parseFloat(r.revenue);
+      if (r.channel === 'amazon') addRevenue(amazonRevenueByDate, date, amount);
+      else if (r.channel === 'shopify') addRevenue(shopifyRevenueByDate, date, amount);
+    }
+    for (const [sku, byDate] of forecastBySku) {
+      const share = skuChannelShare(sku);
+      for (const [date, revenue] of byDate) {
+        addRevenue(amazonRevenueByDate, date, revenue * share.amazon);
+        addRevenue(shopifyRevenueByDate, date, revenue * share.shopify);
+      }
+    }
+
+    // Amazon/Shopify don't pay out daily - they settle in discrete lump sums on a cadence
+    // (checked live: this account's Amazon payouts land almost exactly every 14 days;
+    // Shopify's are sparser and irregular). Detect each channel's real cadence from its own
+    // settlement history, project future settlement dates by stepping forward from the last
+    // real one, then batch ALL revenue accrued in each period into ONE inflow landing on
+    // that date - instead of smearing the same total across a smooth per-day lag, which is
+    // not the shape any real marketplace payout takes.
+    const dayOffset = (dateStr) => Math.round((new Date(dateStr) - new Date(todayStr)) / 86400000);
+    const detectCadenceDays = (sortedDates, fallback) => {
+      if (sortedDates.length < 2) return fallback;
+      const gaps = [];
+      for (let i = 1; i < sortedDates.length; i++) {
+        const gap = dayOffset(sortedDates[i]) - dayOffset(sortedDates[i - 1]);
+        if (gap > 0) gaps.push(gap);
+      }
+      if (!gaps.length) return fallback;
+      gaps.sort((x, y) => x - y);
+      const mid = Math.floor(gaps.length / 2);
+      // Median, not mean - robust to a single anomalous gap (e.g. the reserve-hold period
+      // found earlier for this account: near-zero payouts for months then one release).
+      return gaps.length % 2 ? gaps[mid] : Math.round((gaps[mid - 1] + gaps[mid]) / 2);
+    };
+    const projectSettlementOffsets = (lastSettlementOffset, cadenceDays, horizon) => {
+      const offsets = [];
+      let cur = lastSettlementOffset;
+      while (cur < horizon) { cur += cadenceDays; offsets.push(cur); }
+      return offsets;
+    };
+    const batchIntoSettlements = (revenueByDate, lastSettlementOffset, offsets, payoutRatio, horizon) => {
+      const events = [];
+      let periodStartOffset = lastSettlementOffset + 1;
+      // A channel whose last REAL settlement is far enough in the past (relative to its
+      // detected cadence) projects several settlement dates that land before "today" -
+      // there's no future event to attach that period's revenue to, so carry it forward
+      // instead of dropping it: it's real, already-accrued revenue that hasn't been paid
+      // out yet, and lands in the next settlement that's actually still ahead of us.
+      let carried = 0;
+      for (const settleOffset of offsets) {
+        let periodRevenue = carried;
+        for (let d = periodStartOffset; d <= settleOffset; d++) periodRevenue += revenueByDate.get(addDays(todayStr, d)) || 0;
+        if (settleOffset >= 0 && settleOffset < horizon) {
+          events.push({ day: settleOffset, amount: periodRevenue * payoutRatio });
+          carried = 0;
+        } else if (settleOffset < 0) {
+          carried = periodRevenue;
+        } else {
+          carried = 0;
+        }
+        periodStartOffset = settleOffset + 1;
+      }
+      return events;
+    };
+
+    const amazonSettlementDates = amazonSettlementResult.rows.map(r => isoDate(r.date));
+    const shopifySettlementDates = shopifySettlementResult.rows.map(r => isoDate(r.date));
+    const amazonCadenceDays = detectCadenceDays(amazonSettlementDates, AMAZON_CADENCE_FALLBACK_DAYS);
+    const shopifyCadenceDays = detectCadenceDays(shopifySettlementDates, SHOPIFY_CADENCE_FALLBACK_DAYS);
+    const lastAmazonSettlementOffset = amazonSettlementDates.length
+      ? dayOffset(amazonSettlementDates[amazonSettlementDates.length - 1]) : -amazonCadenceDays;
+    const lastShopifySettlementOffset = shopifySettlementDates.length
+      ? dayOffset(shopifySettlementDates[shopifySettlementDates.length - 1]) : -shopifyCadenceDays;
+    const amazonSettlementOffsets = projectSettlementOffsets(lastAmazonSettlementOffset, amazonCadenceDays, horizonDays);
+    const shopifySettlementOffsets = projectSettlementOffsets(lastShopifySettlementOffset, shopifyCadenceDays, horizonDays);
+    const amazonSettlementEvents = batchIntoSettlements(amazonRevenueByDate, lastAmazonSettlementOffset, amazonSettlementOffsets, amazonPayoutRatio, horizonDays);
+    const shopifySettlementEvents = batchIntoSettlements(shopifyRevenueByDate, lastShopifySettlementOffset, shopifySettlementOffsets, shopifyPayoutRatio, horizonDays);
+
+    const inflowsByDate = new Map();
+    for (const e of [...amazonSettlementEvents, ...shopifySettlementEvents]) {
+      const date = addDays(todayStr, e.day);
+      inflowsByDate.set(date, (inflowsByDate.get(date) || 0) + e.amount);
+    }
 
     // known_outflows expanded into concrete dated occurrences within the horizon - see the
     // shape documented on GET /api/cashflow-assumptions.
@@ -5307,19 +5435,6 @@ app.get('/api/cashflow', async (req, res) => {
       pool.query('SELECT * FROM procurement_assumptions'),
     ]);
     const procurementByParent = new Map(procurementAssumptionsResult.rows.map(r => [r.parent_asin, r]));
-    // Per-SKU forecast, day by day - the same rows forecastResult already summed, but kept
-    // per-SKU here since each SKU has its own stock/velocity/cost and needs its own
-    // simulation, only sharing the parent's lead-time/payment-timing assumption.
-    const perSkuForecastResult = await pool.query(`
-      SELECT sku, forecast_date::date AS date, forecast_revenue
-      FROM sales_forecast
-      WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
-    `, [horizonDays]);
-    const forecastBySku = new Map();
-    for (const r of perSkuForecastResult.rows) {
-      if (!forecastBySku.has(r.sku)) forecastBySku.set(r.sku, new Map());
-      forecastBySku.get(r.sku).set(isoDate(r.date), parseFloat(r.forecast_revenue));
-    }
 
     const SAFETY_BUFFER = 1.10; // 10% timing buffer on the reorder trigger only (not the
     // order quantity) - under steady demand this settles into a permanent safety-stock
@@ -5377,11 +5492,7 @@ app.get('/api/cashflow', async (req, res) => {
     const threshold = fx(a.minimum_cash_threshold || 0);
     for (let i = 0; i < horizonDays; i++) {
       const date = addDays(todayStr, i);
-      const amazonSourceDate = addDays(date, -amazonLag);
-      const shopifySourceDate = addDays(date, -shopifyLag);
-      const amazonInflow = (revenueByDate.get(amazonSourceDate) || 0) * amazonShare * amazonPayoutRatio;
-      const shopifyInflow = (revenueByDate.get(shopifySourceDate) || 0) * shopifyShare * shopifyPayoutRatio;
-      const inflow = fx(amazonInflow + shopifyInflow);
+      const inflow = fx(inflowsByDate.get(date) || 0);
       const outflow = fx(outflowsByDate.get(date) || 0);
       balance += inflow - outflow;
       if (balance < minBalance) { minBalance = balance; minBalanceDate = date; }
@@ -5398,15 +5509,29 @@ app.get('/api/cashflow', async (req, res) => {
     res.json({
       currency_symbol: sym,
       today: todayStr,
-      has_forecast: forecastResult.rows.length > 0,
+      has_forecast: perSkuForecastResult.rows.length > 0,
       assumptions: {
         ...a,
         opening_bank_balance: fx(a.opening_bank_balance || 0).toFixed(2),
         minimum_cash_threshold: fx(a.minimum_cash_threshold || 0).toFixed(2),
       },
       balance_stale_days: staleDays,
-      channel_mix: { amazon: amazonShare, shopify: shopifyShare },
+      // Catalog-wide, trailing-180d - informational only now (the actual inflow above uses
+      // each SKU's OWN channel mix; this blended figure is a summary, not an input).
+      channel_mix: { amazon: catalogAmazonShare, shopify: catalogShopifyShare },
       payout_ratios: { amazon: amazonPayoutRatio, shopify: shopifyPayoutRatio },
+      settlement: {
+        amazon: {
+          cadence_days: amazonCadenceDays,
+          last_settlement_date: amazonSettlementDates.length ? amazonSettlementDates[amazonSettlementDates.length - 1] : null,
+          next_settlement_date: addDays(todayStr, amazonSettlementOffsets[0]),
+        },
+        shopify: {
+          cadence_days: shopifyCadenceDays,
+          last_settlement_date: shopifySettlementDates.length ? shopifySettlementDates[shopifySettlementDates.length - 1] : null,
+          next_settlement_date: addDays(todayStr, shopifySettlementOffsets[0]),
+        },
+      },
       daily,
       min_balance: minBalance.toFixed(2),
       min_balance_date: minBalanceDate,

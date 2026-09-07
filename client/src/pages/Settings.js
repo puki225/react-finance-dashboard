@@ -704,8 +704,6 @@ function CashFlowSettings() {
         opening_bank_balance: fmtDisplay(assumptions.opening_bank_balance),
         balance_as_of_date: assumptions.balance_as_of_date ? assumptions.balance_as_of_date.slice(0, 10) : today(),
         minimum_cash_threshold: fmtDisplay(assumptions.minimum_cash_threshold),
-        amazon_payout_lag_days: assumptions.amazon_payout_lag_days ?? 14,
-        shopify_payout_lag_days: assumptions.shopify_payout_lag_days ?? 3,
       });
       setOutflows((assumptions.known_outflows || []).map(o => ({ ...o, id: o.id || newOutflowId() })));
     }
@@ -746,13 +744,14 @@ function CashFlowSettings() {
         <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Cash Flow Assumptions</h2>
         <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
           The Cash Flow tab projects forward from the sales forecast and your real payout history —
-          these are the manual inputs it can't derive on its own: your current bank position,
-          how long Amazon/Shopify actually take to pay out, and any other known outflows like
-          salaries or rent. Inventory/procurement spend isn't set here — see Settings → Procurement,
-          which works out timing and amounts per product from real stock levels and lead times
-          instead of a manual guess. All monetary figures here are entered in GBP (converted to
-          your reporting currency for display elsewhere), unlike other pages in Settings that let
-          you pick a currency per entry.
+          these are the manual inputs it can't derive on its own: your current bank position and
+          any other known outflows like salaries or rent. Amazon/Shopify payout timing isn't set
+          here either — the projection detects each channel's real settlement cadence from your
+          synced payout history instead of a manual lag guess. Inventory/procurement spend isn't
+          set here — see Settings → Procurement, which works out timing and amounts per product
+          from real stock levels and lead times instead of a manual guess. All monetary figures
+          here are entered in GBP (converted to your reporting currency for display elsewhere),
+          unlike other pages in Settings that let you pick a currency per entry.
         </p>
       </div>
 
@@ -769,20 +768,6 @@ function CashFlowSettings() {
           <div>
             <label style={labelStyle}>Minimum Cash Threshold (£ GBP)</label>
             <input type="number" step="0.01" style={inputStyle} value={form.minimum_cash_threshold} onChange={e => setField('minimum_cash_threshold', e.target.value)} />
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 10 }}>Payout Timing</div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
-            <div>
-              <label style={labelStyle}>Amazon Payout Lag (days)</label>
-              <input type="number" min="0" style={inputStyle} value={form.amazon_payout_lag_days} onChange={e => setField('amazon_payout_lag_days', e.target.value)} />
-            </div>
-            <div>
-              <label style={labelStyle}>Shopify Payout Lag (days)</label>
-              <input type="number" min="0" style={inputStyle} value={form.shopify_payout_lag_days} onChange={e => setField('shopify_payout_lag_days', e.target.value)} />
-            </div>
           </div>
         </div>
 

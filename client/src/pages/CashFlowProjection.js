@@ -215,12 +215,13 @@ function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
 }
 
 function AssumptionsSummary({ data }) {
-  const a = data.assumptions;
+  const s = data.settlement || {};
+  const fmtNext = (d) => d ? new Date(d + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—';
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 12, color: 'var(--muted)' }}>
-      <span>Amazon payout lag: <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{a.amazon_payout_lag_days}d</b></span>
+      <span>Amazon settles every <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{s.amazon?.cadence_days}d</b> (next ~{fmtNext(s.amazon?.next_settlement_date)})</span>
       <span>·</span>
-      <span>Shopify payout lag: <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{a.shopify_payout_lag_days}d</b></span>
+      <span>Shopify settles every <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{s.shopify?.cadence_days}d</b> (next ~{fmtNext(s.shopify?.next_settlement_date)})</span>
       <span>·</span>
       <span>Amazon payout ratio (trailing 180d): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{(data.payout_ratios.amazon * 100).toFixed(0)}%</b></span>
     </div>
