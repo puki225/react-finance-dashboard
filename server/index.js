@@ -225,18 +225,25 @@ app.use(express.static(path.join(__dirname, '../client/build')));
     await pool.query(`
       CREATE TABLE IF NOT EXISTS cashflow_assumptions (
         id SERIAL PRIMARY KEY,
-        supplier_payment_terms_days SMALLINT DEFAULT 30,
         amazon_payout_lag_days SMALLINT DEFAULT 14,
         shopify_payout_lag_days SMALLINT DEFAULT 3,
-        planned_spend_30d NUMERIC DEFAULT 0,
-        planned_spend_60d NUMERIC DEFAULT 0,
-        planned_spend_90d NUMERIC DEFAULT 0,
         known_outflows JSONB,
         minimum_cash_threshold NUMERIC DEFAULT 5000,
         opening_bank_balance NUMERIC DEFAULT 0,
         balance_as_of_date DATE,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       );
+      -- supplier_payment_terms_days and planned_spend_30/60/90d were a single global,
+      -- manually-guessed outflow bucket - fully superseded by procurement_assumptions
+      -- (below), which derives the same thing per parent ASIN from real current stock and
+      -- forecasted velocity instead of a guess, with its own per-product lead
+      -- time/payment-timing pair. Keeping both was genuinely redundant (and confusing -
+      -- two different "when do I pay" answers for the same money). Drop them outright
+      -- rather than leave unused columns/UI around.
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS supplier_payment_terms_days;
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_30d;
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_60d;
+      ALTER TABLE cashflow_assumptions DROP COLUMN IF EXISTS planned_spend_90d;
       -- Replenishment assumptions, one row per parent ASIN (variants of one product share
       -- the same manufacturer/shipping lane, so lead time and payment terms are set once
       -- per product, not once per SKU). GET /api/cashflow uses these to simulate when each
@@ -246,9 +253,28 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       CREATE TABLE IF NOT EXISTS procurement_assumptions (
         parent_asin TEXT PRIMARY KEY,
         procurement_lead_days SMALLINT NOT NULL DEFAULT 90,
-        payment_days_before_arrival SMALLINT NOT NULL DEFAULT 0,
+        payment_days_after_order SMALLINT NOT NULL DEFAULT 0,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      -- Reframe payment timing from "days before arrival" to "days after order placed" -
+      -- same [0, procurement_lead_days] range, opposite anchor, easier for a user to answer
+      -- directly from their own supplier terms. A straight column rename would silently
+      -- reinterpret any already-saved value under the new meaning (a saved "pay 30 days
+      -- before arrival" is NOT "pay 30 days after order" unless lead time happens to be
+      -- exactly 60 days) - transform the value (new = lead_days - old), not just the name.
+      DO $$
+      BEGIN
+        IF EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'procurement_assumptions' AND column_name = 'payment_days_before_arrival'
+        ) THEN
+          ALTER TABLE procurement_assumptions ADD COLUMN IF NOT EXISTS payment_days_after_order SMALLINT;
+          UPDATE procurement_assumptions SET payment_days_after_order = procurement_lead_days - payment_days_before_arrival;
+          ALTER TABLE procurement_assumptions ALTER COLUMN payment_days_after_order SET NOT NULL;
+          ALTER TABLE procurement_assumptions ALTER COLUMN payment_days_after_order SET DEFAULT 0;
+          ALTER TABLE procurement_assumptions DROP COLUMN payment_days_before_arrival;
+        END IF;
+      END $$;
     `);
   } catch (e) {
     console.error('[db] Cash flow schema migration failed:', e.message);
@@ -3536,13 +3562,12 @@ app.get('/api/cashflow-assumptions', async (req, res) => {
 
 app.put('/api/cashflow-assumptions', async (req, res) => {
   const {
-    supplier_payment_terms_days, amazon_payout_lag_days, shopify_payout_lag_days,
-    planned_spend_30d, planned_spend_60d, planned_spend_90d, known_outflows,
+    amazon_payout_lag_days, shopify_payout_lag_days, known_outflows,
     minimum_cash_threshold, opening_bank_balance, balance_as_of_date,
   } = req.body;
   const smallint = (v) => (v === undefined ? undefined : parseInt(v, 10));
   const numeric = (v) => (v === undefined ? undefined : parseFloat(v));
-  for (const [name, v] of [['supplier_payment_terms_days', supplier_payment_terms_days], ['amazon_payout_lag_days', amazon_payout_lag_days], ['shopify_payout_lag_days', shopify_payout_lag_days]]) {
+  for (const [name, v] of [['amazon_payout_lag_days', amazon_payout_lag_days], ['shopify_payout_lag_days', shopify_payout_lag_days]]) {
     if (v !== undefined && (isNaN(parseInt(v, 10)) || parseInt(v, 10) < 0)) {
       return res.status(400).json({ error: `${name} must be a non-negative integer` });
     }
@@ -3557,22 +3582,17 @@ app.put('/api/cashflow-assumptions', async (req, res) => {
     }
     const result = await pool.query(`
       UPDATE cashflow_assumptions SET
-        supplier_payment_terms_days = COALESCE($1, supplier_payment_terms_days),
-        amazon_payout_lag_days = COALESCE($2, amazon_payout_lag_days),
-        shopify_payout_lag_days = COALESCE($3, shopify_payout_lag_days),
-        planned_spend_30d = COALESCE($4, planned_spend_30d),
-        planned_spend_60d = COALESCE($5, planned_spend_60d),
-        planned_spend_90d = COALESCE($6, planned_spend_90d),
-        known_outflows = COALESCE($7::jsonb, known_outflows),
-        minimum_cash_threshold = COALESCE($8, minimum_cash_threshold),
-        opening_bank_balance = COALESCE($9, opening_bank_balance),
-        balance_as_of_date = COALESCE($10, balance_as_of_date),
+        amazon_payout_lag_days = COALESCE($1, amazon_payout_lag_days),
+        shopify_payout_lag_days = COALESCE($2, shopify_payout_lag_days),
+        known_outflows = COALESCE($3::jsonb, known_outflows),
+        minimum_cash_threshold = COALESCE($4, minimum_cash_threshold),
+        opening_bank_balance = COALESCE($5, opening_bank_balance),
+        balance_as_of_date = COALESCE($6, balance_as_of_date),
         updated_at = NOW()
-      WHERE id = $11
+      WHERE id = $7
       RETURNING *
     `, [
-      smallint(supplier_payment_terms_days) ?? null, smallint(amazon_payout_lag_days) ?? null, smallint(shopify_payout_lag_days) ?? null,
-      numeric(planned_spend_30d) ?? null, numeric(planned_spend_60d) ?? null, numeric(planned_spend_90d) ?? null,
+      smallint(amazon_payout_lag_days) ?? null, smallint(shopify_payout_lag_days) ?? null,
       known_outflows !== undefined ? JSON.stringify(known_outflows) : null,
       numeric(minimum_cash_threshold) ?? null, numeric(opening_bank_balance) ?? null, balance_as_of_date ?? null,
       existing.rows[0].id,
@@ -3612,7 +3632,7 @@ app.get('/api/procurement-assumptions', async (req, res) => {
       )
       SELECT p.parent_asin, p.sku_count, p.product_name, p.image_url, p.sellable_units,
         COALESCE(pa.procurement_lead_days, 90) AS procurement_lead_days,
-        COALESCE(pa.payment_days_before_arrival, 0) AS payment_days_before_arrival,
+        COALESCE(pa.payment_days_after_order, 0) AS payment_days_after_order,
         (pa.parent_asin IS NOT NULL) AS configured
       FROM parents p
       LEFT JOIN procurement_assumptions pa ON pa.parent_asin = p.parent_asin
@@ -3625,21 +3645,21 @@ app.get('/api/procurement-assumptions', async (req, res) => {
 app.put('/api/procurement-assumptions/:parent_asin', async (req, res) => {
   const { parent_asin } = req.params;
   const leadDays = parseInt(req.body.procurement_lead_days, 10);
-  const payBefore = parseInt(req.body.payment_days_before_arrival, 10);
+  const payAfter = parseInt(req.body.payment_days_after_order, 10);
   if (isNaN(leadDays) || leadDays <= 0) {
     return res.status(400).json({ error: 'procurement_lead_days must be a positive integer' });
   }
-  if (isNaN(payBefore) || payBefore < 0 || payBefore > leadDays) {
-    return res.status(400).json({ error: 'payment_days_before_arrival must be between 0 and procurement_lead_days' });
+  if (isNaN(payAfter) || payAfter < 0 || payAfter > leadDays) {
+    return res.status(400).json({ error: 'payment_days_after_order must be between 0 and procurement_lead_days' });
   }
   try {
     const result = await pool.query(`
-      INSERT INTO procurement_assumptions (parent_asin, procurement_lead_days, payment_days_before_arrival, updated_at)
+      INSERT INTO procurement_assumptions (parent_asin, procurement_lead_days, payment_days_after_order, updated_at)
       VALUES ($1, $2, $3, NOW())
       ON CONFLICT (parent_asin) DO UPDATE SET
-        procurement_lead_days = $2, payment_days_before_arrival = $3, updated_at = NOW()
+        procurement_lead_days = $2, payment_days_after_order = $3, updated_at = NOW()
       RETURNING *
-    `, [parent_asin, leadDays, payBefore]);
+    `, [parent_asin, leadDays, payAfter]);
     res.json(result.rows[0]);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
@@ -5145,7 +5165,6 @@ app.get('/api/cashflow', async (req, res) => {
     const a = assumptionsResult.rows[0];
     const amazonLag = a.amazon_payout_lag_days ?? 14;
     const shopifyLag = a.shopify_payout_lag_days ?? 3;
-    const supplierTermsDays = a.supplier_payment_terms_days ?? 30;
     const lookbackDays = Math.max(amazonLag, shopifyLag, 1);
 
     const [historyResult, forecastResult, channelMixResult, amazonRatioResult, shopifyRatioResult] = await Promise.all([
@@ -5247,32 +5266,13 @@ app.get('/api/cashflow', async (req, res) => {
       }
     }
 
-    // Planned inventory/supplier spend: planned_spend_Nd is spread evenly across a "we
-    // expect to commit to this much new spend" window (days 1-30, 31-60, 61-90 from
-    // today), then the actual CASH outflow for a day's worth of commitment lands
-    // `supplier_payment_terms_days` later - the whole reason that assumption exists
-    // alongside the three spend buckets rather than being a bare £ figure on its own.
-    const spendBuckets = [
-      { from: 1, to: 30, total: parseFloat(a.planned_spend_30d || 0) },
-      { from: 31, to: 60, total: parseFloat(a.planned_spend_60d || 0) },
-      { from: 61, to: 90, total: parseFloat(a.planned_spend_90d || 0) },
-    ];
-    for (const b of spendBuckets) {
-      const days = b.to - b.from + 1;
-      if (!b.total || days <= 0) continue;
-      const perDay = b.total / days;
-      for (let commitDay = b.from; commitDay <= b.to; commitDay++) {
-        const cashDay = commitDay + supplierTermsDays;
-        if (cashDay >= horizonDays) continue;
-        addOutflow(addDays(todayStr, cashDay), perDay);
-      }
-    }
 
     // Procurement: for every SKU whose parent ASIN has configured replenishment
-    // assumptions (Settings -> Cash Flow -> Procurement), simulate day by day when it'll
-    // need reordering and add the resulting cash outflow - a data-driven replacement for
-    // guessing planned_spend_Nd on products this precise, still available as a manual
-    // fallback for anything left unconfigured.
+    // assumptions (Settings -> Procurement), simulate day by day when it'll need
+    // reordering and add the resulting cash outflow. A SKU whose parent has no configured
+    // assumptions contributes no procurement outflow at all - there's no manual-guess
+    // fallback bucket anymore (that was supplier_payment_terms_days/planned_spend_Nd on
+    // cashflow_assumptions, dropped as redundant once this per-product simulation existed).
     const [skuInputsResult, procurementAssumptionsResult] = await Promise.all([
       pool.query(`
         SELECT sp.sku, sp.parent_asin,
@@ -5328,7 +5328,7 @@ app.get('/api/cashflow', async (req, res) => {
     // mystery number - same "always show why" convention as Sales Forecast's exclusions.
     for (const row of skuInputsResult.rows) {
       const pa = procurementByParent.get(row.parent_asin);
-      if (!pa) continue; // unconfigured - falls back to the manual planned_spend buckets above
+      if (!pa) continue; // unconfigured - no procurement outflow modeled for this SKU yet
       const asp = parseFloat(row.last_price || 0);
       const unitCost = parseFloat(row.unit_cogs || 0);
       if (asp <= 0 || unitCost <= 0) continue; // no price/cost basis to convert £ forecast -> units or units -> £
@@ -5338,7 +5338,7 @@ app.get('/api/cashflow', async (req, res) => {
         return rev ? rev / asp : 0;
       });
       const leadDays = pa.procurement_lead_days;
-      const paymentDaysBeforeArrival = pa.payment_days_before_arrival;
+      const paymentDaysAfterOrder = pa.payment_days_after_order;
 
       let stock = row.sellable;
       const pendingArrivals = [];
@@ -5358,7 +5358,7 @@ app.get('/api/cashflow', async (req, res) => {
         const orderQty = leadDays * avgVelocity;
         const arrivalDay = day + leadDays;
         pendingArrivals.push({ day: arrivalDay, qty: orderQty });
-        const paymentDay = arrivalDay - paymentDaysBeforeArrival;
+        const paymentDay = day + paymentDaysAfterOrder;
         const amount = orderQty * unitCost;
         if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount);
         procurementOrders.push({

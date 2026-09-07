@@ -706,10 +706,6 @@ function CashFlowSettings() {
         minimum_cash_threshold: fmtDisplay(assumptions.minimum_cash_threshold),
         amazon_payout_lag_days: assumptions.amazon_payout_lag_days ?? 14,
         shopify_payout_lag_days: assumptions.shopify_payout_lag_days ?? 3,
-        supplier_payment_terms_days: assumptions.supplier_payment_terms_days ?? 30,
-        planned_spend_30d: fmtDisplay(assumptions.planned_spend_30d),
-        planned_spend_60d: fmtDisplay(assumptions.planned_spend_60d),
-        planned_spend_90d: fmtDisplay(assumptions.planned_spend_90d),
       });
       setOutflows((assumptions.known_outflows || []).map(o => ({ ...o, id: o.id || newOutflowId() })));
     }
@@ -751,10 +747,12 @@ function CashFlowSettings() {
         <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
           The Cash Flow tab projects forward from the sales forecast and your real payout history —
           these are the manual inputs it can't derive on its own: your current bank position,
-          how long Amazon/Shopify actually take to pay out, planned inventory spend, and any other
-          known outflows like salaries or rent. All monetary figures here are entered in GBP
-          (converted to your reporting currency for display elsewhere), unlike other pages in
-          Settings that let you pick a currency per entry.
+          how long Amazon/Shopify actually take to pay out, and any other known outflows like
+          salaries or rent. Inventory/procurement spend isn't set here — see Settings → Procurement,
+          which works out timing and amounts per product from real stock levels and lead times
+          instead of a manual guess. All monetary figures here are entered in GBP (converted to
+          your reporting currency for display elsewhere), unlike other pages in Settings that let
+          you pick a currency per entry.
         </p>
       </div>
 
@@ -784,32 +782,6 @@ function CashFlowSettings() {
             <div>
               <label style={labelStyle}>Shopify Payout Lag (days)</label>
               <input type="number" min="0" style={inputStyle} value={form.shopify_payout_lag_days} onChange={e => setField('shopify_payout_lag_days', e.target.value)} />
-            </div>
-            <div>
-              <label style={labelStyle}>Supplier Payment Terms (days)</label>
-              <input type="number" min="0" style={inputStyle} value={form.supplier_payment_terms_days} onChange={e => setField('supplier_payment_terms_days', e.target.value)} />
-            </div>
-          </div>
-        </div>
-
-        <div>
-          <div style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', marginBottom: 2 }}>Planned Inventory Spend</div>
-          <p style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 10, lineHeight: 1.5 }}>
-            Spend you expect to commit to over each window — the actual cash outflow lands
-            {' '}{form.supplier_payment_terms_days} days after it's committed, per your supplier terms above.
-          </p>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16 }}>
-            <div>
-              <label style={labelStyle}>Next 30 Days (£ GBP)</label>
-              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_30d} onChange={e => setField('planned_spend_30d', e.target.value)} />
-            </div>
-            <div>
-              <label style={labelStyle}>Next 60 Days (£ GBP)</label>
-              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_60d} onChange={e => setField('planned_spend_60d', e.target.value)} />
-            </div>
-            <div>
-              <label style={labelStyle}>Next 90 Days (£ GBP)</label>
-              <input type="number" step="0.01" style={inputStyle} value={form.planned_spend_90d} onChange={e => setField('planned_spend_90d', e.target.value)} />
             </div>
           </div>
         </div>
@@ -864,23 +836,23 @@ function CashFlowSettings() {
 
 function ProcurementRow({ row, onRefresh }) {
   const [leadDays, setLeadDays] = useState(row.procurement_lead_days);
-  const [payBefore, setPayBefore] = useState(row.payment_days_before_arrival);
+  const [payAfter, setPayAfter] = useState(row.payment_days_after_order);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
 
-  const dirty = parseInt(leadDays, 10) !== row.procurement_lead_days || parseInt(payBefore, 10) !== row.payment_days_before_arrival;
+  const dirty = parseInt(leadDays, 10) !== row.procurement_lead_days || parseInt(payAfter, 10) !== row.payment_days_after_order;
 
   const handleSave = async () => {
     const lead = parseInt(leadDays, 10);
-    const before = parseInt(payBefore, 10);
+    const after = parseInt(payAfter, 10);
     if (isNaN(lead) || lead <= 0) { setError('Lead time must be a positive number of days'); return; }
-    if (isNaN(before) || before < 0 || before > lead) { setError('Payment days before arrival must be between 0 and the lead time'); return; }
+    if (isNaN(after) || after < 0 || after > lead) { setError('Payment days after order must be between 0 and the lead time'); return; }
     setSaving(true); setError(null); setSaved(false);
     try {
       const resp = await fetch(`/api/procurement-assumptions/${encodeURIComponent(row.parent_asin)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ procurement_lead_days: lead, payment_days_before_arrival: before }),
+        body: JSON.stringify({ procurement_lead_days: lead, payment_days_after_order: after }),
       });
       const d = await resp.json();
       if (!resp.ok) throw new Error(d.error || 'Save failed');
@@ -905,8 +877,8 @@ function ProcurementRow({ row, onRefresh }) {
         <input type="number" min="1" style={inputStyle} value={leadDays} onChange={e => { setLeadDays(e.target.value); setSaved(false); }} />
       </div>
       <div style={{ flex: '1 1 160px' }}>
-        <label style={labelStyle}>Pay N Days Before Arrival</label>
-        <input type="number" min="0" style={inputStyle} value={payBefore} onChange={e => { setPayBefore(e.target.value); setSaved(false); }} />
+        <label style={labelStyle}>Pay N Days After Order Placed</label>
+        <input type="number" min="0" style={inputStyle} value={payAfter} onChange={e => { setPayAfter(e.target.value); setSaved(false); }} />
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
         {saved && !dirty && <span style={{ fontSize: 11, color: 'var(--green)' }}>✓ Saved</span>}
