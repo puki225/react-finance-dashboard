@@ -4702,7 +4702,18 @@ app.get('/api/pvm', async (req, res) => {
         const w1 = s1Revenue !== 0 ? rev1 / s1Revenue : 0;
         const w2 = s2Revenue !== 0 ? rev2 / s2Revenue : 0;
         const deltaContribution = (w2 * rate2) - (w1 * rate1);
-        const bothPresent = rev1 !== 0 && rev2 !== 0;
+        // Needs BOTH nonzero revenue (to have a rate at all) AND nonzero units in both
+        // periods (to have a per-unit price/cost basis for the driver breakdown below) -
+        // a member can have the former without the latter (e.g. a SKU whose entire volume
+        // for a period was excluded via the Vine toggle: pvmBaseRows deliberately leaves
+        // its revenue untouched but zeroes its units/COGS/fees), and that mismatch used to
+        // let `rateEffect` come out nonzero while the five named drivers stayed stuck at
+        // zero for that same member - the gap between them silently vanished instead of
+        // landing in Mix, which is exactly why the displayed blocks stopped tying to the
+        // scenario-to-scenario delta. Both gates now share this one definition so a member
+        // is either fully decomposed (rate + all five drivers) or fully deferred to Mix -
+        // never split between the two.
+        const bothPresent = rev1 !== 0 && rev2 !== 0 && a.units > 0 && b.units > 0;
         const rateEffect = bothPresent ? w1 * (rate2 - rate1) : 0;
 
         // ─── Rate driver breakdown: Price / Std COGS / Freight / Amazon fees / FBA fees ──
@@ -4711,12 +4722,10 @@ app.get('/api/pvm', async (req, res) => {
         // waterfall attribution (same convention as the £ Price/Volume/Mix bridge, which
         // is also order-dependent). Because each step is "previous rate + this driver's
         // move, nothing else", the five deltas telescope exactly to (rate2 − rate1); no
-        // residual is left over for Mix to silently absorb. Needs a per-unit price, so
-        // members present in only one scenario (bothPresent false, same guard as
-        // rateEffect above) get all-zero drivers — their whole rate delta already isn't
-        // in Rate, it's in Mix, exactly as before this breakdown was added.
+        // residual is left over for Mix to silently absorb. Members failing bothPresent
+        // get all-zero drivers — their whole rate delta already isn't in Rate, it's in Mix.
         let priceDriver = 0, cogsDriver = 0, freightDriver = 0, amzFeeDriver = 0, fbaFeeDriver = 0;
-        if (bothPresent && a.units > 0 && b.units > 0) {
+        if (bothPresent) {
           const price1 = a.revenue / a.units, price2 = b.revenue / b.units;
           const c1_1 = a.cogs_std / a.units,     c1_2 = b.cogs_std / b.units;
           const c2_1 = a.cogs_freight / a.units, c2_2 = b.cogs_freight / b.units;
