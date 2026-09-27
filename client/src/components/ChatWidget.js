@@ -115,9 +115,42 @@ function MaximizeIcon({ maximized }) {
   );
 }
 
+function HistoryIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <path d="M3 12a9 9 0 1 0 3-6.7M3 12V5m0 7h6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+      <path d="M12 8v4l3 2" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+function BackIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <path d="M15 6l-6 6 6 6" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
+// Short, friendly relative timestamp for the conversation list - "just now" through a
+// plain date once it's more than a week old, rather than a raw ISO string.
+function formatRelative(iso) {
+  const then = new Date(iso).getTime();
+  const diffMin = Math.round((Date.now() - then) / 60000);
+  if (diffMin < 1) return 'just now';
+  if (diffMin < 60) return `${diffMin}m ago`;
+  const diffHr = Math.round(diffMin / 60);
+  if (diffHr < 24) return `${diffHr}h ago`;
+  const diffDay = Math.round(diffHr / 24);
+  if (diffDay === 1) return 'yesterday';
+  if (diffDay < 7) return `${diffDay}d ago`;
+  return new Date(iso).toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+}
+
 export default function ChatWidget() {
   const [open, setOpen] = useState(false);
   const [maximized, setMaximized] = useState(false);
+  const [view, setView] = useState('chat'); // 'chat' | 'history'
   const [messages, setMessages] = useState([]); // [{ role, text }]
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -128,6 +161,8 @@ export default function ChatWidget() {
     const stored = localStorage.getItem(STORAGE_KEY);
     return stored ? parseInt(stored, 10) : null;
   });
+  const [conversations, setConversations] = useState([]);
+  const [loadingConversations, setLoadingConversations] = useState(false);
   const listRef = useRef(null);
   const loadedHistoryFor = useRef(null);
 
@@ -191,6 +226,29 @@ export default function ChatWidget() {
     loadedHistoryFor.current = null;
     setMessages([]);
     setError(null);
+    setView('chat');
+  };
+
+  // Backend already returns them newest-first (ORDER BY updated_at DESC) - the active
+  // conversation's own most recent message bumps it back to the top next time this loads.
+  const openHistory = () => {
+    setView('history');
+    setLoadingConversations(true);
+    fetch('/api/chat/conversations')
+      .then(r => r.ok ? r.json() : Promise.reject(new Error(`Request failed: ${r.status}`)))
+      .then(setConversations)
+      .catch(() => setConversations([]))
+      .finally(() => setLoadingConversations(false));
+  };
+
+  const loadConversation = (id) => {
+    if (id !== conversationId) {
+      loadedHistoryFor.current = null;
+      setMessages([]);
+      setConversationId(id);
+      localStorage.setItem(STORAGE_KEY, String(id));
+    }
+    setView('chat');
   };
 
   const handleKeyDown = (e) => {
@@ -235,25 +293,74 @@ export default function ChatWidget() {
             display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexShrink: 0,
           }}>
             <div>
-              <div style={{ fontSize: 13, fontWeight: 700 }}>Assistant</div>
-              <div style={{ fontSize: 10, color: 'var(--muted)' }}>Ask about sales, margin, cash flow, inventory</div>
+              {view === 'history' ? (
+                <div style={{ fontSize: 13, fontWeight: 700 }}>Previous chats</div>
+              ) : (
+                <>
+                  <div style={{ fontSize: 13, fontWeight: 700 }}>Assistant</div>
+                  <div style={{ fontSize: 10, color: 'var(--muted)' }}>Ask about sales, margin, cash flow, inventory</div>
+                </>
+              )}
             </div>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-              {messages.length > 0 && (
-                <button onClick={startNewConversation} title="Start a new conversation" style={{
+              {view === 'history' ? (
+                <button onClick={() => setView('chat')} title="Back to chat" style={{
                   background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
-                  fontSize: 11, padding: '4px 8px', cursor: 'pointer', fontFamily: 'var(--font)',
-                }}>New chat</button>
+                  width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0,
+                }}>
+                  <BackIcon />
+                </button>
+              ) : (
+                <>
+                  <button onClick={openHistory} title="Previous chats" style={{
+                    background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
+                    width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    <HistoryIcon />
+                  </button>
+                  {messages.length > 0 && (
+                    <button onClick={startNewConversation} title="Start a new conversation" style={{
+                      background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
+                      fontSize: 11, padding: '4px 8px', cursor: 'pointer', fontFamily: 'var(--font)',
+                    }}>New chat</button>
+                  )}
+                  <button onClick={() => setMaximized(m => !m)} title={maximized ? 'Restore' : 'Maximize'} style={{
+                    background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
+                    width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0,
+                  }}>
+                    <MaximizeIcon maximized={maximized} />
+                  </button>
+                </>
               )}
-              <button onClick={() => setMaximized(m => !m)} title={maximized ? 'Restore' : 'Maximize'} style={{
-                background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
-                width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0,
-              }}>
-                <MaximizeIcon maximized={maximized} />
-              </button>
             </div>
           </div>
 
+          {view === 'history' ? (
+            <div style={{
+              flex: 1, overflowY: 'auto', padding: 10, display: 'flex', flexDirection: 'column', gap: 4,
+              maxWidth: maximized ? 720 : 'none', width: '100%', margin: maximized ? '0 auto' : 0,
+            }}>
+              {loadingConversations && (
+                <div style={{ color: 'var(--muted)', fontSize: 12, textAlign: 'center', margin: 'auto' }}>Loading…</div>
+              )}
+              {!loadingConversations && conversations.length === 0 && (
+                <div style={{ color: 'var(--muted)', fontSize: 12, textAlign: 'center', margin: 'auto' }}>No previous chats yet.</div>
+              )}
+              {conversations.map(c => (
+                <button key={c.id} onClick={() => loadConversation(c.id)} style={{
+                  textAlign: 'left', background: c.id === conversationId ? 'var(--bg3)' : 'none',
+                  border: '1px solid var(--border)', borderRadius: 8, padding: '8px 10px',
+                  cursor: 'pointer', fontFamily: 'var(--font)', color: 'var(--text)',
+                  display: 'flex', flexDirection: 'column', gap: 2,
+                }}>
+                  <span style={{ fontSize: 12, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {c.title || 'Untitled chat'}
+                  </span>
+                  <span style={{ fontSize: 10, color: 'var(--muted)' }}>{formatRelative(c.updated_at)}</span>
+                </button>
+              ))}
+            </div>
+          ) : (
           <div ref={listRef} style={{
             flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10,
             maxWidth: maximized ? 720 : 'none', width: '100%', margin: maximized ? '0 auto' : 0,
@@ -281,7 +388,9 @@ export default function ChatWidget() {
               <div style={{ alignSelf: 'flex-start', color: 'var(--red)', fontSize: 11, padding: '0 4px' }}>{error}</div>
             )}
           </div>
+          )}
 
+          {view === 'chat' && (
           <div style={{
             padding: 12, borderTop: '1px solid var(--border)', display: 'flex', gap: 8, flexShrink: 0,
             maxWidth: maximized ? 720 : 'none', width: '100%', margin: maximized ? '0 auto' : 0,
@@ -313,6 +422,7 @@ export default function ChatWidget() {
               <SendIcon />
             </button>
           </div>
+          )}
         </div>
       )}
     </>
