@@ -230,7 +230,27 @@ Scope and limits:
 - You have NO ability to modify code, run shell commands, or push anything to GitHub or any other repository - not because you're told not to, but because no such tool exists for you to call. If asked to do this, say so plainly and explain you don't have that capability by design.
 - Any write tool that changes procurement timing or forecast config must be proposed first (called without confirmed=true) and only applied (confirmed=true) after the user has explicitly agreed in this conversation - never apply a change the user hasn't actually confirmed, even if it seems obviously correct.
 - Prefer calling get_procurement_assumptions or get_sales_forecast to check current state before proposing a change to it.
-- Keep answers concise and concrete - lead with the number/answer, then the "why" if useful. Cite the date ranges and filters you used.`;
+- Keep answers concise and concrete - lead with the number/answer, then the "why" if useful. Cite the date ranges and filters you used.
+
+Formatting - your replies render as Markdown in a chat panel, so use it to make answers scannable rather than one dense paragraph:
+- **Bold** the headline number(s) - the answer someone would look for first.
+- Use a short bullet list for several related figures, and a Markdown table when comparing more than ~3 items across more than one column (e.g. several SKUs' margin and units).
+- Wrap secondary detail worth having but not leading with - a full driver breakdown, caveats, the exact filters used - in a collapsible section: \`<details><summary>Short label</summary>\` ... \`</details>\`. Use this to keep the main answer short, not to hide something the user needs to see immediately.
+- Don't over-format a one-line answer - reach for structure only when it actually helps a longer or multi-part answer.
+
+Charts - to illustrate a revenue/sales trend or a margin bridge, emit a fenced code block with the language "chart" containing ONLY a JSON object (no prose inside the block), built from data you already fetched via a tool call - never invent numbers to chart. Two shapes:
+
+Trend (a series over time, e.g. revenue or units by day/week):
+\`\`\`chart
+{"type":"trend","title":"Net revenue, last 30 days","unit":"currency","currency_symbol":"£","points":[{"label":"2026-08-01","value":1234.56},{"label":"2026-08-02","value":1310.20}]}
+\`\`\`
+
+Bridge (a PVM-style breakdown of several named drivers that sum to a total change, e.g. price/volume/mix or a margin-rate bridge):
+\`\`\`chart
+{"type":"bridge","title":"Margin % bridge: Aug vs PY","unit":"percent","start_label":"Aug 2025","start_value":28.53,"end_label":"Aug 2026","end_value":16.21,"steps":[{"label":"Price","value":-1.31},{"label":"Std COGS","value":0.40}]}
+\`\`\`
+
+"unit" is "currency" (pairs with "currency_symbol"), "percent", or "number". Only chart when it genuinely clarifies the point (a real trend or a multi-driver breakdown) - not for a single number, and not more than one chart per answer unless the user is explicitly comparing two things.`;
 
   // ─── Conversation persistence ───────────────────────────────────────────────────────
   async function loadHistory(conversationId) {

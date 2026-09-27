@@ -3,20 +3,31 @@
   "version": "1.0.0",
   "private": true,
   "dependencies": {
+    "date-fns": "^3.3.1",
+    "hast-util-sanitize": "^5.0.2",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
+    "react-markdown": "^10.1.0",
     "react-scripts": "5.0.1",
+    "react-simple-maps": "^3.0.0",
     "recharts": "^2.10.0",
-    "date-fns": "^3.3.1",
-    "react-simple-maps": "^3.0.0"
+    "rehype-raw": "^7.0.0",
+    "rehype-sanitize": "^6.0.0",
+    "remark-gfm": "^4.0.1"
   },
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build"
   },
   "browserslist": {
-    "production": [">0.2%", "not dead", "not op_mini all"],
-    "development": ["last 1 chrome version"]
+    "production": [
+      ">0.2%",
+      "not dead",
+      "not op_mini all"
+    ],
+    "development": [
+      "last 1 chrome version"
+    ]
   },
   "proxy": "http://localhost:3001"
 }

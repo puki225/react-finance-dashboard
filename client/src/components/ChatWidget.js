@@ -1,6 +1,21 @@
 import React, { useState, useRef, useEffect, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import ChatChart from './ChatChart';
 
 const STORAGE_KEY = 'gb_chat_conversation_id';
+
+// Allows only <details>/<summary> on top of the default safe Markdown element set, so the
+// assistant can collapse supporting detail out of the way (per its system prompt) without
+// opening up arbitrary raw HTML from model output - see the sanitize schema's "why" in
+// chat.js's system prompt comment for the paired half of this.
+const sanitizeSchema = {
+  ...defaultSchema,
+  tagNames: [...defaultSchema.tagNames, 'details', 'summary'],
+  attributes: { ...defaultSchema.attributes, details: ['open'] },
+};
 
 // Assistant messages (and the leading turn of a tool round-trip) are stored as an array of
 // content blocks (text/tool_use); a plain user message is stored as a bare string. Tool
@@ -14,6 +29,54 @@ function extractText(content) {
     return text || null;
   }
   return null;
+}
+
+// Fenced ```chart blocks (see chat.js's system prompt for the JSON schema) render as an
+// inline chart instead of a code block; every other fenced/inline code renders normally.
+// `pre` is overridden too, not just `code` - otherwise the chart would still end up nested
+// inside a <pre>, inheriting its monospace/white-space styling.
+const markdownComponents = {
+  code(props) {
+    const { className, children } = props;
+    const match = /language-(\w+)/.exec(className || '');
+    if (match && match[1] === 'chart') {
+      return <ChatChart raw={String(children).replace(/\n$/, '')} />;
+    }
+    return <code className={className}>{children}</code>;
+  },
+  pre(props) {
+    const child = props.children;
+    const isChart = child && child.props && /language-chart/.test(child.props.className || '');
+    if (isChart) return <>{child}</>;
+    return <pre>{props.children}</pre>;
+  },
+};
+
+function MessageBubble({ role, text }) {
+  if (role === 'user') {
+    return (
+      <div style={{
+        alignSelf: 'flex-end', maxWidth: '85%', padding: '8px 12px', borderRadius: 12,
+        background: 'var(--accent)', color: '#fff', fontSize: 13, lineHeight: 1.5,
+        whiteSpace: 'pre-wrap', wordBreak: 'break-word',
+      }}>
+        {text}
+      </div>
+    );
+  }
+  return (
+    <div style={{ alignSelf: 'flex-start', maxWidth: '92%', padding: '8px 12px', borderRadius: 12, background: 'var(--bg3)' }}>
+      <div className="chat-markdown">
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[rehypeRaw, [rehypeSanitize, sanitizeSchema]]}
+          components={markdownComponents}
+        >
+          {text}
+        </ReactMarkdown>
+      </div>
+    </div>
+  );
 }
 
 function ChatIcon() {
@@ -40,8 +103,21 @@ function SendIcon() {
   );
 }
 
+function MaximizeIcon({ maximized }) {
+  return maximized ? (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <path d="M9 3H3v6M15 21h6v-6M3 3l7 7M21 21l-7-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  ) : (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none">
+      <path d="M3 9V3h6M21 15v6h-6M3 3l7 7M21 21l-7-7" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+    </svg>
+  );
+}
+
 export default function ChatWidget() {
   const [open, setOpen] = useState(false);
+  const [maximized, setMaximized] = useState(false);
   const [messages, setMessages] = useState([]); // [{ role, text }]
   const [input, setInput] = useState('');
   const [sending, setSending] = useState(false);
@@ -57,7 +133,7 @@ export default function ChatWidget() {
 
   useEffect(() => {
     if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
-  }, [messages, open]);
+  }, [messages, open, maximized]);
 
   // Load prior turns for a remembered conversation the first time the panel opens, not on
   // every app load - most visits never open the widget at all.
@@ -121,6 +197,16 @@ export default function ChatWidget() {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(); }
   };
 
+  const panelStyle = maximized
+    ? {
+      position: 'fixed', bottom: 24, right: 24, top: 24, left: 24,
+      width: 'auto', height: 'auto', maxWidth: 'none', maxHeight: 'none',
+    }
+    : {
+      position: 'fixed', bottom: 92, right: 24, width: 380, maxWidth: 'calc(100vw - 32px)',
+      height: 560, maxHeight: 'calc(100vh - 140px)',
+    };
+
   return (
     <>
       <button
@@ -140,10 +226,9 @@ export default function ChatWidget() {
 
       {open && (
         <div style={{
-          position: 'fixed', bottom: 92, right: 24, width: 360, maxWidth: 'calc(100vw - 32px)',
-          height: 520, maxHeight: 'calc(100vh - 140px)', background: 'var(--bg2)',
-          border: '1px solid var(--border2)', borderRadius: 16, boxShadow: '0 12px 40px #00000070',
-          display: 'flex', flexDirection: 'column', overflow: 'hidden', zIndex: 1001,
+          ...panelStyle, background: 'var(--bg2)', border: '1px solid var(--border2)', borderRadius: 16,
+          boxShadow: '0 12px 40px #00000070', display: 'flex', flexDirection: 'column',
+          overflow: 'hidden', zIndex: 1001, transition: 'width 0.15s, height 0.15s',
         }}>
           <div style={{
             padding: '14px 16px', borderBottom: '1px solid var(--border)',
@@ -153,15 +238,26 @@ export default function ChatWidget() {
               <div style={{ fontSize: 13, fontWeight: 700 }}>Assistant</div>
               <div style={{ fontSize: 10, color: 'var(--muted)' }}>Ask about sales, margin, cash flow, inventory</div>
             </div>
-            {messages.length > 0 && (
-              <button onClick={startNewConversation} title="Start a new conversation" style={{
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+              {messages.length > 0 && (
+                <button onClick={startNewConversation} title="Start a new conversation" style={{
+                  background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
+                  fontSize: 11, padding: '4px 8px', cursor: 'pointer', fontFamily: 'var(--font)',
+                }}>New chat</button>
+              )}
+              <button onClick={() => setMaximized(m => !m)} title={maximized ? 'Restore' : 'Maximize'} style={{
                 background: 'none', border: '1px solid var(--border2)', borderRadius: 6, color: 'var(--muted)',
-                fontSize: 11, padding: '4px 8px', cursor: 'pointer', fontFamily: 'var(--font)',
-              }}>New chat</button>
-            )}
+                width: 26, height: 26, display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: 'pointer', flexShrink: 0,
+              }}>
+                <MaximizeIcon maximized={maximized} />
+              </button>
+            </div>
           </div>
 
-          <div ref={listRef} style={{ flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div ref={listRef} style={{
+            flex: 1, overflowY: 'auto', padding: 16, display: 'flex', flexDirection: 'column', gap: 10,
+            maxWidth: maximized ? 720 : 'none', width: '100%', margin: maximized ? '0 auto' : 0,
+          }}>
             {unavailable && (
               <div style={{ color: 'var(--muted)', fontSize: 12, lineHeight: 1.6, textAlign: 'center', margin: 'auto' }}>
                 The assistant isn't set up yet — an ANTHROPIC_API_KEY needs to be added to the server's environment.
@@ -175,17 +271,7 @@ export default function ChatWidget() {
                 Ask something like "what was my Amazon margin last month" or "when does SKU X need reordering".
               </div>
             )}
-            {messages.map((m, i) => (
-              <div key={i} style={{
-                alignSelf: m.role === 'user' ? 'flex-end' : 'flex-start',
-                maxWidth: '85%', padding: '8px 12px', borderRadius: 12,
-                background: m.role === 'user' ? 'var(--accent)' : 'var(--bg3)',
-                color: m.role === 'user' ? '#fff' : 'var(--text)',
-                fontSize: 13, lineHeight: 1.5, whiteSpace: 'pre-wrap', wordBreak: 'break-word',
-              }}>
-                {m.text}
-              </div>
-            ))}
+            {messages.map((m, i) => <MessageBubble key={i} role={m.role} text={m.text} />)}
             {sending && (
               <div style={{ alignSelf: 'flex-start', padding: '8px 12px', borderRadius: 12, background: 'var(--bg3)', color: 'var(--muted)', fontSize: 13 }}>
                 …
@@ -196,7 +282,10 @@ export default function ChatWidget() {
             )}
           </div>
 
-          <div style={{ padding: 12, borderTop: '1px solid var(--border)', display: 'flex', gap: 8, flexShrink: 0 }}>
+          <div style={{
+            padding: 12, borderTop: '1px solid var(--border)', display: 'flex', gap: 8, flexShrink: 0,
+            maxWidth: maximized ? 720 : 'none', width: '100%', margin: maximized ? '0 auto' : 0,
+          }}>
             <textarea
               value={input}
               onChange={e => setInput(e.target.value)}
