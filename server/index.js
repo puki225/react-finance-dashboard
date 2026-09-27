@@ -288,6 +288,52 @@ app.use(express.static(path.join(__dirname, '../client/build')));
   }
 })();
 
+// ─── AI CHAT: SCHEMA MIGRATION ────────────────────────────────────────────
+// Conversations/messages for the in-app assistant (see chat.js). content is stored as the
+// raw Anthropic content-block JSON (not just extracted text) so a conversation can be
+// replayed faithfully on the next turn - tool_use/tool_result blocks included, not just
+// what was visibly said. chat_memory is durable, cross-conversation facts the assistant is
+// told to consult every turn (kept in its own small table, not buried in a transcript, so
+// it can be shown/edited in Settings - see chat.js's remember_fact tool and the memory
+// routes). chat_tool_calls is the write-tool audit trail - every tool the assistant runs
+// that changes data gets one row here, independent of the conversation transcript.
+(async function migrateChatSchema() {
+  try {
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS chat_conversations (
+        id SERIAL PRIMARY KEY,
+        title TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS chat_messages (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER NOT NULL REFERENCES chat_conversations(id) ON DELETE CASCADE,
+        role TEXT NOT NULL,
+        content JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE INDEX IF NOT EXISTS idx_chat_messages_conversation ON chat_messages (conversation_id, id);
+      CREATE TABLE IF NOT EXISTS chat_memory (
+        id SERIAL PRIMARY KEY,
+        fact TEXT NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+      CREATE TABLE IF NOT EXISTS chat_tool_calls (
+        id SERIAL PRIMARY KEY,
+        conversation_id INTEGER REFERENCES chat_conversations(id) ON DELETE SET NULL,
+        tool_name TEXT NOT NULL,
+        tool_input JSONB,
+        is_write BOOLEAN NOT NULL DEFAULT FALSE,
+        result_summary TEXT,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
+  } catch (e) {
+    console.error('[db] Chat schema migration failed:', e.message);
+  }
+})();
+
 // ─── VINE ORDER CLASSIFICATION ──────────────────────────────────────────
 // Amazon Vine gives away FBA inventory as free review copies - not real sales, but they
 // inflate units-sold/gross-sales figures with no matching revenue if left unclassified.
@@ -5628,6 +5674,17 @@ app.get('/api/cashflow', async (req, res) => {
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
+
+// AI chat assistant - see chat.js for the tool definitions and guardrails. Mounted with its
+// own base URL for the internal fetch() calls each read/write tool makes back into this same
+// process's routes. Must stay ABOVE the app.get('*', ...) SPA fallback below, same reasoning
+// as every other API route in this file.
+if (process.env.ANTHROPIC_API_KEY) {
+  const { createChatRouter } = require('./chat');
+  app.use(createChatRouter({ pool, baseUrl: `http://localhost:${PORT}` }));
+} else {
+  console.warn('[chat] ANTHROPIC_API_KEY not set - /api/chat routes are disabled');
+}
 
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
