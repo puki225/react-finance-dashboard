@@ -5516,6 +5516,10 @@ app.get('/api/cashflow', async (req, res) => {
         -- its own ASIN is its family of one, matching GET /api/procurement-assumptions so a
         -- loose ASIN configured there actually gets simulated here too.
         SELECT sp.sku, COALESCE(sp.parent_asin, sp.asin) AS parent_asin,
+          -- sku_parameters.product_name is often unpopulated - same order-line-title
+          -- fallback used elsewhere (Inventory, Sales Forecast, Product Breakdown) so a
+          -- procurement order can be reported by its real listing name, not just its SKU.
+          COALESCE(sp.product_name, ot.title) AS product_name,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
           COALESCE(avg30.avg_price, lp.last_price) AS asp,
           COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
@@ -5524,6 +5528,9 @@ app.get('/api/cashflow', async (req, res) => {
           SELECT fulfillable_quantity FROM amazon_inventory_snapshots
           WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
         ) ls ON true
+        LEFT JOIN LATERAL (
+          SELECT title FROM amazon_order_lines WHERE sku = sp.sku AND title IS NOT NULL ORDER BY synced_at DESC LIMIT 1
+        ) ot ON true
         LEFT JOIN v_sku_last_price lp ON lp.sku = sp.sku
         -- Average selling price over the trailing 30 days, not a single last transaction's
         -- price - one order (a multi-buy line, a mid-window price change, a heavy discount)
@@ -5604,7 +5611,7 @@ app.get('/api/cashflow', async (req, res) => {
         const amount = orderQty * unitCost;
         if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount);
         procurementOrders.push({
-          sku: row.sku, parent_asin: row.parent_asin,
+          sku: row.sku, parent_asin: row.parent_asin, product_name: row.product_name,
           trigger_date: addDays(todayStr, day), arrival_date: addDays(todayStr, arrivalDay),
           payment_date: addDays(todayStr, paymentDay),
           order_qty: Math.round(orderQty), amount: fx(amount).toFixed(2),
