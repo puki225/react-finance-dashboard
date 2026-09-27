@@ -8,6 +8,7 @@ import CashFlow from './pages/CashFlow';
 import CashFlowProjection from './pages/CashFlowProjection';
 import SalesForecast from './pages/SalesForecast';
 import Settings from './pages/Settings';
+import ChatWidget from './components/ChatWidget';
 import { useIsMobile } from './hooks/useIsMobile';
 
 const NAV = [
@@ -162,6 +163,10 @@ export default function App() {
         {active === 'cashflow'  && <CashFlowProjection />}
         {active === 'settings'  && <Settings />}
       </div>
+
+      {/* Rendered as a sibling of the tab content, not inside it, so the conversation
+          survives switching tabs instead of unmounting/remounting every time. */}
+      <ChatWidget />
     </div>
   );
 }
