@@ -132,6 +132,12 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
       run: () => callInternalApi('/api/inventory'),
     },
     {
+      name: 'get_shipments',
+      description: 'Inbound FBA shipment pipeline: each shipment\'s status (working/shipped/in-transit/delivered/receiving/closed/etc.), destination fulfillment center, confirmed need-by date (often unset - Amazon rarely provides a firm ETA on this API), and per-SKU units shipped vs received. Use for "what stock is on the way" / "when does shipment X land" / reorder-pipeline questions.',
+      input_schema: { type: 'object', properties: {} },
+      run: () => callInternalApi('/api/shipments'),
+    },
+    {
       name: 'get_cashflow_projection',
       description: 'Forward cash flow projection: daily inflow (Amazon/Shopify settlements), outflow (known outflows, PPC, storage fees, procurement), and resulting balance, plus any scheduled procurement orders. Use for "will I have enough cash" / "when do I need to reorder X" questions.',
       input_schema: {
