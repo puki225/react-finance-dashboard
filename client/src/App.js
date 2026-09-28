@@ -4,6 +4,7 @@ import ProductBreakdown from './pages/ProductBreakdown';
 import PnL from './pages/PnL';
 import PVM from './pages/PVM';
 import Inventory from './pages/Inventory';
+import Shipments from './pages/Shipments';
 import CashFlow from './pages/CashFlow';
 import CashFlowProjection from './pages/CashFlowProjection';
 import SalesForecast from './pages/SalesForecast';
@@ -17,6 +18,7 @@ const NAV = [
   { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
   { id: 'pvm',       label: 'PVM',                 icon: '◐', active: true },
   { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
+  { id: 'shipments', label: 'Shipments',            icon: '◒', active: true },
   { id: 'salesforecast', label: 'Sales Forecast',   icon: '◕', active: true },
   // 'cashrecon' (Cash Reconciliation) is deliberately left OUT of NAV, not just set
   // active:false - that flag renders a grayed-out "SOON" row, which reads as "not built
@@ -158,6 +160,7 @@ export default function App() {
         {active === 'pnl'       && <PnL />}
         {active === 'pvm'       && <PVM />}
         {active === 'inventory' && <Inventory />}
+        {active === 'shipments' && <Shipments />}
         {active === 'salesforecast' && <SalesForecast />}
         {active === 'cashrecon' && <CashFlow />}
         {active === 'cashflow'  && <CashFlowProjection />}

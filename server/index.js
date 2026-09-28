@@ -3898,6 +3898,49 @@ app.get('/api/inventory', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Inbound FBA shipments (replenishment pipeline) - per-shipment status/destination/dates from
+// amazon_inbound_shipments, with each shipment's SKU/quantity lines rolled up from
+// amazon_inbound_shipment_items. Both tables are synced by amazon-spapi-proxy's
+// /sync-inbound-shipments job; see its own comments for what the Amazon API does and doesn't
+// expose (notably: no single "ETA" field, only ShipmentStatus + an often-null
+// ConfirmedNeedByDate).
+app.get('/api/shipments', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT
+        s.shipment_id, s.shipment_name, s.destination_fc, s.shipment_status,
+        s.confirmed_need_by_date, s.synced_at,
+        COALESCE(json_agg(
+          json_build_object(
+            'sku', it.sku,
+            'product_title', COALESCE(sp.product_name, ot.title),
+            'quantity_shipped', it.quantity_shipped,
+            'quantity_received', it.quantity_received
+          ) ORDER BY it.sku
+        ) FILTER (WHERE it.sku IS NOT NULL), '[]') AS items
+      FROM amazon_inbound_shipments s
+      LEFT JOIN amazon_inbound_shipment_items it ON it.shipment_id = s.shipment_id
+      LEFT JOIN sku_parameters sp ON sp.sku = it.sku
+      LEFT JOIN LATERAL (
+        SELECT title FROM amazon_order_lines WHERE sku = it.sku AND title IS NOT NULL
+        ORDER BY synced_at DESC LIMIT 1
+      ) ot ON true
+      GROUP BY s.shipment_id, s.shipment_name, s.destination_fc, s.shipment_status,
+        s.confirmed_need_by_date, s.synced_at
+      ORDER BY s.synced_at DESC
+    `);
+
+    const rows = result.rows.map(r => ({
+      ...r,
+      units_shipped: r.items.reduce((sum, i) => sum + (parseInt(i.quantity_shipped) || 0), 0),
+      units_received: r.items.reduce((sum, i) => sum + (parseInt(i.quantity_received) || 0), 0),
+    }));
+
+    const lastSync = await pool.query(`SELECT last_synced_at, status, last_error FROM sync_state WHERE source = 'amazon_inbound_shipments'`);
+    res.json({ rows, sync: lastSync.rows[0] || null });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Inventory units + £ value over time, optionally filtered to a single SKU.
 // Value uses each SKU's current COGS rate (itemized, falling back to flat unit_cogs) applied
 // uniformly across history - not date-matched to historical cogs_entries like the P&L pages,
