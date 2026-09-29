@@ -3898,6 +3898,42 @@ app.get('/api/inventory', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Same status -> assumed-remaining-transit-days mapping as sales-forecast-service's
+// pipeline.STATUS_REMAINING_DAYS (kept in sync by hand, different runtime). Amazon
+// essentially never gives a real per-shipment ETA on this account
+// (confirmed_need_by_date comes back null on every shipment synced so far), so how much
+// transit time is left is ASSUMED from the shipment's status alone - a stated business
+// assumption, not a measured fact. CLOSED/CANCELLED/DELETED/ERROR are deliberately absent
+// (CLOSED = fully received, already in the live inventory snapshot; the other three mean
+// the units are never coming).
+const INBOUND_STATUS_REMAINING_DAYS = {
+  WORKING: 21, SHIPPED: 14, IN_TRANSIT: 7, DELIVERED: 3, CHECKED_IN: 2, RECEIVING: 1,
+};
+
+// Real pending inbound units (shipped but not yet fully received), grouped by SKU with an
+// assumed arrival day-offset from today - shared by /api/procurement-risk (informational)
+// and /api/cashflow's procurement simulation (as real starting pending-arrivals, so it
+// doesn't simulate a redundant reorder for stock that's already on the way).
+async function fetchPendingInboundBySku() {
+  const result = await pool.query(`
+    SELECT i.sku, s.shipment_status,
+      SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS qty
+    FROM amazon_inbound_shipment_items i
+    JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
+    WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
+    GROUP BY i.sku, s.shipment_status
+    HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
+  `);
+  const bySku = new Map();
+  for (const r of result.rows) {
+    const days = INBOUND_STATUS_REMAINING_DAYS[r.shipment_status];
+    if (days === undefined) continue;
+    if (!bySku.has(r.sku)) bySku.set(r.sku, []);
+    bySku.get(r.sku).push({ day: days, qty: r.qty, status: r.shipment_status });
+  }
+  return bySku;
+}
+
 // Inbound FBA shipments (replenishment pipeline) - per-shipment status/destination/dates from
 // amazon_inbound_shipments, with each shipment's SKU/quantity lines rolled up from
 // amazon_inbound_shipment_items. Both tables are synced by amazon-spapi-proxy's
@@ -3995,18 +4031,6 @@ app.get('/api/procurement-risk', async (req, res) => {
         FROM amazon_inventory_snapshots
         ORDER BY sku, snapshot_date DESC
       ),
-      pending AS (
-        SELECT i.sku, s.shipment_status,
-          SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS qty
-        FROM amazon_inbound_shipment_items i
-        JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
-        WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
-        GROUP BY i.sku, s.shipment_status
-        HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
-      ),
-      pending_total AS (
-        SELECT sku, SUM(qty)::int AS pending_units FROM pending GROUP BY sku
-      ),
       -- Same three windows as sales-forecast-service's _seasonal_velocity input query
       -- (db.fetch_supply_inputs) - kept in sync by hand so both agree on "how fast is
       -- this SKU selling".
@@ -4050,14 +4074,12 @@ app.get('/api/procurement-risk', async (req, res) => {
       SELECT
         li.sku, li.asin, COALESCE(sp.product_name, ot.title) AS product_title,
         COALESCE(li.sellable, 0) AS sellable,
-        COALESCE(pt.pending_units, 0) AS pending_units,
         COALESCE(cy.units, 0) AS cy_trailing_units,
         COALESCE(pyt.units, 0) AS py_trailing_units,
         COALESCE(pyf.units, 0) AS py_forward_units,
         COALESCE(ff.constrained_days_next_90, 0) AS constrained_days_next_90,
         ff.first_constrained_date
       FROM latest_inv li
-      LEFT JOIN pending_total pt ON pt.sku = li.sku
       LEFT JOIN cy_trailing cy ON cy.sku = li.sku
       LEFT JOIN py_trailing pyt ON pyt.sku = li.sku
       LEFT JOIN py_forward pyf ON pyf.sku = li.sku
@@ -4069,18 +4091,10 @@ app.get('/api/procurement-risk', async (req, res) => {
       ) ot ON true
     `);
 
-    const pendingByStatusResult = await pool.query(`
-      SELECT i.sku, s.shipment_status,
-        SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS qty
-      FROM amazon_inbound_shipment_items i
-      JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
-      WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
-      GROUP BY i.sku, s.shipment_status
-      HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
-    `);
+    const pendingInboundBySku = await fetchPendingInboundBySku();
     const pendingByStatus = {};
-    for (const r of pendingByStatusResult.rows) {
-      (pendingByStatus[r.sku] ||= []).push({ status: r.shipment_status, qty: r.qty });
+    for (const [sku, entries] of pendingInboundBySku) {
+      pendingByStatus[sku] = entries.map(e => ({ status: e.status, qty: e.qty }));
     }
 
     // Same PY-seasonal-adjusted velocity formula as /api/inventory's "days of inventory
@@ -4098,14 +4112,15 @@ app.get('/api/procurement-risk', async (req, res) => {
 
     const rows = result.rows.map(r => {
       const velocity = seasonalVelocity(r);
+      const pendingUnits = (pendingInboundBySku.get(r.sku) || []).reduce((sum, e) => sum + e.qty, 0);
       const daysOfStock = velocity > 0 ? r.sellable / velocity : null;
-      const daysOfStockWithPending = velocity > 0 ? (r.sellable + r.pending_units) / velocity : null;
+      const daysOfStockWithPending = velocity > 0 ? (r.sellable + pendingUnits) / velocity : null;
       return {
         sku: r.sku,
         asin: r.asin,
         product_title: r.product_title,
         sellable: r.sellable,
-        pending_units: r.pending_units,
+        pending_units: pendingUnits,
         pending_by_status: pendingByStatus[r.sku] || [],
         daily_velocity_units: Math.round(velocity * 100) / 100,
         days_of_stock: daysOfStock === null ? null : Math.round(daysOfStock),
@@ -5789,6 +5804,13 @@ app.get('/api/cashflow', async (req, res) => {
       pool.query('SELECT * FROM procurement_assumptions'),
     ]);
     const procurementByParent = new Map(procurementAssumptionsResult.rows.map(r => [r.parent_asin, r]));
+    // Real shipments already placed and in transit (see /api/shipments/
+    // /api/procurement-risk) - seeded into each SKU's simulation below as REAL starting
+    // pending arrivals, so it doesn't simulate a redundant new order (and outflow) for
+    // stock that's already on the way. Only the assumed ARRIVAL is seeded, never an
+    // outflow for it - that payment already happened in the past (when the real PO was
+    // placed), not something this forward-looking projection should add again.
+    const pendingInboundBySku = await fetchPendingInboundBySku();
 
     // Flat 2-week safety-stock cushion on the reorder TRIGGER only (not the order quantity)
     // - a percentage-of-lead-time buffer (the original 10% design) gives almost no real
@@ -5815,7 +5837,12 @@ app.get('/api/cashflow', async (req, res) => {
       const paymentDaysAfterOrder = pa.payment_days_after_order;
 
       let stock = row.sellable;
-      const pendingArrivals = [];
+      // Seed with real in-transit shipments (not simulated future orders) - the loop's
+      // own "one order in flight at a time" rule below then naturally holds off
+      // simulating a NEW order until whatever's really already coming has arrived.
+      const pendingArrivals = (pendingInboundBySku.get(row.sku) || [])
+        .filter(e => e.day < horizonDays)
+        .map(e => ({ day: e.day, qty: e.qty }));
       for (let day = 0; day < horizonDays; day++) {
         for (let i = pendingArrivals.length - 1; i >= 0; i--) {
           if (pendingArrivals[i].day === day) { stock += pendingArrivals[i].qty; pendingArrivals.splice(i, 1); }
@@ -5849,6 +5876,14 @@ app.get('/api/cashflow', async (req, res) => {
     let minBalance = balance, minBalanceDate = todayStr;
     let thresholdBreachDate = null;
     const threshold = fx(a.minimum_cash_threshold || 0);
+    // Estimated credit-line draw needed to keep the account AT the configured minimum
+    // threshold on any day cash alone would otherwise fall below it - drawn only as
+    // needed and assumed paid back the moment projected cash recovers past the threshold
+    // on its own. No interest/repayment-schedule modeling: there's no such assumption
+    // configured anywhere in this app to base one on, so this is "how big a credit line
+    // would you need", not a real drawdown/repayment ledger. Threshold unconfigured (0)
+    // degrades to "stay above zero" rather than needing special-casing.
+    let maxCreditUtilization = 0, maxCreditUtilizationDate = null;
     for (let i = 0; i < horizonDays; i++) {
       const date = addDays(todayStr, i);
       const inflow = fx(inflowsByDate.get(date) || 0);
@@ -5856,9 +5891,12 @@ app.get('/api/cashflow', async (req, res) => {
       balance += inflow - outflow;
       if (balance < minBalance) { minBalance = balance; minBalanceDate = date; }
       if (thresholdBreachDate === null && balance < threshold) thresholdBreachDate = date;
+      const creditUtilization = Math.max(0, threshold - balance);
+      if (creditUtilization > maxCreditUtilization) { maxCreditUtilization = creditUtilization; maxCreditUtilizationDate = date; }
       daily.push({
         date, inflow: inflow.toFixed(2), outflow: outflow.toFixed(2),
         net: (inflow - outflow).toFixed(2), balance: balance.toFixed(2),
+        credit_utilization: creditUtilization.toFixed(2),
       });
     }
 
@@ -5902,6 +5940,13 @@ app.get('/api/cashflow', async (req, res) => {
       min_balance: minBalance.toFixed(2),
       min_balance_date: minBalanceDate,
       threshold_breach_date: thresholdBreachDate,
+      // Peak estimated credit-line draw across the horizon (see the per-day
+      // credit_utilization field on `daily` for the full shape) - 0 means the projection
+      // never needs it at the configured threshold.
+      credit: {
+        max_utilization: maxCreditUtilization.toFixed(2),
+        max_utilization_date: maxCreditUtilizationDate,
+      },
       procurement_orders: procurementOrders.sort((x, y) => x.payment_date.localeCompare(y.payment_date)),
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }

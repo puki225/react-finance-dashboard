@@ -145,7 +145,7 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
     },
     {
       name: 'get_cashflow_projection',
-      description: 'Forward cash flow projection: daily inflow (Amazon/Shopify settlements), outflow (known outflows, PPC, storage fees, procurement), and resulting balance, plus any scheduled procurement orders. Use for "will I have enough cash" / "when do I need to reorder X" questions.',
+      description: 'Forward cash flow projection: daily inflow (Amazon/Shopify settlements, now driven by the shipment/supply-aware sales forecast), outflow (known outflows, PPC, storage fees, procurement - procurement already accounts for real shipments already in transit, not just simulated reorders), resulting balance, and any scheduled procurement orders. Also returns an estimated credit-line need (`credit.max_utilization`/`max_utilization_date`, plus a per-day `credit_utilization` on each daily row) - how much credit draw would be needed to keep the balance at the configured minimum threshold on days cash alone would fall below it. Use for "will I have enough cash" / "when do I need to reorder X" / "will I need a credit line" questions.',
       input_schema: {
         type: 'object',
         properties: { horizon_days: { type: 'integer', description: 'How many days forward to project, 1-180, default 180' } },

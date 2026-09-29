@@ -177,11 +177,32 @@ function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
           </>
         )}
         <path d={areaPath} fill="var(--accent)" opacity={0.1} />
+        {/* Credit-gap band: one thick vertical stroke per day the balance sits below the
+            threshold - the same shape as the "how much credit would this take" figure in
+            the stat row above, drawn where it actually occurs rather than only as a
+            number. Per-day strokes (not one continuous fill) because the threshold line
+            is flat and the balance line isn't, so a single polygon would need to track
+            every crossing point - N thin strokes is simpler and reads identically at
+            this density. */}
+        {thresholdY !== null && daily.map((d, i) => {
+          const bal = parseFloat(d.balance);
+          if (bal >= threshold) return null;
+          return <line key={'credit-' + i} x1={x(i)} x2={x(i)} y1={y1(bal)} y2={thresholdY} stroke="var(--red)" strokeWidth={Math.max(1.5, slot)} opacity={0.18} />;
+        })}
         <path d={linePath} fill="none" stroke="var(--accent)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
         <circle cx={x(lowIdx)} cy={y1(parseFloat(daily[lowIdx].balance))} r={5} fill={belowThreshold ? 'var(--red)' : 'var(--accent)'} stroke="var(--bg2)" strokeWidth={2} />
-        <text x={x(lowIdx)} y={y1(parseFloat(daily[lowIdx].balance)) - 12} textAnchor={lowIdx > n - 12 ? 'end' : 'middle'} fontSize={11} fontFamily="var(--mono)" fontWeight={600} fill={belowThreshold ? 'var(--red)' : 'var(--text)'}>
-          Low {fmtMoney(daily[lowIdx].balance, sym)} · {fmtDate(daily[lowIdx].date)}
-        </text>
+        {(() => {
+          const lowY = y1(parseFloat(daily[lowIdx].balance));
+          // A low balance close to the threshold puts this label's usual position (12px
+          // above the point) right on top of the dashed threshold line and its own label -
+          // flip below the point instead whenever they'd be within a label-height of each other.
+          const flipBelow = thresholdY !== null && Math.abs(lowY - thresholdY) < 28;
+          return (
+            <text x={x(lowIdx)} y={flipBelow ? lowY + 20 : lowY - 12} textAnchor={lowIdx > n - 12 ? 'end' : 'middle'} fontSize={11} fontFamily="var(--mono)" fontWeight={600} fill={belowThreshold ? 'var(--red)' : 'var(--text)'}>
+              Low {fmtMoney(daily[lowIdx].balance, sym)} · {fmtDate(daily[lowIdx].date)}
+            </text>
+          );
+        })()}
         {breachDate && daily.some(d => d.date === breachDate) && breachDate !== daily[lowIdx].date && (
           <circle cx={x(daily.findIndex(d => d.date === breachDate))} cy={y1(parseFloat(daily.find(d => d.date === breachDate).balance))} r={4} fill="var(--red)" />
         )}
@@ -249,6 +270,7 @@ export default function CashFlowProjection() {
 
   const todayBalance = data.daily?.[0]?.balance;
   const threshold = parseFloat(data.assumptions.minimum_cash_threshold || 0);
+  const creditNeeded = parseFloat(data.credit?.max_utilization || 0);
   const willBreach = !!data.threshold_breach_date;
   const stale = data.balance_stale_days !== null && data.balance_stale_days > 7;
 
@@ -274,7 +296,8 @@ export default function CashFlowProjection() {
       )}
       {willBreach && (
         <div style={{ background: 'var(--red)15', border: '1px solid var(--red)', borderRadius: 10, padding: '12px 16px', fontSize: 13, color: 'var(--red)' }}>
-          Projected balance drops below your minimum threshold ({fmtMoney(threshold, sym)}) around {fmtDateFull(data.threshold_breach_date)}.
+          Projected balance drops below your minimum threshold ({fmtMoney(threshold, sym)}) around {fmtDateFull(data.threshold_breach_date)}
+          {creditNeeded > 0 && <> — staying at the threshold from there would take up to <b>{fmtMoney(creditNeeded, sym)}</b> of credit, peaking around {fmtDateFull(data.credit.max_utilization_date)}</>}.
         </div>
       )}
 
@@ -293,6 +316,15 @@ export default function CashFlowProjection() {
         <div style={statCardStyle}>
           <div style={cardLabel}>Minimum threshold</div>
           <div style={cardValue}>{fmtMoney(threshold, sym)}</div>
+        </div>
+        <div style={statCardStyle}>
+          <div style={cardLabel}>Est. credit needed</div>
+          <div style={{ ...cardValue, color: creditNeeded > 0 ? 'var(--red)' : 'var(--green)' }}>
+            {fmtMoney(creditNeeded, sym)}
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--muted)', marginTop: 4 }}>
+            {creditNeeded > 0 ? `peak draw on ${fmtDate(data.credit.max_utilization_date)}` : 'projection stays above threshold'}
+          </div>
         </div>
       </div>
 
@@ -320,6 +352,11 @@ export default function CashFlowProjection() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
             <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--red)' }} />Cash out
           </div>
+          {creditNeeded > 0 && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--muted)' }}>
+              <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--red)', opacity: 0.35 }} />Credit needed
+            </div>
+          )}
         </div>
         <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
           <AssumptionsSummary data={data} sym={sym} />
@@ -330,7 +367,7 @@ export default function CashFlowProjection() {
         <div style={cardStyle}>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Projected replenishment orders</div>
           <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.5 }}>
-            Automatically triggered from current stock, forecasted velocity, and your Procurement lead-time/payment assumptions (Settings → Procurement) — each of these is already included as a cash outflow above.
+            Automatically triggered from current stock (plus any real shipments already in transit — see the Shipments tab), forecasted velocity, and your Procurement lead-time/payment assumptions (Settings → Procurement) — each of these is already included as a cash outflow above.
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 640 }}>
