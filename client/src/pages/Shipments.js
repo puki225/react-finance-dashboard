@@ -30,6 +30,30 @@ const STATUS_GROUPS = {
 };
 const statusInfo = (s) => STATUS_GROUPS[s] || { label: s || 'Unknown', color: 'var(--muted)' };
 
+// Same status hexes as the shipment-status badges above (and Inventory's aging buckets) - red
+// under 90% received, amber for the home stretch (90-99%), green once fully (or over-)received.
+// Uncapped on purpose: a shipment can legitimately receive more than the manifest said (Amazon
+// over-receipt), and that's still "done", not something to flag red/amber.
+const pctComplete = (row) => {
+  const shipped = parseInt(row.units_shipped || 0, 10);
+  if (shipped <= 0) return null;
+  return (parseInt(row.units_received || 0, 10) / shipped) * 100;
+};
+const pctColor = (pct) => pct === null ? 'var(--muted)' : pct < 90 ? '#f87171' : pct < 100 ? '#fbbf24' : '#34d399';
+
+function CompletionBar({ pct }) {
+  if (pct === null) return <span style={{ fontSize: 13, color: 'var(--muted)' }}>—</span>;
+  const color = pctColor(pct);
+  return (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 8, width: '100%' }}>
+      <div style={{ flex: 1, height: 6, borderRadius: 3, background: 'var(--bg3)', overflow: 'hidden', maxWidth: 72 }}>
+        <div style={{ width: `${Math.min(pct, 100)}%`, height: '100%', borderRadius: 3, background: color }} />
+      </div>
+      <span style={{ fontSize: 12, fontWeight: 700, fontFamily: 'var(--mono)', color, flexShrink: 0 }}>{Math.round(pct)}%</span>
+    </div>
+  );
+}
+
 const COLS = [
   { key: 'shipment_name', label: 'Shipment', width: '1fr' },
   { key: 'destination_fc', label: 'Destination FC', width: '140px' },
@@ -37,9 +61,10 @@ const COLS = [
   { key: 'confirmed_need_by_date', label: 'Need-By Date', width: '130px' },
   { key: 'units_shipped', label: 'Units Shipped', width: '120px' },
   { key: 'units_received', label: 'Units Received', width: '120px' },
+  { key: 'pct_complete', label: '% Completed', width: '130px' },
 ];
-const TABLE_GRID = 'minmax(180px,1fr) 140px 130px 130px 120px 120px';
-const TABLE_MIN_WIDTH = 180 + 140 + 130 + 130 + 120 + 120;
+const TABLE_GRID = 'minmax(180px,1fr) 140px 130px 130px 120px 120px 130px';
+const TABLE_MIN_WIDTH = 180 + 140 + 130 + 130 + 120 + 120 + 130;
 
 export default function Shipments() {
   const isMobile = useIsMobile();
@@ -114,6 +139,9 @@ export default function Shipments() {
             <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
               <span style={{ fontSize: 16, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(totals.received)}</span>
             </div>
+            <div style={{ padding: '14px 8px', display: 'flex', alignItems: 'center' }}>
+              <CompletionBar pct={totals.shipped > 0 ? (totals.received / totals.shipped) * 100 : null} />
+            </div>
           </div>
         </div>
       </div>
@@ -168,6 +196,9 @@ export default function Shipments() {
                     </div>
                     <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
                       <span style={{ fontSize: 15, fontWeight: 700, fontFamily: 'var(--mono)', color: 'var(--accent2)' }}>{fmtN(row.units_received)}</span>
+                    </div>
+                    <div style={{ padding: '13px 8px', display: 'flex', alignItems: 'center' }}>
+                      <CompletionBar pct={pctComplete(row)} />
                     </div>
                   </div>
 
