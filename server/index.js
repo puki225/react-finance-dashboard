@@ -3941,6 +3941,188 @@ app.get('/api/shipments', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Same nth-weekday-of-month rule sales-forecast-service's forecast.py uses for Black
+// Friday/Cyber Monday (the 4th Thursday of November) - ported here (not shared, different
+// runtime) so "when's the next seasonal event" agrees between what the forecast model
+// treats as a recurring spike and what this route/the chatbot tells the user about.
+// weekday: 0=Sunday..6=Saturday (JS Date convention, unlike Python's Monday=0).
+function nthWeekdayOfMonth(year, month, weekday, n) {
+  const first = new Date(Date.UTC(year, month - 1, 1));
+  const day = 1 + ((weekday - first.getUTCDay() + 7) % 7) + 7 * (n - 1);
+  return new Date(Date.UTC(year, month - 1, day));
+}
+
+// Same recurring-event calendar as forecast.py's event_window_for_date (kept in sync by
+// hand - see that function's own docstring for why each window is shaped the way it is).
+// Returns events starting within the next `horizonDays` (or already under way - up to 5
+// days into an event still counts as "upcoming" for a procurement conversation).
+function upcomingSeasonalEvents(from, horizonDays = 120) {
+  const events = [];
+  for (const year of [from.getUTCFullYear(), from.getUTCFullYear() + 1]) {
+    const bfStart = nthWeekdayOfMonth(year, 11, 4, 4); // Thursday=4
+    events.push({ label: 'Black Friday / Cyber Monday', start: bfStart, end: new Date(bfStart.getTime() + 4 * 86400000) });
+    events.push({ label: 'Prime Day', start: new Date(Date.UTC(year, 6, 1)), end: new Date(Date.UTC(year, 6, 20)) });
+    events.push({ label: 'Prime Big Deal Days', start: new Date(Date.UTC(year, 9, 1)), end: new Date(Date.UTC(year, 9, 20)) });
+    events.push({ label: 'Christmas', start: new Date(Date.UTC(year, 11, 1)), end: new Date(Date.UTC(year, 11, 26)) });
+  }
+  return events
+    .map(e => ({ ...e, days_until_start: Math.round((e.start - from) / 86400000) }))
+    .filter(e => e.days_until_start >= -5 && e.days_until_start <= horizonDays)
+    .sort((a, b) => a.days_until_start - b.days_until_start)
+    .map(e => ({
+      label: e.label,
+      start_date: e.start.toISOString().split('T')[0],
+      end_date: e.end.toISOString().split('T')[0],
+      days_until_start: e.days_until_start,
+    }));
+}
+
+// Procurement risk, per SKU: current sellable stock, units already shipped but not yet
+// received (pending inbound - see /api/shipments), the same PY-seasonal daily-velocity
+// figure /api/inventory and sales-forecast-service both use, and whether
+// sales-forecast-service's own supply-constrained model has ALREADY detected a stock-out
+// dip in this SKU's next-90-day forecast (sales_forecast.model_used carries a
+// +supply_constrained or +eol_cutoff suffix on any day it applied - see that service's
+// forecast.py). Built for the AI chatbot (get_procurement_risk tool in chat.js) to reason
+// about restocking, especially ahead of a seasonal demand spike - this route only surfaces
+// the underlying numbers, not a canned recommendation; the chatbot forms that from context
+// in the conversation.
+app.get('/api/procurement-risk', async (req, res) => {
+  try {
+    const result = await pool.query(`
+      WITH latest_inv AS (
+        SELECT DISTINCT ON (sku) sku, asin, fulfillable_quantity::int AS sellable
+        FROM amazon_inventory_snapshots
+        ORDER BY sku, snapshot_date DESC
+      ),
+      pending AS (
+        SELECT i.sku, s.shipment_status,
+          SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS qty
+        FROM amazon_inbound_shipment_items i
+        JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
+        WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
+        GROUP BY i.sku, s.shipment_status
+        HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
+      ),
+      pending_total AS (
+        SELECT sku, SUM(qty)::int AS pending_units FROM pending GROUP BY sku
+      ),
+      -- Same three windows as sales-forecast-service's _seasonal_velocity input query
+      -- (db.fetch_supply_inputs) - kept in sync by hand so both agree on "how fast is
+      -- this SKU selling".
+      cy_trailing AS (
+        SELECT aol.sku, SUM(aol.quantity)::int AS units
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.status != 'Canceled' AND ao.order_date::date >= CURRENT_DATE - 89
+        GROUP BY aol.sku
+      ),
+      py_trailing AS (
+        SELECT aol.sku, SUM(aol.quantity)::int AS units
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.status != 'Canceled'
+          AND ao.order_date::date BETWEEN (CURRENT_DATE - INTERVAL '1 year' - INTERVAL '89 days')::date AND (CURRENT_DATE - INTERVAL '1 year')::date
+        GROUP BY aol.sku
+      ),
+      py_forward AS (
+        SELECT aol.sku, SUM(aol.quantity)::int AS units
+        FROM amazon_order_lines aol
+        JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+        WHERE ao.status != 'Canceled'
+          AND ao.order_date::date BETWEEN (CURRENT_DATE - INTERVAL '1 year')::date AND (CURRENT_DATE - INTERVAL '1 year' + INTERVAL '89 days')::date
+        GROUP BY aol.sku
+      ),
+      forecast_flags AS (
+        SELECT sku,
+          COUNT(*) FILTER (WHERE model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%')::int AS constrained_days_next_90,
+          MIN(forecast_date) FILTER (WHERE model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%') AS first_constrained_date
+        FROM sales_forecast
+        WHERE forecast_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
+        GROUP BY sku
+      ),
+      order_title AS (
+        SELECT DISTINCT ON (sku) sku, title
+        FROM amazon_order_lines
+        WHERE title IS NOT NULL
+        ORDER BY sku, synced_at DESC
+      )
+      SELECT
+        li.sku, li.asin, COALESCE(sp.product_name, ot.title) AS product_title,
+        COALESCE(li.sellable, 0) AS sellable,
+        COALESCE(pt.pending_units, 0) AS pending_units,
+        COALESCE(cy.units, 0) AS cy_trailing_units,
+        COALESCE(pyt.units, 0) AS py_trailing_units,
+        COALESCE(pyf.units, 0) AS py_forward_units,
+        COALESCE(ff.constrained_days_next_90, 0) AS constrained_days_next_90,
+        ff.first_constrained_date
+      FROM latest_inv li
+      LEFT JOIN pending_total pt ON pt.sku = li.sku
+      LEFT JOIN cy_trailing cy ON cy.sku = li.sku
+      LEFT JOIN py_trailing pyt ON pyt.sku = li.sku
+      LEFT JOIN py_forward pyf ON pyf.sku = li.sku
+      LEFT JOIN forecast_flags ff ON ff.sku = li.sku
+      LEFT JOIN sku_parameters sp ON sp.sku = li.sku
+      LEFT JOIN LATERAL (
+        SELECT title FROM amazon_order_lines WHERE sku = li.sku AND title IS NOT NULL
+        ORDER BY synced_at DESC LIMIT 1
+      ) ot ON true
+    `);
+
+    const pendingByStatusResult = await pool.query(`
+      SELECT i.sku, s.shipment_status,
+        SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0))::int AS qty
+      FROM amazon_inbound_shipment_items i
+      JOIN amazon_inbound_shipments s ON s.shipment_id = i.shipment_id
+      WHERE s.shipment_status NOT IN ('CLOSED', 'CANCELLED', 'DELETED', 'ERROR')
+      GROUP BY i.sku, s.shipment_status
+      HAVING SUM(GREATEST(i.quantity_shipped - i.quantity_received, 0)) > 0
+    `);
+    const pendingByStatus = {};
+    for (const r of pendingByStatusResult.rows) {
+      (pendingByStatus[r.sku] ||= []).push({ status: r.shipment_status, qty: r.qty });
+    }
+
+    // Same PY-seasonal-adjusted velocity formula as /api/inventory's "days of inventory
+    // left" and sales-forecast-service's _seasonal_velocity - ported (not shared, three
+    // different call sites in two different runtimes), so all three agree.
+    const seasonalVelocity = (row) => {
+      const cy = row.cy_trailing_units, pyTrailing = row.py_trailing_units, pyForward = row.py_forward_units;
+      if (pyForward > 0) {
+        const growth = pyTrailing > 0 ? (cy - pyTrailing) / pyTrailing : 0;
+        return Math.max(0, (pyForward / 90) * (1 + growth));
+      }
+      if (cy > 0) return cy / 90;
+      return 0;
+    };
+
+    const rows = result.rows.map(r => {
+      const velocity = seasonalVelocity(r);
+      const daysOfStock = velocity > 0 ? r.sellable / velocity : null;
+      const daysOfStockWithPending = velocity > 0 ? (r.sellable + r.pending_units) / velocity : null;
+      return {
+        sku: r.sku,
+        asin: r.asin,
+        product_title: r.product_title,
+        sellable: r.sellable,
+        pending_units: r.pending_units,
+        pending_by_status: pendingByStatus[r.sku] || [],
+        daily_velocity_units: Math.round(velocity * 100) / 100,
+        days_of_stock: daysOfStock === null ? null : Math.round(daysOfStock),
+        days_of_stock_with_pending: daysOfStockWithPending === null ? null : Math.round(daysOfStockWithPending),
+        forecast_constrained_days_next_90: r.constrained_days_next_90,
+        forecast_first_constrained_date: r.first_constrained_date,
+      };
+    }).sort((a, b) => {
+      const av = a.days_of_stock === null ? Infinity : a.days_of_stock;
+      const bv = b.days_of_stock === null ? Infinity : b.days_of_stock;
+      return av - bv;
+    });
+
+    res.json({ rows, upcoming_events: upcomingSeasonalEvents(new Date()) });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // Inventory units + £ value over time, optionally filtered to a single SKU.
 // Value uses each SKU's current COGS rate (itemized, falling back to flat unit_cogs) applied
 // uniformly across history - not date-matched to historical cogs_entries like the P&L pages,
