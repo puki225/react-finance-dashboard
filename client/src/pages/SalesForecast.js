@@ -437,12 +437,24 @@ export default function SalesForecast() {
   const [selectedSkus, setSelectedSkus] = useState(() => new Set());
   const [tip, setTip] = useState(null);
   const [savingSku, setSavingSku] = useState(null);
+  // Server-side filters (unlike selectedSkus, which re-aggregates sku_series client-side)
+  // - each (SKU, country) is forecast as a fully independent series on the backend (see
+  // sales-forecast-service/pipeline.run()), so narrowing to one country changes which
+  // underlying forecast rows are even summed, not just which SKUs are shown.
+  const [brandFilter, setBrandFilter] = useState('');
+  const [countryFilter, setCountryFilter] = useState('');
 
-  const { data, loading, error, refetch } = useApi('/api/sales-forecast', { history_days: historyWindow });
+  const { data, loading, error, refetch } = useApi('/api/sales-forecast', {
+    history_days: historyWindow,
+    ...(brandFilter ? { brand: brandFilter } : {}),
+    ...(countryFilter ? { country: countryFilter } : {}),
+  });
   const sym = data?.currency_symbol || '£';
   const history = data?.history || [];
   const forecast = data?.forecast || [];
   const skus = data?.skus || [];
+  const availableBrands = data?.available_brands || [];
+  const availableCountries = data?.available_countries || [];
   const skuSeries = data?.sku_series || [];
   const milestones = data?.milestones || [];
   const pyHistory = data?.py_history || [];
@@ -655,16 +667,47 @@ export default function SalesForecast() {
     }
   }
 
+  const selectStyle = (active) => ({
+    background: 'var(--bg2)', border: '1px solid ' + (active ? 'var(--accent)' : 'var(--border)'), borderRadius: 8,
+    padding: '6px 12px', color: active ? 'var(--accent2)' : 'var(--muted)', fontSize: 12, fontFamily: 'var(--font)',
+    cursor: 'pointer', fontWeight: 600,
+  });
+
   return (
     <div style={{ padding: 24, display: 'flex', flexDirection: 'column', gap: 20 }}>
-      <div>
-        <h1 style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>Sales Forecast</h1>
-        <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, maxWidth: 780 }}>
-          Per-SKU revenue forecast, segmented by growth stage, with seasonality (blended
-          against prior-year where available) and outlier exclusion. Click a SKU below to
-          filter the chart to it — ctrl/cmd-click to compare several. Set a manual stage
-          override or flag a SKU end-of-life; both are respected by the next nightly run.
-        </p>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+        <div>
+          <h1 style={{ fontSize: 20, fontWeight: 800, marginBottom: 4 }}>Sales Forecast</h1>
+          <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6, maxWidth: 780 }}>
+            Per-SKU revenue forecast, segmented by growth stage, with seasonality (blended
+            against prior-year where available) and outlier exclusion. Click a SKU below to
+            filter the chart to it — ctrl/cmd-click to compare several. Set a manual stage
+            override or flag a SKU end-of-life; both are respected by the next nightly run.
+            Each brand/country combination is forecast independently.
+          </p>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          {availableBrands.length > 0 && (
+            <select
+              value={brandFilter}
+              onChange={e => { setBrandFilter(e.target.value); setSelectedSkus(new Set()); }}
+              style={selectStyle(!!brandFilter)}
+            >
+              <option value="">All Brands</option>
+              {availableBrands.map(b => <option key={b} value={b}>{b}</option>)}
+            </select>
+          )}
+          {availableCountries.length > 0 && (
+            <select
+              value={countryFilter}
+              onChange={e => { setCountryFilter(e.target.value); setSelectedSkus(new Set()); }}
+              style={selectStyle(!!countryFilter)}
+            >
+              <option value="">All Countries</option>
+              {availableCountries.map(c => <option key={c} value={c}>{c === 'UNKNOWN' ? 'Unknown' : c}</option>)}
+            </select>
+          )}
+        </div>
       </div>
 
       {loading ? (
