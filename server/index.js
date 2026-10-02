@@ -5114,7 +5114,7 @@ app.get('/api/sales-forecast', async (req, res) => {
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
     const fx = (n) => (parseFloat(n || 0) * fxRate);
 
-    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult, pyDailyResult, py2DailyResult] = await Promise.all([
+    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult, pyDailyResult, py2DailyResult, unitsInputsResult, pendingInboundBySku] = await Promise.all([
       // "revenue" here means the same thing it means everywhere else in this app (Sales
       // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
       // for the period - not just v_sku_revenue.net_revenue on its own, which is
@@ -5332,6 +5332,29 @@ app.get('/api/sales-forecast', async (req, res) => {
         FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
         ORDER BY 1, 2
       `, [historyDays]),
+      // Current sellable units + an average selling price per SKU, so each forecast-date
+      // row's £ revenue can be converted into units for the chart tooltip's "Available
+      // units" / "Incoming units" lines below - same avg30-with-last-price-fallback basis
+      // used by /api/cashflow's procurement simulation, for consistency between the two.
+      pool.query(`
+        SELECT sp.sku,
+          COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
+          COALESCE(avg30.avg_price, lp.last_price) AS asp
+        FROM sku_parameters sp
+        LEFT JOIN LATERAL (
+          SELECT fulfillable_quantity FROM amazon_inventory_snapshots
+          WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
+        ) ls ON true
+        LEFT JOIN v_sku_last_price lp ON lp.sku = sp.sku
+        LEFT JOIN LATERAL (
+          SELECT SUM(gross_sales) / NULLIF(SUM(quantity), 0) AS avg_price
+          FROM v_sku_revenue
+          WHERE sku = sp.sku AND order_date::date >= CURRENT_DATE - 30
+        ) avg30 ON true
+      `),
+      // Real pending inbound shipments per SKU (see fetchPendingInboundBySku above) - the
+      // "incoming units" half of the available-units figure below.
+      fetchPendingInboundBySku(),
     ]);
 
     res.json({
@@ -5342,12 +5365,40 @@ app.get('/api/sales-forecast', async (req, res) => {
       forecast: forecastResult.rows.map(r => ({
         date: r.date, revenue: fx(r.revenue).toFixed(2), low: fx(r.low).toFixed(2), high: fx(r.high).toFixed(2),
       })),
-      sku_series: skuSeriesResult.rows.map(r => ({
-        sku: r.sku, date: r.date, actual: r.actual,
-        revenue: fx(r.revenue).toFixed(2),
-        low: r.low === null ? null : fx(r.low).toFixed(2),
-        high: r.high === null ? null : fx(r.high).toFixed(2),
-      })),
+      // sku_series rows are ordered by sku then date (see the query above), so a running
+      // per-SKU cumulative-units-sold total can be accumulated in a single left-to-right
+      // pass - reset whenever the SKU changes. Only forecast (non-actual) rows carry units
+      // figures: "available units" is inherently forward-looking (current stock projected
+      // ahead), and a historical actual day has no such projection to show.
+      sku_series: (() => {
+        const sellableBySku = new Map(unitsInputsResult.rows.map(r => [r.sku, r.sellable]));
+        const aspBySku = new Map(unitsInputsResult.rows.map(r => [r.sku, parseFloat(r.asp || 0)]));
+        let curSku = null, soldCum = 0;
+        return skuSeriesResult.rows.map(r => {
+          const base = {
+            sku: r.sku, date: r.date, actual: r.actual,
+            revenue: fx(r.revenue).toFixed(2),
+            low: r.low === null ? null : fx(r.low).toFixed(2),
+            high: r.high === null ? null : fx(r.high).toFixed(2),
+          };
+          if (r.sku !== curSku) { curSku = r.sku; soldCum = 0; }
+          if (r.actual) return base;
+          const asp = aspBySku.get(r.sku) || 0;
+          if (asp <= 0) return base; // no price basis to convert £ forecast -> units
+          soldCum += parseFloat(r.revenue || 0) / asp;
+          const dateStr = typeof r.date === 'string' ? r.date : r.date.toISOString().slice(0, 10);
+          const dayOffset = Math.round((new Date(dateStr + 'T00:00:00Z') - new Date(today + 'T00:00:00Z')) / 86400000);
+          const incomingUnits = (pendingInboundBySku.get(r.sku) || [])
+            .filter(e => e.day <= dayOffset)
+            .reduce((sum, e) => sum + e.qty, 0);
+          const sellable = sellableBySku.get(r.sku) || 0;
+          return {
+            ...base,
+            available_units: Math.round(sellable - soldCum + incomingUnits),
+            incoming_units: incomingUnits > 0 ? Math.round(incomingUnits) : 0,
+          };
+        });
+      })(),
       milestones: milestonesResult.rows.map(r => {
         const total = parseFloat(r.actual_revenue || 0) + parseFloat(r.forecast_revenue || 0);
         const py = r.py_revenue === null ? null : parseFloat(r.py_revenue);
