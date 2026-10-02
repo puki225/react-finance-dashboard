@@ -5643,7 +5643,8 @@ app.get('/api/cashflow', async (req, res) => {
       // Per-SKU forecast, day by day - shared below by both the channel split and the
       // Procurement simulation further down, which each need this same per-SKU/per-day shape.
       pool.query(`
-        SELECT sku, forecast_date::date AS date, forecast_revenue
+        SELECT sku, forecast_date::date AS date, forecast_revenue,
+          (model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%') AS constrained
         FROM sales_forecast
         WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
       `, [horizonDays]),
@@ -5724,7 +5725,7 @@ app.get('/api/cashflow', async (req, res) => {
     const forecastBySku = new Map();
     for (const r of perSkuForecastResult.rows) {
       if (!forecastBySku.has(r.sku)) forecastBySku.set(r.sku, new Map());
-      forecastBySku.get(r.sku).set(isoDate(r.date), parseFloat(r.forecast_revenue));
+      forecastBySku.get(r.sku).set(isoDate(r.date), { revenue: parseFloat(r.forecast_revenue), constrained: !!r.constrained });
     }
 
     // Per-SKU trailing channel mix, with a catalog-wide fallback for a SKU with no channel
@@ -5763,9 +5764,9 @@ app.get('/api/cashflow', async (req, res) => {
     }
     for (const [sku, byDate] of forecastBySku) {
       const share = skuChannelShare(sku);
-      for (const [date, revenue] of byDate) {
-        addRevenue(amazonRevenueByDate, date, revenue * share.amazon);
-        addRevenue(shopifyRevenueByDate, date, revenue * share.shopify);
+      for (const [date, info] of byDate) {
+        addRevenue(amazonRevenueByDate, date, info.revenue * share.amazon);
+        addRevenue(shopifyRevenueByDate, date, info.revenue * share.shopify);
       }
     }
 
@@ -5888,8 +5889,33 @@ app.get('/api/cashflow', async (req, res) => {
           sp.image_url, sp.asin,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
           COALESCE(avg30.avg_price, lp.last_price) AS asp,
-          COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
+          COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs,
+          COALESCE(cy.units, 0) AS cy_trailing_units,
+          COALESCE(pyt.units, 0) AS py_trailing_units,
+          COALESCE(pyf.units, 0) AS py_forward_units
         FROM sku_parameters sp
+        -- Same three trailing/PY windows as /api/procurement-risk and sales-forecast-
+        -- service's _seasonal_velocity (db.fetch_supply_inputs) - feeds the SAME
+        -- unconstrained-demand formula below, used as a floor under the forecast-derived
+        -- velocity so a currently-out-of-stock SKU's own (correctly) zeroed-out forecast
+        -- doesn't also zero out its reorder trigger - see dailyVelocity below.
+        LEFT JOIN LATERAL (
+          SELECT SUM(aol.quantity)::int AS units FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          WHERE aol.sku = sp.sku AND ao.status != 'Canceled' AND ao.order_date::date >= CURRENT_DATE - 89
+        ) cy ON true
+        LEFT JOIN LATERAL (
+          SELECT SUM(aol.quantity)::int AS units FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          WHERE aol.sku = sp.sku AND ao.status != 'Canceled'
+            AND ao.order_date::date BETWEEN (CURRENT_DATE - INTERVAL '1 year' - INTERVAL '89 days')::date AND (CURRENT_DATE - INTERVAL '1 year')::date
+        ) pyt ON true
+        LEFT JOIN LATERAL (
+          SELECT SUM(aol.quantity)::int AS units FROM amazon_order_lines aol
+          JOIN amazon_orders ao ON ao.amazon_order_id = aol.amazon_order_id
+          WHERE aol.sku = sp.sku AND ao.status != 'Canceled'
+            AND ao.order_date::date BETWEEN (CURRENT_DATE - INTERVAL '1 year')::date AND (CURRENT_DATE - INTERVAL '1 year' + INTERVAL '89 days')::date
+        ) pyf ON true
         -- End-of-life SKUs are deliberately excluded from replenishment planning - the
         -- Sales Forecast tab's EOL flag (Settings -> per-SKU "End of life" checkbox) means
         -- "don't expect this to keep selling", so simulating a reorder for it here would
@@ -5951,6 +5977,21 @@ app.get('/api/cashflow', async (req, res) => {
     // for now (applies to every SKU); can move to a per-parent-ASIN setting later if a
     // specific product needs its own buffer.
     const SAFETY_STOCK_DAYS = 14;
+    // Same PY-seasonal-adjusted velocity formula as /api/inventory's "days of inventory
+    // left", /api/procurement-risk, and sales-forecast-service's _seasonal_velocity -
+    // ported (not shared, four different call sites in two different runtimes) so all
+    // four agree on "how fast would this SKU actually sell, independent of whether it
+    // currently has stock to sell". See dailyVelocity below for why this specific route
+    // needs that unconstrained figure, not just the forecast on its own.
+    const seasonalVelocity = (row) => {
+      const cy = row.cy_trailing_units, pyTrailing = row.py_trailing_units, pyForward = row.py_forward_units;
+      if (pyForward > 0) {
+        const growth = pyTrailing > 0 ? (cy - pyTrailing) / pyTrailing : 0;
+        return Math.max(0, (pyForward / 90) * (1 + growth));
+      }
+      if (cy > 0) return cy / 90;
+      return 0;
+    };
     const procurementOrders = []; // surfaced in the response so a cash outflow isn't a
     // mystery number - same "always show why" convention as Sales Forecast's exclusions.
     for (const row of skuInputsResult.rows) {
@@ -5960,9 +6001,28 @@ app.get('/api/cashflow', async (req, res) => {
       const unitCost = parseFloat(row.unit_cogs || 0);
       if (asp <= 0 || unitCost <= 0) continue; // no price/cost basis to convert £ forecast -> units or units -> £
       const skuForecast = forecastBySku.get(row.sku);
+      // The sales forecast correctly shows ~0 revenue for a day the supply-constrained
+      // model expects to be out of stock (see Sales Forecast's own constrained-forecast
+      // logic) - exactly right for projecting realistic cash INFLOW, but wrong as the
+      // demand signal for deciding whether/how much to REORDER: a SKU already at 0 stock
+      // with no shipment would otherwise look like it has ~0 demand and never trigger a
+      // reorder, when the truth is the opposite - it has real demand with nothing to meet
+      // it. Floors (never overrides) the forecast-derived rate at the unconstrained
+      // seasonal velocity on any day the forecast flags as supply/EOL-constrained - a day
+      // the model projects has already recovered (e.g. the synthetic post-lead-time
+      // restock assumption - see sales-forecast-service's apply_replenishment_assumption)
+      // keeps its own, more specific figure via the max() below, since it's likely more
+      // accurate than the flat baseline; only an actually-suppressed day gets floored.
+      // Note `constrained` is a per-RUN flag (model_used is one string per SKU, not
+      // recomputed per day), so every day of a SKU that was constrained ANYWHERE in its
+      // horizon gets this floor applied, not just the specific days that were scaled down
+      // - harmless (max() is a no-op) wherever that day's own forecast is already higher.
+      const unconstrainedVelocity = seasonalVelocity(row);
       const dailyVelocity = Array.from({ length: horizonDays }, (_, i) => {
-        const rev = skuForecast ? skuForecast.get(addDays(todayStr, i)) : undefined;
-        return rev ? rev / asp : 0;
+        const info = skuForecast ? skuForecast.get(addDays(todayStr, i)) : undefined;
+        if (!info) return 0;
+        const forecastVelocity = info.revenue / asp;
+        return info.constrained ? Math.max(forecastVelocity, unconstrainedVelocity) : forecastVelocity;
       });
       const leadDays = pa.procurement_lead_days;
       const paymentDaysAfterOrder = pa.payment_days_after_order;
@@ -6097,7 +6157,10 @@ app.get('/api/cashflow', async (req, res) => {
         max_utilization: maxCreditUtilization.toFixed(2),
         max_utilization_date: maxCreditUtilizationDate,
       },
-      procurement_orders: procurementOrders.sort((x, y) => x.payment_date.localeCompare(y.payment_date)),
+      // Sorted by trigger_date (soonest order to actually PLACE first) rather than
+      // payment_date - this is a to-do list ("what do I need to order, and when"), so the
+      // decision date belongs at the top, not whichever order happens to debit cash first.
+      procurement_orders: procurementOrders.sort((x, y) => x.trigger_date.localeCompare(y.trigger_date) || x.payment_date.localeCompare(y.payment_date)),
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
