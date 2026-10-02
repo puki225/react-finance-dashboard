@@ -118,10 +118,14 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
     },
     {
       name: 'get_sales_forecast',
-      description: 'Sales forecast (per-SKU and totals) alongside recent actuals, including each SKU\'s forecast stage, exclusions and confidence range. Use for "what will we sell" / "is X trending up or down" questions.',
+      description: 'Sales forecast (per-SKU and totals) alongside recent actuals, including each SKU\'s forecast stage, exclusions and confidence range. Use for "what will we sell" / "is X trending up or down" questions. Each (SKU, country) pair is forecast fully independently - its own stage classification, curve fit, and seasonality, never blended with another country\'s numbers for the same SKU - so a SKU\'s stage/trend can genuinely differ by market. Optionally filter to one brand and/or one country; omit both for the whole catalog, summed across every country. `available_brands`/`available_countries` in the response list every real option (`country` values are shipping-country codes, or \'UNKNOWN\' for a sale whose country wasn\'t captured by the sync - common on this account\'s Amazon side today, not an error).',
       input_schema: {
         type: 'object',
-        properties: { history_days: { type: 'integer', description: 'How many days of trailing actuals to include, default 60' } },
+        properties: {
+          history_days: { type: 'integer', description: 'How many days of trailing actuals to include, default 60' },
+          brand: { type: 'string', description: 'Filter to one brand (exact match) - see available_brands in a prior response, or omit for every brand' },
+          country: { type: 'string', description: 'Filter to one country (exact match, e.g. "GB" or "UNKNOWN") - see available_countries in a prior response, or omit to sum across every country' },
+        },
       },
       run: (input) => callInternalApi('/api/sales-forecast', input),
     },

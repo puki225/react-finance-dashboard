@@ -175,10 +175,18 @@ app.use(express.static(path.join(__dirname, '../client/build')));
 // mature/plateau/declining) and an end-of-life flag (sell out remaining inventory at the
 // current run rate, then stop - no restock assumed). Both are read by the forecasting job,
 // not written by it, so a user's choice always survives the next nightly run.
-// sales_forecast holds that job's daily per-SKU output. stage_used/model_used are recorded
-// per row so the UI can show which model produced a given number without re-deriving it.
+// sales_forecast holds that job's daily per-SKU-per-COUNTRY output - each (sku, country)
+// pair is forecast fully independently by sales-forecast-service (its own stage
+// classification, outlier stripping, curve fit, and PY/catalog seasonality - see
+// pipeline.run()'s own docstring), never blended across countries. country is 'UNKNOWN'
+// for a sale whose shipping country wasn't captured by the sync (common on this account's
+// Amazon side today) - kept as its own real group rather than dropped. stage_used/
+// model_used are recorded per row so the UI can show which model produced a given number
+// without re-deriving it.
 // sales_forecast_exclusions records which historical dates were stripped as outliers before
-// fitting (e.g. a Prime Day spike), purely for UI transparency - not read by the model itself.
+// fitting (e.g. a Prime Day spike), purely for UI transparency - not read by the model
+// itself. Same (sku, country) independence as sales_forecast - an outlier in one country's
+// series says nothing about another country's.
 (async function migrateSalesForecastSchema() {
   try {
     await pool.query(`
@@ -190,6 +198,7 @@ app.use(express.static(path.join(__dirname, '../client/build')));
       );
       CREATE TABLE IF NOT EXISTS sales_forecast (
         sku TEXT NOT NULL,
+        country TEXT NOT NULL DEFAULT 'UNKNOWN',
         forecast_date DATE NOT NULL,
         forecast_revenue NUMERIC(12,2) NOT NULL,
         low_revenue NUMERIC(12,2),
@@ -197,15 +206,28 @@ app.use(express.static(path.join(__dirname, '../client/build')));
         stage_used TEXT,
         model_used TEXT,
         generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-        PRIMARY KEY (sku, forecast_date)
+        PRIMARY KEY (sku, country, forecast_date)
       );
+      -- Pre-existing deploys created this table before the country column existed - add it
+      -- (every existing row backfills to the same 'UNKNOWN' default the column itself now
+      -- has, which is exactly correct: that data was never country-split to begin with) and
+      -- widen the primary key to match. Idempotent: re-running this against an
+      -- already-migrated table just drops and recreates the identical constraint.
+      ALTER TABLE sales_forecast ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'UNKNOWN';
+      ALTER TABLE sales_forecast DROP CONSTRAINT IF EXISTS sales_forecast_pkey;
+      ALTER TABLE sales_forecast ADD CONSTRAINT sales_forecast_pkey PRIMARY KEY (sku, country, forecast_date);
       CREATE INDEX IF NOT EXISTS idx_sales_forecast_date ON sales_forecast (forecast_date);
+      CREATE INDEX IF NOT EXISTS idx_sales_forecast_sku_country ON sales_forecast (sku, country);
       CREATE TABLE IF NOT EXISTS sales_forecast_exclusions (
         sku TEXT NOT NULL,
+        country TEXT NOT NULL DEFAULT 'UNKNOWN',
         excluded_date DATE NOT NULL,
         reason TEXT,
-        PRIMARY KEY (sku, excluded_date)
+        PRIMARY KEY (sku, country, excluded_date)
       );
+      ALTER TABLE sales_forecast_exclusions ADD COLUMN IF NOT EXISTS country TEXT NOT NULL DEFAULT 'UNKNOWN';
+      ALTER TABLE sales_forecast_exclusions DROP CONSTRAINT IF EXISTS sales_forecast_exclusions_pkey;
+      ALTER TABLE sales_forecast_exclusions ADD CONSTRAINT sales_forecast_exclusions_pkey PRIMARY KEY (sku, country, excluded_date);
     `);
   } catch (e) {
     console.error('[db] Sales forecast schema migration failed:', e.message);
@@ -4132,8 +4154,13 @@ app.get('/api/procurement-risk', async (req, res) => {
         GROUP BY aol.sku
       ),
       forecast_flags AS (
+        -- COUNT(DISTINCT forecast_date), not COUNT(*) - sales_forecast can now hold
+        -- several rows per (sku, date), one per country (each forecast independently -
+        -- see sales-forecast-service/pipeline.run()); this is an account-wide "how many
+        -- of the next 90 days are constrained" figure, so a day flagged in two countries
+        -- still only counts once.
         SELECT sku,
-          COUNT(*) FILTER (WHERE model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%')::int AS constrained_days_next_90,
+          COUNT(DISTINCT forecast_date) FILTER (WHERE model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%')::int AS constrained_days_next_90,
           MIN(forecast_date) FILTER (WHERE model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%') AS first_constrained_date
         FROM sales_forecast
         WHERE forecast_date::date BETWEEN CURRENT_DATE AND CURRENT_DATE + INTERVAL '90 days'
@@ -5181,14 +5208,28 @@ app.get('/api/sync-status', async (req, res) => {
 // silently gets index.html back instead (exactly what broke this the first time).
 app.get('/api/sales-forecast', async (req, res) => {
   const historyDays = Math.min(parseInt(req.query.history_days, 10) || 60, 365);
+  // Both optional - null means "every brand"/"every country". brand matches
+  // sku_parameters.brand exactly; country matches sales_forecast.country / v_sku_revenue's
+  // COALESCE(shipping_country,'UNKNOWN') exactly (see migrateSalesForecastSchema's own
+  // comment for why 'UNKNOWN' is a real, selectable group rather than being dropped).
+  // Every query below that touches actual sales or the forecast applies both - see
+  // run_for_sku/pipeline.run() in sales-forecast-service for why country-filtering the
+  // forecast is meaningful at all: each (sku, country) pair was fit as its own fully
+  // independent series, not derived by splitting a blended one after the fact.
+  const brand = req.query.brand || null;
+  const country = req.query.country || null;
   try {
     const reportingCurrency = await getReportingCurrency();
     const today = new Date().toISOString().split('T')[0];
     const fxRate = await getFxRate('GBP', reportingCurrency, today);
     const sym = { GBP: '£', USD: '$', EUR: '€' }[reportingCurrency] || '£';
     const fx = (n) => (parseFloat(n || 0) * fxRate);
+    const brandSkuFilter = `($2::text IS NULL OR sku IN (SELECT sku FROM sku_parameters WHERE brand = $2))`;
 
-    const [historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult, pyDailyResult, py2DailyResult, unitsInputsResult, pendingInboundBySku] = await Promise.all([
+    const [
+      historyResult, forecastResult, skuResult, latestGenResult, skuSeriesResult, milestonesResult,
+      pyDailyResult, py2DailyResult, unitsInputsResult, pendingInboundBySku, brandsResult, countriesResult,
+    ] = await Promise.all([
       // "revenue" here means the same thing it means everywhere else in this app (Sales
       // Summary, Product Breakdown): order-line revenue net of discounts, MINUS refunds
       // for the period - not just v_sku_revenue.net_revenue on its own, which is
@@ -5197,19 +5238,21 @@ app.get('/api/sales-forecast', async (req, res) => {
         WITH rev AS (
           SELECT order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
-          WHERE order_date::date >= CURRENT_DATE - $1::int
+          WHERE order_date::date >= CURRENT_DATE - $1::int AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY 1
         ),
         ref AS (
           SELECT refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
-          WHERE refund_date::date >= CURRENT_DATE - $1::int
+          WHERE refund_date::date >= CURRENT_DATE - $1::int AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY 1
         )
         SELECT COALESCE(rev.date, ref.date) AS date, (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
         FROM rev FULL OUTER JOIN ref ON ref.date = rev.date
         ORDER BY 1
-      `, [historyDays]),
+      `, [historyDays, brand, country]),
       pool.query(`
         SELECT forecast_date::date AS date,
           SUM(forecast_revenue)::numeric(12,2) AS revenue,
@@ -5217,21 +5260,29 @@ app.get('/api/sales-forecast', async (req, res) => {
           SUM(COALESCE(high_revenue, forecast_revenue))::numeric(12,2) AS high
         FROM sales_forecast
         WHERE forecast_date::date >= CURRENT_DATE
+          AND ($1::text IS NULL OR sku IN (SELECT sku FROM sku_parameters WHERE brand = $1))
+          AND ($2::text IS NULL OR country = $2)
         GROUP BY 1 ORDER BY 1
-      `),
+      `, [brand, country]),
       // Per-SKU: last 30d actual vs next 30d forecast, plus the stage/EOL config and any
-      // outlier exclusions, so the UI can show why a number looks the way it does.
+      // outlier exclusions, so the UI can show why a number looks the way it does. Country
+      // filters every revenue/forecast/exclusion CTE (a SKU not sold into the filtered
+      // country correctly shows 0, not its whole-catalog total); brand filters only the
+      // final SELECT (sp.brand), so all_skus stays catalog-wide and a brand-filtered-out
+      // SKU is excluded as a whole row rather than zeroed.
       pool.query(`
         WITH last30_rev AS (
           SELECT sku, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
           WHERE order_date::date >= CURRENT_DATE - INTERVAL '30 days'
+            AND ($2::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $2)
           GROUP BY sku
         ),
         last30_ref AS (
           SELECT sku, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
           WHERE refund_date::date >= CURRENT_DATE - INTERVAL '30 days' AND sku IS NOT NULL
+            AND ($2::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $2)
           GROUP BY sku
         ),
         last30 AS (
@@ -5242,24 +5293,32 @@ app.get('/api/sales-forecast', async (req, res) => {
           SELECT sku, SUM(forecast_revenue)::numeric(12,2) AS revenue
           FROM sales_forecast
           WHERE forecast_date::date > CURRENT_DATE AND forecast_date::date <= CURRENT_DATE + INTERVAL '30 days'
+            AND ($2::text IS NULL OR country = $2)
           GROUP BY sku
         ),
+        -- Country unfiltered: a SKU's stage/model can now genuinely differ by country (each
+        -- is an independent fit - see pipeline.run()), so picking a representative one for
+        -- the whole-catalog view is inherently approximate. Breaks ties deterministically by
+        -- country name rather than leaving it to arbitrary row order.
         latest_stage AS (
           SELECT DISTINCT ON (sku) sku, stage_used, model_used, generated_at
           FROM sales_forecast
-          ORDER BY sku, forecast_date DESC
+          WHERE $2::text IS NULL OR country = $2
+          ORDER BY sku, forecast_date DESC, country
         ),
         exclusions AS (
           SELECT sku, COUNT(*)::int AS excluded_count, MAX(excluded_date) AS last_excluded_date,
             (ARRAY_AGG(reason ORDER BY excluded_date DESC))[1] AS last_reason
-          FROM sales_forecast_exclusions GROUP BY sku
+          FROM sales_forecast_exclusions
+          WHERE $2::text IS NULL OR country = $2
+          GROUP BY sku
         ),
         all_skus AS (
           SELECT sku FROM last30
           UNION SELECT sku FROM next30
           UNION SELECT sku FROM sku_forecast_config
         )
-        SELECT a.sku, COALESCE(sp.product_name, ot.title) AS product_title, sp.image_url, sp.asin, sp.parent_asin,
+        SELECT a.sku, COALESCE(sp.product_name, ot.title) AS product_title, sp.image_url, sp.asin, sp.parent_asin, sp.brand,
           cfg.stage_override, COALESCE(cfg.is_end_of_life, false) AS is_end_of_life,
           ls.stage_used, ls.model_used, ls.generated_at,
           COALESCE(l30.revenue, 0) AS last_30d_revenue,
@@ -5276,8 +5335,9 @@ app.get('/api/sales-forecast', async (req, res) => {
           SELECT title FROM amazon_order_lines WHERE sku = a.sku AND title IS NOT NULL
           ORDER BY synced_at DESC LIMIT 1
         ) ot ON true
+        WHERE $1::text IS NULL OR sp.brand = $1
         ORDER BY n30.revenue DESC NULLS LAST, l30.revenue DESC NULLS LAST
-      `),
+      `, [brand, country]),
       pool.query(`SELECT MAX(generated_at) AS generated_at FROM sales_forecast`),
       // Per-SKU, per-day series (actual within the same history window, plus every
       // forecast row) - lets the tab re-aggregate the chart down to just the SKUs a user
@@ -5287,13 +5347,15 @@ app.get('/api/sales-forecast', async (req, res) => {
         WITH actual_rev AS (
           SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
-          WHERE sku IS NOT NULL AND order_date::date >= CURRENT_DATE - $1::int
+          WHERE sku IS NOT NULL AND order_date::date >= CURRENT_DATE - $1::int AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, order_date::date
         ),
         actual_ref AS (
           SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
-          WHERE sku IS NOT NULL AND refund_date::date >= CURRENT_DATE - $1::int
+          WHERE sku IS NOT NULL AND refund_date::date >= CURRENT_DATE - $1::int AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, refund_date::date
         ),
         actual_by_sku AS (
@@ -5304,11 +5366,20 @@ app.get('/api/sales-forecast', async (req, res) => {
         SELECT sku, date, revenue, NULL::numeric AS low, NULL::numeric AS high, true AS actual
         FROM actual_by_sku
         UNION ALL
-        SELECT sku, forecast_date AS date, forecast_revenue AS revenue, low_revenue AS low, high_revenue AS high, false AS actual
+        -- GROUP BY (not a raw per-row SELECT) - sales_forecast can now hold several rows
+        -- per (sku, date), one per country (each fit independently - see pipeline.run()).
+        -- Summing here reduces back to the catalog-wide per-(sku,date) total when no
+        -- country filter is given (the shape this query has always returned), or to just
+        -- the one matching country's row when a filter narrows it to a single group.
+        SELECT sku, forecast_date AS date, SUM(forecast_revenue)::numeric(12,2) AS revenue,
+          SUM(COALESCE(low_revenue, forecast_revenue))::numeric(12,2) AS low,
+          SUM(COALESCE(high_revenue, forecast_revenue))::numeric(12,2) AS high, false AS actual
         FROM sales_forecast
-        WHERE forecast_date::date >= CURRENT_DATE
+        WHERE forecast_date::date >= CURRENT_DATE AND ${brandSkuFilter}
+          AND ($3::text IS NULL OR country = $3)
+        GROUP BY sku, forecast_date
         ORDER BY 1, 2
-      `, [historyDays]),
+      `, [historyDays, brand, country]),
       // Monthly milestones: one row per calendar month from the start of the selected
       // actuals window through the end of the forecast horizon, each compared against
       // the SAME calendar month exactly one year earlier - a real PY comparator, not a
@@ -5328,14 +5399,16 @@ app.get('/api/sales-forecast', async (req, res) => {
           SELECT date_trunc('month', order_date::date)::date AS month,
             SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
-          WHERE order_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months'
+          WHERE order_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months' AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY 1
         ),
         actual_ref AS (
           SELECT date_trunc('month', refund_date::date)::date AS month,
             SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
-          WHERE refund_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months'
+          WHERE refund_date::date >= (SELECT start_month FROM bounds) - INTERVAL '13 months' AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY 1
         ),
         actual_by_month AS (
@@ -5344,7 +5417,9 @@ app.get('/api/sales-forecast', async (req, res) => {
         ),
         forecast_by_month AS (
           SELECT date_trunc('month', forecast_date::date)::date AS month, SUM(forecast_revenue)::numeric(12,2) AS revenue
-          FROM sales_forecast WHERE forecast_date::date >= CURRENT_DATE
+          FROM sales_forecast
+          WHERE forecast_date::date >= CURRENT_DATE AND ${brandSkuFilter}
+            AND ($3::text IS NULL OR country = $3)
           GROUP BY 1
         )
         SELECT m.month,
@@ -5356,7 +5431,7 @@ app.get('/api/sales-forecast', async (req, res) => {
         LEFT JOIN forecast_by_month fc ON fc.month = m.month
         LEFT JOIN actual_by_month py ON py.month = (m.month - INTERVAL '1 year')::date
         ORDER BY m.month
-      `, [historyDays]),
+      `, [historyDays, brand, country]),
       // Daily actuals for the PY (prior-year) comparator, at DAY grain AND per-SKU - so the
       // tooltip's "vs PY" can compare a single hovered day (Daily granularity) or a summed
       // week (Weekly) against the matching PY day/week, not just a whole month (`milestones`
@@ -5373,19 +5448,21 @@ app.get('/api/sales-forecast', async (req, res) => {
           SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
           WHERE sku IS NOT NULL AND order_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+            AND ${brandSkuFilter} AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, 2
         ),
         ref AS (
           SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
           WHERE sku IS NOT NULL AND refund_date::date BETWEEN (CURRENT_DATE - $1::int - 371) AND (CURRENT_DATE + 180 - 357)
+            AND ${brandSkuFilter} AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, 2
         )
         SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.date, ref.date) AS date,
           (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
         FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
         ORDER BY 1, 2
-      `, [historyDays]),
+      `, [historyDays, brand, country]),
       // Same as the PY query above, shifted a further 364 days back (728 total - two
       // whole years, weekday-aligned) - the chart's "PY-2" reference line.
       pool.query(`
@@ -5393,19 +5470,21 @@ app.get('/api/sales-forecast', async (req, res) => {
           SELECT sku, order_date::date AS date, SUM(net_revenue / vat_divisor(shipping_country))::numeric(12,2) AS revenue
           FROM v_sku_revenue
           WHERE sku IS NOT NULL AND order_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
+            AND ${brandSkuFilter} AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, 2
         ),
         ref AS (
           SELECT sku, refund_date::date AS date, SUM(amount_refunded / vat_divisor(shipping_country))::numeric(12,2) AS refunded
           FROM v_refunds_by_date
           WHERE sku IS NOT NULL AND refund_date::date BETWEEN (CURRENT_DATE - $1::int - 735) AND (CURRENT_DATE + 180 - 721)
+            AND ${brandSkuFilter} AND ($3::text IS NULL OR COALESCE(shipping_country, 'UNKNOWN') = $3)
           GROUP BY sku, 2
         )
         SELECT COALESCE(rev.sku, ref.sku) AS sku, COALESCE(rev.date, ref.date) AS date,
           (COALESCE(rev.revenue, 0) - COALESCE(ref.refunded, 0))::numeric(12,2) AS revenue
         FROM rev FULL OUTER JOIN ref ON ref.sku = rev.sku AND ref.date = rev.date
         ORDER BY 1, 2
-      `, [historyDays]),
+      `, [historyDays, brand, country]),
       // Current sellable units + an average selling price per SKU, so each forecast-date
       // row's £ revenue can be converted into units for the chart tooltip's "Available
       // units" / "Incoming units" lines below - same avg30-with-last-price-fallback basis
@@ -5429,6 +5508,11 @@ app.get('/api/sales-forecast', async (req, res) => {
       // Real pending inbound shipments per SKU (see fetchPendingInboundBySku above) - the
       // "incoming units" half of the available-units figure below.
       fetchPendingInboundBySku(),
+      // Filter dropdown options - deliberately UNFILTERED by the current brand/country
+      // selection (unlike every query above) so picking one filter never shrinks the other
+      // dropdown's own options out from under the user.
+      pool.query(`SELECT DISTINCT brand FROM sku_parameters WHERE brand IS NOT NULL ORDER BY 1`),
+      pool.query(`SELECT DISTINCT COALESCE(shipping_country, 'UNKNOWN') AS country FROM v_sku_revenue ORDER BY 1`),
     ]);
 
     res.json({
@@ -5509,6 +5593,7 @@ app.get('/api/sales-forecast', async (req, res) => {
         image_url: r.image_url,
         asin: r.asin,
         parent_asin: r.parent_asin,
+        brand: r.brand,
         stage: r.stage_override || r.stage_used || null,
         stage_override: r.stage_override,
         auto_stage: r.stage_used,
@@ -5521,6 +5606,13 @@ app.get('/api/sales-forecast', async (req, res) => {
         last_excluded_date: r.last_excluded_date,
         last_exclusion_reason: r.last_reason,
       })),
+      // Dropdown options for the Brand/Country filters above the chart - always the FULL
+      // catalog-wide list (see the two queries above), independent of whichever brand/
+      // country is currently selected.
+      available_brands: brandsResult.rows.map(r => r.brand),
+      available_countries: countriesResult.rows.map(r => r.country),
+      selected_brand: brand,
+      selected_country: country,
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
@@ -5643,10 +5735,19 @@ app.get('/api/cashflow', async (req, res) => {
       // Per-SKU forecast, day by day - shared below by both the channel split and the
       // Procurement simulation further down, which each need this same per-SKU/per-day shape.
       pool.query(`
-        SELECT sku, forecast_date::date AS date, forecast_revenue,
-          (model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%') AS constrained
+        -- SUMs across country (sales_forecast can now hold several rows per (sku, date),
+        -- one per independently-forecast country - see pipeline.run()) - both downstream
+        -- uses (cash INFLOW projection, procurement reorder sizing) are SKU/stock-level
+        -- concerns that need the SKU's TOTAL demand across every market it sells into, not
+        -- any one country's own figure. constrained is true if ANY country's forecast for
+        -- that day was supply/EOL-constrained - the unconstrained-velocity floor in the
+        -- procurement loop below should still kick in if part of the SKU's true demand is
+        -- being suppressed somewhere, even if another country's slice wasn't.
+        SELECT sku, forecast_date::date AS date, SUM(forecast_revenue) AS forecast_revenue,
+          BOOL_OR(model_used LIKE '%supply_constrained%' OR model_used LIKE '%eol_cutoff%') AS constrained
         FROM sales_forecast
         WHERE forecast_date::date >= CURRENT_DATE AND forecast_date::date < CURRENT_DATE + $1::int
+        GROUP BY sku, forecast_date::date
       `, [horizonDays]),
       // Trailing 180-day channel split, PER SKU - a single catalog-wide ratio would hide
       // real per-SKU variation (checked live against this account: per-SKU Shopify share
