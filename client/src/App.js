@@ -12,21 +12,48 @@ import Settings from './pages/Settings';
 import ChatWidget from './components/ChatWidget';
 import { useIsMobile } from './hooks/useIsMobile';
 
-const NAV = [
-  { id: 'sales',     label: 'Sales Summary',      icon: '◈', active: true },
-  { id: 'products',  label: 'Product Breakdown',   icon: '◉', active: true },
-  { id: 'pnl',       label: 'P&L',                 icon: '◎', active: true },
-  { id: 'pvm',       label: 'PVM',                 icon: '◐', active: true },
-  { id: 'inventory', label: 'Inventory',            icon: '◑', active: true },
-  { id: 'shipments', label: 'Shipments',            icon: '◒', active: true },
-  { id: 'salesforecast', label: 'Sales Forecast',   icon: '◕', active: true },
-  // 'cashrecon' (Cash Reconciliation) is deliberately left OUT of NAV, not just set
-  // active:false - that flag renders a grayed-out "SOON" row, which reads as "not built
-  // yet" for a tab that's fully working and just hidden by request. Its render branch
-  // below is untouched, so re-adding this one line brings it straight back.
-  { id: 'cashflow',  label: 'Cash Flow',            icon: '◔', active: true },
-  { id: 'settings',  label: 'Settings',             icon: '◓', active: true },
+// Grouped into sections for the sidebar - Settings is deliberately NOT one of these
+// groups, it's rendered as its own pinned item at the bottom of the nav (see SETTINGS_ITEM
+// below), separate from the day-to-day sections above it.
+const NAV_SECTIONS = [
+  {
+    label: 'Sales',
+    items: [
+      { id: 'sales',    label: 'Sales Summary',    icon: '◈', active: true },
+      { id: 'products', label: 'Product Breakdown', icon: '◉', active: true },
+    ],
+  },
+  {
+    label: 'Profitability',
+    items: [
+      { id: 'pnl', label: 'P&L', icon: '◎', active: true },
+      { id: 'pvm', label: 'PVM', icon: '◐', active: true },
+    ],
+  },
+  {
+    label: 'Operations',
+    items: [
+      { id: 'shipments', label: 'Shipments', icon: '◒', active: true },
+      { id: 'inventory', label: 'Inventory', icon: '◑', active: true },
+    ],
+  },
+  {
+    label: 'Forecasting',
+    items: [
+      { id: 'salesforecast', label: 'Sales Forecast', icon: '◕', active: true },
+      // 'cashrecon' (Cash Reconciliation) is deliberately left out of every section, not
+      // just set active:false - that flag renders a grayed-out "SOON" row, which reads as
+      // "not built yet" for a tab that's fully working and just hidden by request. Its
+      // render branch below is untouched, so re-adding it to a section brings it straight
+      // back.
+      { id: 'cashflow', label: 'Cash Flow', icon: '◔', active: true },
+    ],
+  },
 ];
+const SETTINGS_ITEM = { id: 'settings', label: 'Settings', icon: '◓', active: true };
+// Flat lookup across every section plus Settings - used for the mobile top bar's current-
+// tab label and nothing else, so it doesn't need to know about section grouping at all.
+const ALL_NAV_ITEMS = [...NAV_SECTIONS.flatMap(s => s.items), SETTINGS_ITEM];
 
 function Placeholder({ label }) {
   return (
@@ -38,6 +65,39 @@ function Placeholder({ label }) {
   );
 }
 
+function NavButton({ item, active, collapsed, onClick }) {
+  return (
+    <button
+      onClick={() => item.active && onClick(item.id)}
+      title={collapsed ? item.label : ''}
+      style={{
+        display: 'flex',
+        alignItems: 'center',
+        gap: 12,
+        padding: collapsed ? '10px 0' : '10px 12px',
+        justifyContent: collapsed ? 'center' : 'flex-start',
+        borderRadius: 8,
+        border: 'none',
+        background: active ? 'var(--accent)20' : 'none',
+        color: active ? 'var(--accent2)' : item.active ? 'var(--text)' : 'var(--muted)',
+        cursor: item.active ? 'pointer' : 'not-allowed',
+        fontSize: 13,
+        fontWeight: active ? 600 : 400,
+        fontFamily: 'var(--font)',
+        transition: 'all 0.15s',
+        width: '100%',
+        opacity: item.active ? 1 : 0.4,
+        letterSpacing: '0.01em',
+        whiteSpace: 'nowrap',
+      }}
+    >
+      <span style={{ fontSize: 16, flexShrink: 0 }}>{item.icon}</span>
+      {!collapsed && <span>{item.label}</span>}
+      {!collapsed && !item.active && <span style={{ marginLeft: 'auto', fontSize: 9, letterSpacing: '0.08em', color: 'var(--muted)' }}>SOON</span>}
+    </button>
+  );
+}
+
 export default function App() {
   const [active, setActive] = useState(() => localStorage.getItem('gb_active_tab') || 'sales');
   const [collapsed, setCollapsed] = useState(false);
@@ -46,7 +106,7 @@ export default function App() {
   // On mobile the sidebar is a full-width overlay drawer, not an icon rail — the desktop
   // collapse toggle doesn't apply there.
   const sidebarCollapsed = isMobile ? false : collapsed;
-  const activeLabel = NAV.find(n => n.id === active)?.label || '';
+  const activeLabel = ALL_NAV_ITEMS.find(n => n.id === active)?.label || '';
 
   const handleNav = (id) => {
     setActive(id);
@@ -106,40 +166,26 @@ export default function App() {
           </button>
         </div>
 
-        {/* Nav items */}
-        <nav style={{ flex: 1, padding: '12px 8px', display: 'flex', flexDirection: 'column', gap: 2 }}>
-          {NAV.map(item => (
-            <button
-              key={item.id}
-              onClick={() => item.active && handleNav(item.id)}
-              title={sidebarCollapsed ? item.label : ''}
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: 12,
-                padding: sidebarCollapsed ? '10px 0' : '10px 12px',
-                justifyContent: sidebarCollapsed ? 'center' : 'flex-start',
-                borderRadius: 8,
-                border: 'none',
-                background: active === item.id ? 'var(--accent)20' : 'none',
-                color: active === item.id ? 'var(--accent2)' : item.active ? 'var(--text)' : 'var(--muted)',
-                cursor: item.active ? 'pointer' : 'not-allowed',
-                fontSize: 13,
-                fontWeight: active === item.id ? 600 : 400,
-                fontFamily: 'var(--font)',
-                transition: 'all 0.15s',
-                width: '100%',
-                opacity: item.active ? 1 : 0.4,
-                letterSpacing: '0.01em',
-                whiteSpace: 'nowrap',
-              }}
-            >
-              <span style={{ fontSize: 16, flexShrink: 0 }}>{item.icon}</span>
-              {!sidebarCollapsed && <span>{item.label}</span>}
-              {!sidebarCollapsed && !item.active && <span style={{ marginLeft: 'auto', fontSize: 9, letterSpacing: '0.08em', color: 'var(--muted)' }}>SOON</span>}
-            </button>
+        {/* Nav sections */}
+        <nav style={{ flex: 1, padding: '12px 8px', display: 'flex', flexDirection: 'column', gap: 16, overflowY: 'auto' }}>
+          {NAV_SECTIONS.map(section => (
+            <div key={section.label} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+              {!sidebarCollapsed && (
+                <div style={{ padding: '0 12px', marginBottom: 4, fontSize: 10, color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  {section.label}
+                </div>
+              )}
+              {section.items.map(item => (
+                <NavButton key={item.id} item={item} active={active === item.id} collapsed={sidebarCollapsed} onClick={handleNav} />
+              ))}
+            </div>
           ))}
         </nav>
+
+        {/* Settings — pinned at the bottom of the nav, separate from the sections above it */}
+        <div style={{ padding: '8px', borderTop: '1px solid var(--border)' }}>
+          <NavButton item={SETTINGS_ITEM} active={active === SETTINGS_ITEM.id} collapsed={sidebarCollapsed} onClick={handleNav} />
+        </div>
 
         {/* Bottom: channel indicator */}
         {!sidebarCollapsed && (
