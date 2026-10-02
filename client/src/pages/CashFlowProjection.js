@@ -367,7 +367,7 @@ export default function CashFlowProjection() {
         <div style={cardStyle}>
           <div style={{ fontSize: 13, fontWeight: 700, marginBottom: 2 }}>Projected replenishment orders</div>
           <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 14, lineHeight: 1.5 }}>
-            Automatically triggered from current stock (plus any real shipments already in transit — see the Shipments tab), forecasted velocity, and your Procurement lead-time/payment assumptions (Settings → Procurement) — each of these is already included as a cash outflow above.
+            Automatically triggered from current stock (plus any real shipments already in transit — see the Shipments tab), forecasted velocity, and your Procurement lead-time/payment assumptions (Settings → Procurement) — each of these is already included as a cash outflow above. Order size covers forecasted demand until the order arrives; a <span style={{ color: 'var(--amber)' }}>●</span> marks an order placed while already at/below zero stock, which adds 2 weeks of extra safety stock on top.
           </div>
           <div style={{ overflowX: 'auto' }}>
             <table style={{ width: '100%', borderCollapse: 'collapse', minWidth: 640 }}>
@@ -385,7 +385,17 @@ export default function CashFlowProjection() {
                     <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.trigger_date)}</td>
                     <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.arrival_date)}</td>
                     <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtDate(o.payment_date)}</td>
-                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{o.order_qty.toLocaleString()}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>
+                      {o.order_qty.toLocaleString()}
+                      {o.includes_safety_stock && (
+                        <span
+                          title={`Includes ${o.safety_stock_qty.toLocaleString()} extra units of safety stock — stock was already at/below zero when this order was triggered`}
+                          style={{ marginLeft: 5, color: 'var(--amber)', cursor: 'help' }}
+                        >
+                          ●
+                        </span>
+                      )}
+                    </td>
                     <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right', fontWeight: 600 }}>{fmtMoney(o.amount, sym)}</td>
                   </tr>
                 ))}
