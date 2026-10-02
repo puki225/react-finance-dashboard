@@ -117,11 +117,22 @@ function bucketDays(days, granularity) {
       cur.hasBand = true;
     }
     cur.actual = cur.actual && d.actual;
+    // Available/incoming units are point-in-time stock levels, not flows - summing them
+    // across a bucket would overcount (e.g. "500 units available" every day of a week
+    // becoming "3500"). Keep the LAST day's figure instead, so a weekly/monthly bucket
+    // reads as "units available as of the end of that period". `days` arrives sorted
+    // ascending by date, so iterating in order and overwriting lands on the last one.
+    if (d.available_units !== undefined) cur.available_units = d.available_units;
+    if (d.incoming_units !== undefined) cur.incoming_units = d.incoming_units;
     buckets.set(key, cur);
   }
   return [...buckets.values()]
     .sort((a, b) => (a.date < b.date ? -1 : 1))
-    .map(b => ({ date: b.date, value: b.value, actual: b.actual, low: b.hasBand ? b.low : undefined, high: b.hasBand ? b.high : undefined }));
+    .map(b => ({
+      date: b.date, value: b.value, actual: b.actual,
+      low: b.hasBand ? b.low : undefined, high: b.hasBand ? b.high : undefined,
+      available_units: b.available_units, incoming_units: b.incoming_units,
+    }));
 }
 
 // Pick a readable subset of x-axis tick indices regardless of series length: always the
@@ -331,6 +342,25 @@ function MainChart({ days, granularity, sym, milestones, pyByDate, py2ByDate }) 
               <span>Range</span><span style={{ fontFamily: 'var(--mono)', fontWeight: 500 }}>{fmtMoney(hoveredDay.low, sym)} – {fmtMoney(hoveredDay.high, sym)}</span>
             </div>
           )}
+          {!hoveredDay.actual && hoveredDay.available_units !== undefined && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+              <span>Available units</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: hoveredDay.available_units < 0 ? 'var(--red)' : 'var(--text)' }}>
+                {Math.round(hoveredDay.available_units).toLocaleString('en-GB')}
+              </span>
+            </div>
+          )}
+          {/* Only shown when a real shipment is actually pending for the selected SKU(s) -
+              a zero or absent incoming figure means no shipment is created/live, so the
+              line is omitted entirely rather than shown as "Incoming units: 0". */}
+          {!hoveredDay.actual && hoveredDay.incoming_units > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
+              <span>Incoming units</span>
+              <span style={{ fontFamily: 'var(--mono)', fontWeight: 500, color: 'var(--accent2)' }}>
+                {Math.round(hoveredDay.incoming_units).toLocaleString('en-GB')}
+              </span>
+            </div>
+          )}
           {hoveredPyPct !== undefined && (
             <div style={{ display: 'flex', justifyContent: 'space-between', gap: 14 }}>
               <span>{granularity === 'monthly' ? 'Month' : granularity === 'weekly' ? 'Week' : 'Day'} vs PY</span>
@@ -472,8 +502,33 @@ export default function SalesForecast() {
 
   const fullDays = useMemo(() => buildDays(history, forecast), [history, forecast]);
 
+  // Available/incoming units, summed across whichever SKUs are selected - or every SKU in
+  // skuSeriesBySku when nothing's selected, since (unlike revenue/low/high) there's no
+  // separate whole-catalog-pre-aggregated source for units to fall back to. This is what
+  // makes the tooltip's unit figures "work at SKU level... when I filter": the same
+  // selectedSkus set that already narrows the revenue line narrows this too.
+  const unitsByDate = useMemo(() => {
+    const skusToSum = selectedSkus.size > 0 ? selectedSkus : skuSeriesBySku.keys();
+    const byDate = new Map();
+    for (const sku of skusToSum) {
+      for (const r of (skuSeriesBySku.get(sku) || [])) {
+        if (r.actual || r.available_units === undefined) continue;
+        const cur = byDate.get(r.date) || { available_units: 0, incoming_units: 0 };
+        cur.available_units += r.available_units;
+        cur.incoming_units += r.incoming_units;
+        byDate.set(r.date, cur);
+      }
+    }
+    return byDate;
+  }, [selectedSkus, skuSeriesBySku]);
+
   const selectedDays = useMemo(() => {
-    if (selectedSkus.size === 0) return fullDays;
+    if (selectedSkus.size === 0) {
+      return fullDays.map(d => {
+        const u = unitsByDate.get(d.date);
+        return u ? { ...d, available_units: u.available_units, incoming_units: u.incoming_units } : d;
+      });
+    }
     const byDate = new Map();
     for (const sku of selectedSkus) {
       for (const r of (skuSeriesBySku.get(sku) || [])) {
@@ -486,10 +541,12 @@ export default function SalesForecast() {
     }
     return fullDays.map(d => {
       const v = byDate.get(d.date);
-      if (!v) return { date: d.date, value: 0, actual: d.actual, low: d.actual ? undefined : 0, high: d.actual ? undefined : 0 };
-      return { date: d.date, value: v.revenue, actual: d.actual, low: d.actual ? undefined : v.low, high: d.actual ? undefined : v.high };
+      const u = unitsByDate.get(d.date);
+      const unitsFields = u ? { available_units: u.available_units, incoming_units: u.incoming_units } : {};
+      if (!v) return { date: d.date, value: 0, actual: d.actual, low: d.actual ? undefined : 0, high: d.actual ? undefined : 0, ...unitsFields };
+      return { date: d.date, value: v.revenue, actual: d.actual, low: d.actual ? undefined : v.low, high: d.actual ? undefined : v.high, ...unitsFields };
     });
-  }, [fullDays, selectedSkus, skuSeriesBySku]);
+  }, [fullDays, selectedSkus, skuSeriesBySku, unitsByDate]);
 
   const bucketedDays = useMemo(() => bucketDays(selectedDays, granularity), [selectedDays, granularity]);
 
