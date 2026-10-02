@@ -171,7 +171,7 @@ export default function App() {
           {NAV_SECTIONS.map(section => (
             <div key={section.label} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
               {!sidebarCollapsed && (
-                <div style={{ padding: '0 12px', marginBottom: 4, fontSize: 10, color: 'var(--muted)', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                <div style={{ padding: '0 12px', marginBottom: 6, fontSize: 13, fontWeight: 700, color: 'var(--text)', letterSpacing: '0.04em', textTransform: 'uppercase', textDecoration: 'underline', textUnderlineOffset: 3 }}>
                   {section.label}
                 </div>
               )}
