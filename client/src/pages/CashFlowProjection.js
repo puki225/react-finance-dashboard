@@ -61,6 +61,27 @@ function bucketWeekly(daily) {
     .map(b => ({ date: b.date, inflow: b.inflow.toFixed(2), outflow: b.outflow.toFixed(2), net: b.net.toFixed(2), balance: b.balance }));
 }
 
+const amazonUrl = (asin) => asin ? `https://www.amazon.co.uk/dp/${asin}` : null;
+
+// Same small thumbnail pattern as Sales Forecast's per-SKU table - links out to the Amazon
+// listing when an ASIN is known, and reports hover in/out so the caller can show the real
+// product title (hovering a bare SKU tells you nothing about what the product actually is).
+function ProductImage({ imageUrl, asin, sku, onEnter, onLeave }) {
+  const url = amazonUrl(asin);
+  const Tag = url ? 'a' : 'div';
+  const linkProps = url ? { href: url, target: '_blank', rel: 'noopener noreferrer' } : {};
+  return (
+    <Tag
+      {...linkProps}
+      onMouseEnter={onEnter}
+      onMouseLeave={onLeave}
+      style={{ width: 28, height: 28, flexShrink: 0, borderRadius: 6, overflow: 'hidden', background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', cursor: url ? 'pointer' : 'help', textDecoration: 'none' }}
+    >
+      {imageUrl ? <img src={imageUrl} alt={sku} style={{ width: '100%', height: '100%', objectFit: 'contain' }} /> : <span style={{ fontSize: 11, opacity: 0.2 }}>◉</span>}
+    </Tag>
+  );
+}
+
 // Same fast custom tooltip pattern as Sales Forecast/PVM - native `title` has a fixed OS
 // delay; portalled to document.body so it can't get clipped by a card's own overflow.
 function HoverTooltip({ tip }) {
@@ -256,6 +277,7 @@ function AssumptionsSummary({ data, sym }) {
 export default function CashFlowProjection() {
   const [windowDays, setWindowDays] = useState(90);
   const [granularity, setGranularity] = useState('daily');
+  const [productTip, setProductTip] = useState(null);
   const { data, loading, error } = useApi('/api/cashflow', { horizon_days: windowDays });
   const sym = data?.currency_symbol || '£';
 
@@ -381,7 +403,19 @@ export default function CashFlowProjection() {
               <tbody>
                 {data.procurement_orders.map((o, i) => (
                   <tr key={i} style={{ borderBottom: '1px solid var(--border)' }}>
-                    <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)' }}>{o.sku}</td>
+                    <td style={{ padding: '8px 10px', fontSize: 12 }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                        <ProductImage
+                          imageUrl={o.image_url} asin={o.asin} sku={o.sku}
+                          onEnter={e => {
+                            const r = e.currentTarget.getBoundingClientRect();
+                            setProductTip({ top: r.bottom + 6, left: r.left, content: o.product_name || o.sku });
+                          }}
+                          onLeave={() => setProductTip(null)}
+                        />
+                        <span style={{ fontFamily: 'var(--mono)' }}>{o.sku}</span>
+                      </div>
+                    </td>
                     <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.trigger_date)}</td>
                     <td style={{ padding: '8px 10px', fontSize: 12 }}>{fmtDate(o.arrival_date)}</td>
                     <td style={{ padding: '8px 10px', fontSize: 12, fontFamily: 'var(--mono)', textAlign: 'right' }}>{fmtDate(o.payment_date)}</td>
@@ -404,6 +438,7 @@ export default function CashFlowProjection() {
           </div>
         </div>
       )}
+      <HoverTooltip tip={productTip} />
     </div>
   );
 }

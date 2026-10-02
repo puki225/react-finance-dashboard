@@ -5885,10 +5885,16 @@ app.get('/api/cashflow', async (req, res) => {
           -- fallback used elsewhere (Inventory, Sales Forecast, Product Breakdown) so a
           -- procurement order can be reported by its real listing name, not just its SKU.
           COALESCE(sp.product_name, ot.title) AS product_name,
+          sp.image_url, sp.asin,
           COALESCE(ls.fulfillable_quantity, 0)::int AS sellable,
           COALESCE(avg30.avg_price, lp.last_price) AS asp,
           COALESCE(ce.unit_cogs, sp.unit_cogs, 0) AS unit_cogs
         FROM sku_parameters sp
+        -- End-of-life SKUs are deliberately excluded from replenishment planning - the
+        -- Sales Forecast tab's EOL flag (Settings -> per-SKU "End of life" checkbox) means
+        -- "don't expect this to keep selling", so simulating a reorder for it here would
+        -- contradict that and show a spend the business never intends to make.
+        LEFT JOIN sku_forecast_config cfg ON cfg.sku = sp.sku
         LEFT JOIN LATERAL (
           SELECT fulfillable_quantity FROM amazon_inventory_snapshots
           WHERE sku = sp.sku ORDER BY snapshot_date DESC LIMIT 1
@@ -5924,7 +5930,7 @@ app.get('/api/cashflow', async (req, res) => {
             AND (ce0.effective_to IS NULL OR ce0.effective_to >= CURRENT_DATE)
           ORDER BY ce0.effective_from DESC LIMIT 1
         ) ce ON true
-        WHERE COALESCE(sp.parent_asin, sp.asin) IS NOT NULL
+        WHERE COALESCE(sp.parent_asin, sp.asin) IS NOT NULL AND COALESCE(cfg.is_end_of_life, false) = false
       `),
       pool.query('SELECT * FROM procurement_assumptions'),
     ]);
@@ -6005,6 +6011,7 @@ app.get('/api/cashflow', async (req, res) => {
         if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount);
         procurementOrders.push({
           sku: row.sku, parent_asin: row.parent_asin, product_name: row.product_name,
+          image_url: row.image_url, asin: row.asin,
           trigger_date: addDays(todayStr, day), arrival_date: addDays(todayStr, arrivalDay),
           payment_date: addDays(todayStr, paymentDay),
           order_qty: Math.round(orderQty), amount: fx(amount).toFixed(2),
