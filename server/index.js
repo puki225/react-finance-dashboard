@@ -5856,7 +5856,23 @@ app.get('/api/cashflow', async (req, res) => {
         if (avgVelocity <= 0) continue;
         const reorderPoint = (leadDays + SAFETY_STOCK_DAYS) * avgVelocity;
         if (stock > reorderPoint) continue;
-        const orderQty = leadDays * avgVelocity;
+        // Base order size is the SKU's own forecasted units summed over the lead window
+        // (sumV, not leadDays*avgVelocity - identical in the common case, but sumV stays
+        // correct right at the end of the horizon where the window gets clipped and n <
+        // leadDays, when an average-based figure would overstate it) - "the units needed
+        // to cover the sales forecast" for however long this order has to last before
+        // the next one can land.
+        //
+        // SAFETY_STOCK_DAYS worth of extra units is added ONLY when stock is already
+        // AT OR BELOW ZERO right as this order is placed (checked against `stock`, the
+        // real inventory level this simulation has been tracking from row.sellable) - a
+        // routine reorder triggered with a healthy buffer still on hand doesn't need
+        // padding (it'll land with SAFETY_STOCK_DAYS still intact, by the reorder point's
+        // own design); one triggered too late, or by a demand spike, comes back with real
+        // cushion instead of landing exactly empty-handed and immediately at risk again.
+        const missingUnitsNow = stock <= 0;
+        const safetyQty = missingUnitsNow ? SAFETY_STOCK_DAYS * avgVelocity : 0;
+        const orderQty = sumV + safetyQty;
         const arrivalDay = day + leadDays;
         pendingArrivals.push({ day: arrivalDay, qty: orderQty });
         const paymentDay = day + paymentDaysAfterOrder;
@@ -5867,6 +5883,8 @@ app.get('/api/cashflow', async (req, res) => {
           trigger_date: addDays(todayStr, day), arrival_date: addDays(todayStr, arrivalDay),
           payment_date: addDays(todayStr, paymentDay),
           order_qty: Math.round(orderQty), amount: fx(amount).toFixed(2),
+          includes_safety_stock: missingUnitsNow,
+          safety_stock_qty: missingUnitsNow ? Math.round(safetyQty) : 0,
         });
       }
     }
