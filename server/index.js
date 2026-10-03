@@ -5616,23 +5616,36 @@ app.get('/api/cashflow', async (req, res) => {
     const SETTLEMENT_LOOKBACK_DAYS = 180;
     const AMAZON_CADENCE_FALLBACK_DAYS = 14;
     const SHOPIFY_CADENCE_FALLBACK_DAYS = 7;
-    // Recurring costs that don't scale with sales at all - PPC spend tracks ad decisions,
-    // not order volume, and storage/subscription/disposal fees track inventory volume and
-    // time, billed roughly monthly regardless of that period's sales. Modeled as a flat
-    // daily run-rate (trailing 2-week average) projected across the whole horizon, instead
-    // of being smeared into a sales-proportional ratio the way order-level fees are below.
-    const RECURRING_COST_LOOKBACK_DAYS = 14;
     // FBA storage/disposal fees and the account subscription fee - the "account-level,
     // not-sales-driven" slice of ServiceFeeEventList (see amazon-spapi-proxy's finance
     // sync). Reserve debit/credit and coupon/deal participation fees are deliberately left
     // out: reserve movements are balance-sheet noise (they net to ~0 and aren't a real
     // cost), and coupon/deal fees are promo-decision-driven, not a steady run-rate like these.
     const ACCOUNT_FEE_TYPES = ['FBAStorageFee', 'FBALongTermStorageFee', 'FBADisposalFee', 'Subscription'];
+    // Checked live against this account's real posting history: every FBAStorageFee/
+    // FBALongTermStorageFee/FBADisposalFee/Subscription charge lands on EXACTLY the same
+    // dates as the Amazon payout settlement (both land on the account's bi-weekly
+    // statement) - so these are modeled as a lump sum on each projected Amazon settlement
+    // date below (amazonSettlementOffsets), not smeared across every day, the same way the
+    // settlement itself is a lump sum rather than a smooth daily trickle.
+    //
+    // PPC spend has no such real cadence to detect from - amazon_ppc_product_performance
+    // only has a daily accrual/attribution date, not a billing date, and this account's
+    // Amazon settlements never include an ad-spend line (confirmed: amazon_payouts.
+    // total_other is £0 on every settlement), so it isn't paid through the marketplace
+    // payout either. Amazon Ads' own documented default billing behavior is a ~30-day
+    // invoicing cycle (or sooner if an account-specific spend threshold is hit first - not
+    // something this account's synced data can detect) - an explicit stated assumption,
+    // not a measured fact, the same way shipment lead times are assumed from status alone
+    // elsewhere in this app. Modeled as one lump charge every 30 days, sized to the
+    // trailing 30 days' actual spend (one cycle's worth), landing 30 days out from today
+    // (today -> nothing known about where in a real cycle the account currently sits).
+    const PPC_BILLING_CYCLE_DAYS = 30;
 
     const [
       perSkuHistoryResult, perSkuForecastResult, perSkuChannelMixResult,
       amazonRatioResult, shopifyRatioResult, amazonSettlementResult, shopifySettlementResult,
-      accountFeesRatioWindowResult, accountFeesRecentResult, ppcRecentResult,
+      accountFeesRatioWindowResult, ppcRecentResult,
     ] = await Promise.all([
       // Real (refund-netted) revenue, per SKU per channel, for the recent history window -
       // this is the exact truth for what already sold where, so the historical portion of
@@ -5710,19 +5723,20 @@ app.get('/api/cashflow', async (req, res) => {
       pool.query(`SELECT DISTINCT fund_transfer_date::date AS date FROM amazon_payouts WHERE fund_transfer_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
       pool.query(`SELECT DISTINCT payout_date::date AS date FROM shopify_payouts WHERE status = 'paid' AND payout_date >= CURRENT_DATE - $1::int ORDER BY 1`, [SETTLEMENT_LOOKBACK_DAYS]),
       // Account-level fees (storage/disposal/subscription) over the SAME trailing window as
-      // the Amazon fee ratio below, so their amount can be subtracted out of that ratio's fee
-      // total - they're about to be modeled as their own explicit outflow, and would be
-      // double-counted if left blended into the sales-proportional ratio too.
+      // the Amazon fee ratio above, so (a) their amount can be subtracted out of that
+      // ratio's fee total - they're modeled as their own explicit outflow below, and would
+      // be double-counted if left blended into the sales-proportional ratio too - and (b)
+      // dividing this total by the number of real Amazon settlements in the same window
+      // gives the typical amount charged per settlement, used to size each future
+      // lump-sum occurrence below.
       pool.query(`SELECT COALESCE(SUM(ABS(amount)), 0) AS total FROM amazon_account_fees WHERE fee_type = ANY($1::text[]) AND posted_date >= CURRENT_DATE - 180`, [ACCOUNT_FEE_TYPES]),
-      // Same fee types, trailing RECURRING_COST_LOOKBACK_DAYS only - this is the recent
-      // run-rate actually projected forward as a daily outflow.
-      pool.query(`SELECT COALESCE(SUM(ABS(amount)), 0) AS total FROM amazon_account_fees WHERE fee_type = ANY($1::text[]) AND posted_date::date >= CURRENT_DATE - $2::int AND posted_date::date < CURRENT_DATE`, [ACCOUNT_FEE_TYPES, RECURRING_COST_LOOKBACK_DAYS]),
       // PPC (TACoS) spend - real ad cost, confirmed NOT deducted from the Amazon settlement
       // for this account (amazon_payouts.total_other, where Amazon would fold
       // ProductAdsPaymentEventList if it billed ads that way, is £0 on every settlement) -
       // it's charged separately, so it's a genuinely separate outflow, not part of the
-      // payout ratio at all.
-      pool.query(`SELECT COALESCE(SUM(cost), 0) AS total FROM amazon_ppc_product_performance WHERE report_date::date >= CURRENT_DATE - $1::int AND report_date::date < CURRENT_DATE`, [RECURRING_COST_LOOKBACK_DAYS]),
+      // payout ratio at all. Trailing PPC_BILLING_CYCLE_DAYS (one assumed billing cycle's
+      // worth), sized to be charged as a single lump sum every PPC_BILLING_CYCLE_DAYS below.
+      pool.query(`SELECT COALESCE(SUM(cost), 0) AS total FROM amazon_ppc_product_performance WHERE report_date::date >= CURRENT_DATE - $1::int AND report_date::date < CURRENT_DATE`, [PPC_BILLING_CYCLE_DAYS]),
     ]);
 
     // Clamped the same way this app's forecast model bounds its own growth-factor ratios -
@@ -5734,8 +5748,8 @@ app.get('/api/cashflow', async (req, res) => {
     // etc. - these genuinely scale with sales, so a ratio-of-settled-revenue is a reasonable
     // model for them) together with account-level fees like storage, which do NOT scale with
     // sales. Subtract the account-level slice back out so the ratio only represents the
-    // sales-proportional part; the account-level part is added back as its own flat outflow
-    // below (accountFeeDailyOutflow), timed by its own recent run-rate instead.
+    // sales-proportional part; the account-level part is added back separately below, timed
+    // to land on the same settlement dates it actually posts on instead of this ratio.
     const accountFeesInRatioWindow = parseFloat(accountFeesRatioWindowResult.rows[0].total || 0);
     const amazonOrderLevelFees = Math.max(0, parseFloat(amazonRow.fees || 0) - accountFeesInRatioWindow);
     const amazonPayoutRatio = amazonGross > 0 ? clipRatio(1 - amazonOrderLevelFees / amazonGross) : 0.7;
@@ -5743,12 +5757,11 @@ app.get('/api/cashflow', async (req, res) => {
     const shopifyGross = parseFloat(shopifyRow.gross || 0);
     const shopifyPayoutRatio = shopifyGross > 0 ? clipRatio(parseFloat(shopifyRow.paid || 0) / shopifyGross) : 0.95;
 
-    // Flat daily run-rate for PPC + storage/account fees, from the trailing 2-week actual -
-    // projected across the whole horizon and added as an outflow below (not deducted from
-    // inflow directly: neither is part of the Amazon/Shopify settlement itself for this
-    // account, they're separate cash leaving the business).
-    const ppcDailyOutflow = parseFloat(ppcRecentResult.rows[0].total || 0) / RECURRING_COST_LOOKBACK_DAYS;
-    const accountFeeDailyOutflow = parseFloat(accountFeesRecentResult.rows[0].total || 0) / RECURRING_COST_LOOKBACK_DAYS;
+    // Trailing one-cycle's-worth of PPC spend - charged as a single lump sum every
+    // PPC_BILLING_CYCLE_DAYS below (not deducted from inflow directly: like storage/account
+    // fees, it's not part of either marketplace's settlement for this account, it's
+    // separate cash leaving the business).
+    const ppcPerCycle = parseFloat(ppcRecentResult.rows[0].total || 0);
 
     // Per-SKU forecast, keyed for lookup - shared by the channel split right below and by
     // the Procurement simulation further down.
@@ -5865,6 +5878,17 @@ app.get('/api/cashflow', async (req, res) => {
     const shopifySettlementOffsets = projectSettlementOffsets(lastShopifySettlementOffset, shopifyCadenceDays, horizonDays);
     const amazonSettlementEvents = batchIntoSettlements(amazonRevenueByDate, lastAmazonSettlementOffset, amazonSettlementOffsets, amazonPayoutRatio, horizonDays);
     const shopifySettlementEvents = batchIntoSettlements(shopifyRevenueByDate, lastShopifySettlementOffset, shopifySettlementOffsets, shopifyPayoutRatio, horizonDays);
+    // Typical storage/disposal/subscription charge PER settlement (trailing 180-day total
+    // of those fee types / number of real Amazon settlements in that same window) - sized
+    // this way (rather than a daily rate) since the real occurrences are lump sums, not a
+    // smooth trickle (see ACCOUNT_FEE_TYPES' own comment above for the live-data evidence).
+    const accountFeePerSettlement = accountFeesInRatioWindow / Math.max(amazonSettlementDates.length, 1);
+    // PPC has no real billing-date history to detect a cadence from (see PPC_BILLING_CYCLE_DAYS'
+    // own comment above) - reuses the same offset-projection helper as the settlements
+    // above, just with an assumed cadence instead of a detected one. Starting offset of 0
+    // ("last charge was today") means the first PROJECTED charge lands PPC_BILLING_CYCLE_DAYS
+    // out, not today - nothing in this account's synced data says a charge is due today.
+    const ppcOffsets = projectSettlementOffsets(0, PPC_BILLING_CYCLE_DAYS, horizonDays);
 
     const inflowsByDate = new Map();
     for (const e of [...amazonSettlementEvents, ...shopifySettlementEvents]) {
@@ -5893,11 +5917,14 @@ app.get('/api/cashflow', async (req, res) => {
       }
     }
 
-    // PPC + storage/account fees, projected forward at their trailing 2-week daily run rate.
-    if (ppcDailyOutflow > 0 || accountFeeDailyOutflow > 0) {
-      for (let i = 0; i < horizonDays; i++) {
-        addOutflow(addDays(todayStr, i), ppcDailyOutflow + accountFeeDailyOutflow);
-      }
+    // Storage/account fees land on the same dates the Amazon settlement itself does (see
+    // ACCOUNT_FEE_TYPES' own comment above); PPC lands on its own assumed 30-day cycle -
+    // both as a single lump sum per occurrence, not smeared across every day in between.
+    if (accountFeePerSettlement > 0) {
+      for (const offset of amazonSettlementOffsets) addOutflow(addDays(todayStr, offset), accountFeePerSettlement);
+    }
+    if (ppcPerCycle > 0) {
+      for (const offset of ppcOffsets) addOutflow(addDays(todayStr, offset), ppcPerCycle);
     }
 
     // Procurement: for every SKU whose parent ASIN has configured replenishment
@@ -6169,12 +6196,19 @@ app.get('/api/cashflow', async (req, res) => {
           next_settlement_date: addDays(todayStr, shopifySettlementOffsets[0]),
         },
       },
-      // Recurring, non-sales-proportional costs projected forward at their trailing 2-week
-      // daily run rate and folded into the outflow above - surfaced here so that outflow
-      // isn't a mystery number, same "always show why" convention as procurement_orders.
+      // Recurring, non-sales-proportional costs folded into the outflow above as discrete
+      // lump sums on their own real/assumed cadence (not a smooth daily rate) - surfaced
+      // here so that outflow isn't a mystery number, same "always show why" convention as
+      // procurement_orders.
       recurring_costs: {
-        ppc: { daily_amount: fx(ppcDailyOutflow).toFixed(2), lookback_days: RECURRING_COST_LOOKBACK_DAYS },
-        storage_and_account_fees: { daily_amount: fx(accountFeeDailyOutflow).toFixed(2), lookback_days: RECURRING_COST_LOOKBACK_DAYS },
+        ppc: {
+          amount_per_cycle: fx(ppcPerCycle).toFixed(2), cycle_days: PPC_BILLING_CYCLE_DAYS,
+          next_charge_date: ppcOffsets.length ? addDays(todayStr, ppcOffsets[0]) : null,
+        },
+        storage_and_account_fees: {
+          amount_per_settlement: fx(accountFeePerSettlement).toFixed(2), cadence_days: amazonCadenceDays,
+          next_charge_date: amazonSettlementOffsets.length ? addDays(todayStr, amazonSettlementOffsets[0]) : null,
+        },
       },
       daily,
       min_balance: minBalance.toFixed(2),
