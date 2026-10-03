@@ -188,6 +188,13 @@ async function detectAllIssues({ callInternalApi }) {
   const peerBySku = new Map(peer.map(r => [r.sku, r]));
   const candidates = [];
 
+  // Every £ figure below is framed as "what doing nothing costs over the next 30 days", not
+  // an abstract/perpetual "£/month" run-rate - a concrete, bounded number reads as more
+  // tangible than a rate that implies it just continues forever. The underlying math is
+  // already a 30-day (or 30-day-equivalent) figure for every detector that uses this - this
+  // only changes the words around the number, not the number itself.
+  const inactionClause = (impact) => `Left as-is, this is projected to cost ${currencySymbol}${impact.toFixed(2)} over the next 30 days.`;
+
   // Peer benchmarks: medians across the wider, more stable 90-day window, each restricted to
   // SKUs where the metric is actually meaningful (e.g. only SKUs running ads for TACOS) so a
   // pile of zero-spend/zero-return SKUs doesn't drag the "normal" level down to nothing.
@@ -216,7 +223,7 @@ async function detectAllIssues({ callInternalApi }) {
       if (impact >= 30) {
         candidates.push({
           issue_type: 'tacos_blowout', scope_key: sku, sku, subject, title: `High TACOS on ${subject}`,
-          description: `TACOS is ${tacos.toFixed(1)}% vs a ${peerTacos.toFixed(1)}% peer benchmark across similar-selling SKUs (last 90 days) — ad spend here is outpacing what comparable products need.`,
+          description: `TACOS is ${tacos.toFixed(1)}% vs a ${peerTacos.toFixed(1)}% peer benchmark across similar-selling SKUs (last 90 days) — ad spend here is outpacing what comparable products need. ${inactionClause(impact)}`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'TACOS', kpi_value: round1(tacos), kpi_target: round1(peerTacos),
           kpi_unit: '%', kpi_direction: 'lower_better',
@@ -234,7 +241,7 @@ async function detectAllIssues({ callInternalApi }) {
         if (impact >= 20) {
           candidates.push({
             issue_type: 'high_returns', scope_key: sku, sku, subject, title: `High return rate on ${subject}`,
-            description: `${returnRate.toFixed(1)}% of units sold are coming back vs a ${peerReturnRate.toFixed(1)}% peer benchmark — worth checking for a quality, sizing, or listing-accuracy issue.`,
+            description: `${returnRate.toFixed(1)}% of units sold are coming back vs a ${peerReturnRate.toFixed(1)}% peer benchmark — worth checking for a quality, sizing, or listing-accuracy issue. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Return rate', kpi_value: round1(returnRate), kpi_target: round1(peerReturnRate),
             kpi_unit: '%', kpi_direction: 'lower_better',
@@ -251,7 +258,7 @@ async function detectAllIssues({ callInternalApi }) {
         if (impact >= 20) {
           candidates.push({
             issue_type: 'discount_leakage', scope_key: sku, sku, subject, title: `Heavy discounting on ${subject}`,
-            description: `${discountRate.toFixed(1)}% of gross sales is being discounted away vs a ${peerDiscountRate.toFixed(1)}% peer benchmark.`,
+            description: `${discountRate.toFixed(1)}% of gross sales is being discounted away vs a ${peerDiscountRate.toFixed(1)}% peer benchmark. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Discount rate', kpi_value: round1(discountRate), kpi_target: round1(peerDiscountRate),
             kpi_unit: '%', kpi_direction: 'lower_better',
@@ -268,7 +275,7 @@ async function detectAllIssues({ callInternalApi }) {
       if (impact >= 20) {
         candidates.push({
           issue_type: 'negative_margin', scope_key: sku, sku, subject, title: `Thin/negative margin on ${subject}`,
-          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell.`,
+          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell. ${inactionClause(impact)}`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target),
           kpi_unit: '%', kpi_direction: 'higher_better',
@@ -287,7 +294,7 @@ async function detectAllIssues({ callInternalApi }) {
         if (impact >= 20) {
           candidates.push({
             issue_type: 'margin_compression', scope_key: sku, sku, subject, title: `Margin slipping on ${subject}`,
-            description: `Gross margin dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here.`,
+            description: `Gross margin dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Gross margin (vs prior period)', kpi_value: round1(marginPct), kpi_target: round1(priorMargin),
             kpi_unit: '%', kpi_direction: 'higher_better',
@@ -310,7 +317,7 @@ async function detectAllIssues({ callInternalApi }) {
       const agedUnits = num(row.age_271_365) + num(row.age_365_plus);
       candidates.push({
         issue_type: 'aged_inventory', scope_key: sku, sku, subject, title: `Aged stock surcharge on ${subject}`,
-        description: `${agedUnits} units have been sitting 271+ days, triggering a recurring ${currencySymbol}${surcharge.toFixed(2)}/month long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed.`,
+        description: `${agedUnits} units have been sitting 271+ days, triggering a long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed. ${inactionClause(surcharge)}`,
         impact_amount: round2(surcharge), currency_symbol: currencySymbol,
         kpi_name: 'Aged units (271+ days)', kpi_value: agedUnits, kpi_target: 0,
         kpi_unit: 'units', kpi_direction: 'lower_better',
@@ -332,7 +339,7 @@ async function detectAllIssues({ callInternalApi }) {
             const target = Math.max(1, Math.round(velocity * 30));
             candidates.push({
               issue_type: 'stock_out', scope_key: sku, sku, subject, title: `Stock-out on ${subject}`,
-              description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day — an estimated ${currencySymbol}${impact.toFixed(2)}/month in lost gross profit for as long as it stays out of stock.`,
+              description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day. ${inactionClause(impact)}`,
               impact_amount: round2(impact), currency_symbol: currencySymbol,
               kpi_name: 'Sellable units', kpi_value: sellable, kpi_target: target,
               kpi_unit: 'units', kpi_direction: 'higher_better',
@@ -409,7 +416,7 @@ function synthesizeCardText(issueType, members, currencySymbol) {
   if (members.length === 0) return { title: `${label} — resolved`, description: 'Every affected product is back within target.' };
   if (members.length === 1) return { title: members[0].title, description: members[0].description };
   const sorted = [...members].sort((a, b) => parseFloat(b.impact_amount) - parseFloat(a.impact_amount));
-  const top = sorted.slice(0, 3).map(m => `${m.subject || m.sku} (${currencySymbol}${Math.round(m.impact_amount)}/mo)`);
+  const top = sorted.slice(0, 3).map(m => `${m.subject || m.sku} (${currencySymbol}${Math.round(m.impact_amount)} over 30d)`);
   const more = sorted.length > 3 ? `, and ${sorted.length - 3} more` : '';
   return {
     title: `${label} across ${members.length} products`,

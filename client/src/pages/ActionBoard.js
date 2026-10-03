@@ -111,7 +111,7 @@ function Card({ card, onMove, onDismiss, onUndismiss, onRevert, dragEnabled }) {
           <div style={{ fontSize: 15, fontWeight: 800, fontFamily: 'var(--mono)', color: '#f87171' }}>
             {fmtMoney(card.currency_symbol, impact)}
           </div>
-          <div style={{ fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>/ month{hasImpactOverride ? ' · edited' : ''}</div>
+          <div style={{ fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase' }}>cost of inaction, 30d{hasImpactOverride ? ' · edited' : ''}</div>
         </div>
       </div>
 
@@ -243,7 +243,7 @@ export default function ActionBoard() {
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, letterSpacing: '-0.02em' }}>AI Action Board</h1>
           <p style={{ fontSize: 13, color: 'var(--muted)', marginTop: 2 }}>
-            Business problems with a real £ cost, ranked by impact — re-prioritized daily{data?.generated_at ? `, last run ${fmtAgo(data.generated_at)}` : ''}.
+            Business problems ranked by what leaving them unaddressed costs over the next 30 days — re-prioritized daily{data?.generated_at ? `, last run ${fmtAgo(data.generated_at)}` : ''}.
           </p>
         </div>
         <div style={{ display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
@@ -299,7 +299,7 @@ export default function ActionBoard() {
                     <span style={{ fontSize: 12, fontWeight: 700, letterSpacing: '0.04em', textTransform: 'uppercase' }}>{stage.label}</span>
                     <span style={{ fontSize: 11, color: 'var(--muted)' }}>{stageCards.length}</span>
                   </div>
-                  {total > 0 && <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney(sym, total)}/mo</span>}
+                  {total > 0 && <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--muted)' }}>{fmtMoney(sym, total)} / 30d</span>}
                 </div>
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 10, overflowY: 'auto' }}>
                   {stageCards.length === 0 && (
@@ -314,7 +314,7 @@ export default function ActionBoard() {
                     gets dismissed/reverted). */}
                 {stage.id === 'todo' && byStage.backlog.length > 0 && (
                   <div style={{ fontSize: 11, color: 'var(--muted)', textAlign: 'center', padding: '6px 0', borderTop: '1px dashed var(--border)' }}>
-                    +{byStage.backlog.length} queued · next up {fmtMoney(byStage.backlog[0].currency_symbol, byStage.backlog[0].effective_impact ?? byStage.backlog[0].impact_amount)}/mo
+                    +{byStage.backlog.length} queued · next up {fmtMoney(byStage.backlog[0].currency_symbol, byStage.backlog[0].effective_impact ?? byStage.backlog[0].impact_amount)} / 30d
                   </div>
                 )}
               </div>
