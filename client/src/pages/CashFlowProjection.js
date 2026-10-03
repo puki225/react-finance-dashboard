@@ -88,7 +88,7 @@ function HoverTooltip({ tip }) {
   if (!tip) return null;
   return createPortal(
     <div style={{
-      position: 'fixed', top: tip.top, left: tip.left, zIndex: 9999, maxWidth: 260,
+      position: 'fixed', top: tip.top, left: tip.left, zIndex: 9999, maxWidth: 320,
       background: 'var(--bg3)', border: '1px solid var(--border)', borderRadius: 8,
       padding: '10px 12px', fontSize: 12, color: 'var(--text)', fontFamily: 'var(--font)',
       boxShadow: '0 4px 16px rgba(0,0,0,0.35)', pointerEvents: 'none',
@@ -163,6 +163,8 @@ function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
     let i = Math.round((relX - PAD_L) / (W - PAD_L - PAD_R) * (n - 1));
     i = Math.max(0, Math.min(n - 1, i));
     const d = daily[i];
+    const inflowItems = d.inflow_items || [];
+    const outflowItems = d.outflow_items || [];
     setHover({
       i,
       top: e.clientY + 14,
@@ -174,8 +176,26 @@ function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
           <div style={{ color: parseFloat(d.net) >= 0 ? 'var(--green)' : 'var(--red)' }}>
             Net: <b style={{ fontFamily: 'var(--mono)' }}>{parseFloat(d.net) >= 0 ? '+' : ''}{fmtMoney(d.net, sym)}</b>
           </div>
-          <div style={{ color: 'var(--green)' }}>Inflow: {fmtMoney(d.inflow, sym)}</div>
-          <div style={{ color: 'var(--red)' }}>Outflow: {fmtMoney(d.outflow, sym)}</div>
+          {inflowItems.length > 0 && (
+            <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border2)' }}>
+              <div style={{ color: 'var(--green)', fontWeight: 600, marginBottom: 2 }}>Inflow — {fmtMoney(d.inflow, sym)}</div>
+              {inflowItems.map((it, idx) => (
+                <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                  <span>{it.label}</span><span style={{ fontFamily: 'var(--mono)' }}>{fmtMoney(it.amount, sym)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {outflowItems.length > 0 && (
+            <div style={{ marginTop: 6, paddingTop: 6, borderTop: '1px solid var(--border2)' }}>
+              <div style={{ color: 'var(--red)', fontWeight: 600, marginBottom: 2 }}>Outflow — {fmtMoney(d.outflow, sym)}</div>
+              {outflowItems.map((it, idx) => (
+                <div key={idx} style={{ display: 'flex', justifyContent: 'space-between', gap: 12 }}>
+                  <span>{it.label}</span><span style={{ fontFamily: 'var(--mono)' }}>{fmtMoney(it.amount, sym)}</span>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       ),
     });
@@ -256,24 +276,6 @@ function CashFlowChart({ daily, sym, threshold, breachDate, granularity }) {
   );
 }
 
-function AssumptionsSummary({ data, sym }) {
-  const s = data.settlement || {};
-  const rc = data.recurring_costs || {};
-  const fmtNext = (d) => d ? new Date(d + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—';
-  return (
-    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 12, color: 'var(--muted)' }}>
-      <span>Amazon settles every <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{s.amazon?.cadence_days}d</b> (next ~{fmtNext(s.amazon?.next_settlement_date)})</span>
-      <span>·</span>
-      <span>Shopify settles every <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{s.shopify?.cadence_days}d</b> (next ~{fmtNext(s.shopify?.next_settlement_date)})</span>
-      <span>·</span>
-      <span>Amazon payout ratio (trailing 180d): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{(data.payout_ratios.amazon * 100).toFixed(0)}%</b></span>
-      <span>·</span>
-      <span>Storage/account fees ~<b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{sym}{parseFloat(rc.storage_and_account_fees?.amount_per_settlement || 0).toFixed(2)}</b> every {rc.storage_and_account_fees?.cadence_days}d with the Amazon settlement (next ~{fmtNext(rc.storage_and_account_fees?.next_charge_date)})</span>
-      <span>·</span>
-      <span>PPC ~<b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{sym}{parseFloat(rc.ppc?.amount_per_cycle || 0).toFixed(2)}</b> every {rc.ppc?.cycle_days}d (assumed billing cycle, next ~{fmtNext(rc.ppc?.next_charge_date)})</span>
-    </div>
-  );
-}
 
 export default function CashFlowProjection() {
   const [windowDays, setWindowDays] = useState(90);
@@ -380,9 +382,6 @@ export default function CashFlowProjection() {
               <span style={{ width: 10, height: 10, borderRadius: 2, background: 'var(--red)', opacity: 0.35 }} />Credit needed
             </div>
           )}
-        </div>
-        <div style={{ marginTop: 12, paddingTop: 12, borderTop: '1px solid var(--border)' }}>
-          <AssumptionsSummary data={data} sym={sym} />
         </div>
       </div>
 

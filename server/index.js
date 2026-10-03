@@ -5890,21 +5890,36 @@ app.get('/api/cashflow', async (req, res) => {
     // out, not today - nothing in this account's synced data says a charge is due today.
     const ppcOffsets = projectSettlementOffsets(0, PPC_BILLING_CYCLE_DAYS, horizonDays);
 
+    // Labeled per-day breakdown, not just the daily total - surfaced in the response
+    // (inflow_items/outflow_items on each `daily` row) so the chart's tooltip can show
+    // exactly what made up a given day's inflow/outflow, not just the aggregate figure.
     const inflowsByDate = new Map();
-    for (const e of [...amazonSettlementEvents, ...shopifySettlementEvents]) {
-      const date = addDays(todayStr, e.day);
-      inflowsByDate.set(date, (inflowsByDate.get(date) || 0) + e.amount);
-    }
+    const inflowItemsByDate = new Map();
+    const addInflow = (dateStr, amount, label) => {
+      if (!amount) return;
+      inflowsByDate.set(dateStr, (inflowsByDate.get(dateStr) || 0) + amount);
+      if (!inflowItemsByDate.has(dateStr)) inflowItemsByDate.set(dateStr, []);
+      inflowItemsByDate.get(dateStr).push({ label, amount });
+    };
+    for (const e of amazonSettlementEvents) addInflow(addDays(todayStr, e.day), e.amount, 'Amazon settlement');
+    for (const e of shopifySettlementEvents) addInflow(addDays(todayStr, e.day), e.amount, 'Shopify settlement');
 
+    const outflowsByDate = new Map();
+    const outflowItemsByDate = new Map();
+    const addOutflow = (dateStr, amount, label) => {
+      if (!amount) return;
+      outflowsByDate.set(dateStr, (outflowsByDate.get(dateStr) || 0) + amount);
+      if (!outflowItemsByDate.has(dateStr)) outflowItemsByDate.set(dateStr, []);
+      outflowItemsByDate.get(dateStr).push({ label, amount });
+    };
     // known_outflows expanded into concrete dated occurrences within the horizon - see the
     // shape documented on GET /api/cashflow-assumptions.
-    const outflowsByDate = new Map();
-    const addOutflow = (dateStr, amount) => outflowsByDate.set(dateStr, (outflowsByDate.get(dateStr) || 0) + amount);
     for (const o of (a.known_outflows || [])) {
       const amount = parseFloat(o.amount || 0);
       if (!amount) continue;
+      const label = o.label || 'Known outflow';
       if (o.type === 'one_time') {
-        if (o.date && o.date >= todayStr && o.date < addDays(todayStr, horizonDays)) addOutflow(o.date, amount);
+        if (o.date && o.date >= todayStr && o.date < addDays(todayStr, horizonDays)) addOutflow(o.date, amount, label);
       } else if (o.type === 'monthly') {
         const day = Math.min(Math.max(parseInt(o.day_of_month, 10) || 1, 1), 28);
         for (let i = 0; i < horizonDays; i++) {
@@ -5912,7 +5927,7 @@ app.get('/api/cashflow', async (req, res) => {
           if (parseInt(d.slice(8, 10), 10) !== day) continue;
           if (o.start_date && d < o.start_date) continue;
           if (o.end_date && d > o.end_date) continue;
-          addOutflow(d, amount);
+          addOutflow(d, amount, label);
         }
       }
     }
@@ -5921,10 +5936,10 @@ app.get('/api/cashflow', async (req, res) => {
     // ACCOUNT_FEE_TYPES' own comment above); PPC lands on its own assumed 30-day cycle -
     // both as a single lump sum per occurrence, not smeared across every day in between.
     if (accountFeePerSettlement > 0) {
-      for (const offset of amazonSettlementOffsets) addOutflow(addDays(todayStr, offset), accountFeePerSettlement);
+      for (const offset of amazonSettlementOffsets) addOutflow(addDays(todayStr, offset), accountFeePerSettlement, 'Storage & account fees');
     }
     if (ppcPerCycle > 0) {
-      for (const offset of ppcOffsets) addOutflow(addDays(todayStr, offset), ppcPerCycle);
+      for (const offset of ppcOffsets) addOutflow(addDays(todayStr, offset), ppcPerCycle, 'PPC');
     }
 
     // Procurement: for every SKU whose parent ASIN has configured replenishment
@@ -6125,7 +6140,7 @@ app.get('/api/cashflow', async (req, res) => {
         pendingArrivals.push({ day: arrivalDay, qty: orderQty });
         const paymentDay = day + paymentDaysAfterOrder;
         const amount = orderQty * unitCost;
-        if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount);
+        if (paymentDay >= 0 && paymentDay < horizonDays) addOutflow(addDays(todayStr, paymentDay), amount, `Restock: ${row.sku}`);
         procurementOrders.push({
           sku: row.sku, parent_asin: row.parent_asin, product_name: row.product_name,
           image_url: row.image_url, asin: row.asin,
@@ -6164,6 +6179,11 @@ app.get('/api/cashflow', async (req, res) => {
         date, inflow: inflow.toFixed(2), outflow: outflow.toFixed(2),
         net: (inflow - outflow).toFixed(2), balance: balance.toFixed(2),
         credit_utilization: creditUtilization.toFixed(2),
+        // Itemized breakdown of what made up this day's inflow/outflow, same labels used
+        // for procurement_orders/recurring_costs elsewhere in this response - for the
+        // chart tooltip to show exactly what landed, not just the day's total.
+        inflow_items: (inflowItemsByDate.get(date) || []).map(it => ({ label: it.label, amount: fx(it.amount).toFixed(2) })),
+        outflow_items: (outflowItemsByDate.get(date) || []).map(it => ({ label: it.label, amount: fx(it.amount).toFixed(2) })),
       });
     }
 
