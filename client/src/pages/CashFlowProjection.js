@@ -260,7 +260,6 @@ function AssumptionsSummary({ data, sym }) {
   const s = data.settlement || {};
   const rc = data.recurring_costs || {};
   const fmtNext = (d) => d ? new Date(d + 'T00:00:00Z').toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—';
-  const dailyCost = (parseFloat(rc.ppc?.daily_amount) || 0) + (parseFloat(rc.storage_and_account_fees?.daily_amount) || 0);
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 12, color: 'var(--muted)' }}>
       <span>Amazon settles every <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{s.amazon?.cadence_days}d</b> (next ~{fmtNext(s.amazon?.next_settlement_date)})</span>
@@ -269,7 +268,9 @@ function AssumptionsSummary({ data, sym }) {
       <span>·</span>
       <span>Amazon payout ratio (trailing 180d): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{(data.payout_ratios.amazon * 100).toFixed(0)}%</b></span>
       <span>·</span>
-      <span>PPC + storage/account fees (trailing {rc.ppc?.lookback_days || 14}d avg): <b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{sym}{dailyCost.toFixed(2)}/day</b></span>
+      <span>Storage/account fees ~<b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{sym}{parseFloat(rc.storage_and_account_fees?.amount_per_settlement || 0).toFixed(2)}</b> every {rc.storage_and_account_fees?.cadence_days}d with the Amazon settlement (next ~{fmtNext(rc.storage_and_account_fees?.next_charge_date)})</span>
+      <span>·</span>
+      <span>PPC ~<b style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{sym}{parseFloat(rc.ppc?.amount_per_cycle || 0).toFixed(2)}</b> every {rc.ppc?.cycle_days}d (assumed billing cycle, next ~{fmtNext(rc.ppc?.next_charge_date)})</span>
     </div>
   );
 }
