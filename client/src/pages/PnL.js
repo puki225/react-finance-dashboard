@@ -83,7 +83,7 @@ function prettifyFeeType(ft) {
     .split(' ').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
 }
 
-function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, fixedCostTypes, sym) {
+function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, sym) {
   const cols = ['Line Item', ...periods.map(p => fmtPeriodLabel(p.period, group)), 'Total'];
   const rows = [];
   const pushRow = (label, key) => {
@@ -113,9 +113,6 @@ function downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, f
   // Contribution down to Profit.
   pushRow('Headcount', 'opex.headcount.total');
   pushRow('Fixed Costs', 'opex.fixed_costs.total');
-  for (const label of fixedCostTypes) {
-    if (parseFloat(getPath(totals, `opex.fixed_costs.items.${label}`) || 0) !== 0) pushRow('    ' + label, `opex.fixed_costs.items.${label}`);
-  }
   for (const ft of accountFeeTypes) {
     if (parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0) pushRow('    ' + prettifyFeeType(ft), `opex.other_fees.account_fees.${ft}`);
   }
@@ -151,7 +148,6 @@ export default function PnL() {
   const [cogsExpanded, setCogsExpanded] = useState(false);
   const [feesExpanded, setFeesExpanded] = useState(false);
   const [opexExpanded, setOpexExpanded] = useState(false);
-  const [fixedCostsExpanded, setFixedCostsExpanded] = useState(false);
   const [otherFeesExpanded, setOtherFeesExpanded] = useState(false);
   const [adjustmentsExpanded, setAdjustmentsExpanded] = useState(false);
 
@@ -178,14 +174,6 @@ export default function PnL() {
   const accountFeeRows = useMemo(() => (
     accountFeeTypes.filter(ft => parseFloat(getPath(totals, `opex.other_fees.account_fees.${ft}`) || 0) !== 0)
   ), [accountFeeTypes, totals]);
-
-  // Fixed Costs — itemized by label from the known_outflows entries configured on
-  // Settings -> Cash Flow (the same ones the Cash Flow page's projection spends), so a
-  // recurring cost entered there (e.g. "Accountant") shows up here by name too.
-  const fixedCostTypes = data?.fixed_cost_types || [];
-  const fixedCostRows = useMemo(() => (
-    fixedCostTypes.filter(label => parseFloat(getPath(totals, `opex.fixed_costs.items.${label}`) || 0) !== 0)
-  ), [fixedCostTypes, totals]);
 
   const adjustmentTypes = data?.adjustment_types || [];
   const adjustmentRows = useMemo(() => (
@@ -280,7 +268,7 @@ export default function PnL() {
           </div>
           <DateRangePicker value={range} onChange={handleRange} />
           <button
-            onClick={() => downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, fixedCostTypes, sym)}
+            onClick={() => downloadCsv(periods, totals, group, accountFeeTypes, adjustmentTypes, sym)}
             disabled={!periods.length}
             style={{ padding: '6px 14px', borderRadius: 8, fontSize: 12, fontWeight: 600, border: '1px solid var(--border)', background: 'var(--bg3)', color: periods.length ? 'var(--text)' : 'var(--muted)', cursor: periods.length ? 'pointer' : 'not-allowed', fontFamily: 'var(--font)' }}
           >
@@ -358,10 +346,11 @@ export default function PnL() {
 
                 {/* OPEX — account-wide operating expenses that can't be attributed to a
                     specific product. This is the bridge between Product Contribution and
-                    the true bottom-line Profit. Fixed Costs is itemized from the same
-                    known_outflows entries configured on Settings -> Cash Flow; Headcount
-                    is still a placeholder (no data source yet); Other Fees holds everything
-                    Amazon charges at the account level plus inventory Adjustments. */}
+                    the true bottom-line Profit. Headcount and Fixed Costs are placeholder
+                    categories (no data source yet) — manual known_outflows entries
+                    (Settings -> Cash Flow) are deliberately not wired in here, only into
+                    the cash projection; Other Fees holds everything Amazon charges at the
+                    account level plus inventory Adjustments. */}
                 <ValueRow
                   label="OPEX" keyPath="opex.total" bold cost
                   expandable expanded={opexExpanded}
@@ -370,14 +359,7 @@ export default function PnL() {
                 {opexExpanded && (
                   <>
                     <ValueRow label="Headcount" keyPath="opex.headcount.total" indent={1} cost />
-                    <ValueRow
-                      label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} cost
-                      expandable={fixedCostRows.length > 0} expanded={fixedCostsExpanded}
-                      onClick={() => setFixedCostsExpanded(s => !s)}
-                    />
-                    {fixedCostsExpanded && fixedCostRows.map(label => (
-                      <ValueRow key={label} label={label} keyPath={`opex.fixed_costs.items.${label}`} indent={2} cost />
-                    ))}
+                    <ValueRow label="Fixed Costs" keyPath="opex.fixed_costs.total" indent={1} cost />
                     <ValueRow
                       label="Other Fees - Non-Product Related" keyPath="opex.other_fees.total" indent={1} cost
                       expandable expanded={otherFeesExpanded}
