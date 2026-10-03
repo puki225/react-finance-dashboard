@@ -684,7 +684,13 @@ let outflowIdCounter = 0;
 function newOutflowId() { return `new-${Date.now()}-${outflowIdCounter++}`; }
 
 function emptyOutflow() {
-  return { id: newOutflowId(), label: '', amount: '', type: 'monthly', date: today(), day_of_month: 1, start_date: today(), end_date: '' };
+  // _dayTouched: false means "Day" hasn't been deliberately set yet, so changing "Starts"
+  // below keeps auto-filling it to match - without this, a user who only picks a start
+  // date (reasonably expecting "starts on the 5th" to also mean "recurs on the 5th") gets
+  // a silent mismatch: day_of_month stays at this default of 1 while start_date says 5,
+  // and the entry recurs on the 1st instead of the 5th with no visible sign anything's
+  // wrong. Stripped before saving - the backend never sees this field.
+  return { id: newOutflowId(), label: '', amount: '', type: 'monthly', date: today(), day_of_month: 1, start_date: today(), end_date: '', _dayTouched: false };
 }
 
 // Cash Flow assumptions — the manual inputs the Cash Flow tab's projection blends with the
@@ -705,7 +711,10 @@ function CashFlowSettings() {
         balance_as_of_date: assumptions.balance_as_of_date ? assumptions.balance_as_of_date.slice(0, 10) : today(),
         minimum_cash_threshold: fmtDisplay(assumptions.minimum_cash_threshold),
       });
-      setOutflows((assumptions.known_outflows || []).map(o => ({ ...o, id: o.id || newOutflowId() })));
+      // Loaded rows are already explicitly configured (persisted with whatever day_of_month
+      // they actually have) - _dayTouched: true so editing "Starts" later never silently
+      // changes a day_of_month the user (or a previous save) already deliberately set.
+      setOutflows((assumptions.known_outflows || []).map(o => ({ ...o, id: o.id || newOutflowId(), _dayTouched: true })));
     }
   }, [assumptions, form]);
 
@@ -782,7 +791,7 @@ function CashFlowSettings() {
           {outflows.length === 0 && <div style={{ fontSize: 12, color: 'var(--muted)', padding: '8px 0' }}>None configured.</div>}
           <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
             {outflows.map(o => (
-              <div key={o.id} style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap', background: 'var(--bg3)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 10px' }}>
+              <div key={o.id} style={{ display: 'flex', gap: 8, alignItems: 'flex-end', flexWrap: 'wrap', background: 'var(--bg3)', border: '1px solid var(--border2)', borderRadius: 8, padding: '8px 10px' }}>
                 <input placeholder="Label (e.g. Salaries)" style={{ ...inputStyle, flex: '2 1 160px' }} value={o.label} onChange={e => setOutflow(o.id, { label: e.target.value })} />
                 <input type="number" step="0.01" placeholder="Amount (£)" style={{ ...inputStyle, flex: '1 1 100px' }} value={o.amount} onChange={e => setOutflow(o.id, { amount: e.target.value })} />
                 <select style={{ ...inputStyle, flex: '1 1 110px' }} value={o.type} onChange={e => setOutflow(o.id, { type: e.target.value })}>
@@ -792,10 +801,33 @@ function CashFlowSettings() {
                 {o.type === 'monthly' ? (
                   <>
                     <div style={{ flex: '1 1 90px' }}>
-                      <input type="number" min="1" max="28" placeholder="Day" style={inputStyle} value={o.day_of_month} onChange={e => setOutflow(o.id, { day_of_month: e.target.value })} title="Day of month (1-28)" />
+                      <div style={{ fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 2 }}>Day of month</div>
+                      <input
+                        type="number" min="1" max="28" placeholder="Day" style={inputStyle} value={o.day_of_month}
+                        onChange={e => setOutflow(o.id, { day_of_month: e.target.value, _dayTouched: true })}
+                        title="Day of month this recurs on (1-28) - independent of the Starts date below"
+                      />
                     </div>
-                    <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.start_date || ''} onChange={e => setOutflow(o.id, { start_date: e.target.value })} title="Starts" />
-                    <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.end_date || ''} onChange={e => setOutflow(o.id, { end_date: e.target.value })} title="Ends (optional)" placeholder="No end" />
+                    <div style={{ flex: '1 1 130px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 2 }}>Starts</div>
+                      <input
+                        type="date" style={inputStyle} value={o.start_date || ''}
+                        onChange={e => {
+                          const start_date = e.target.value;
+                          // Only auto-follow while "Day" hasn't been deliberately set -
+                          // once a user edits it directly, further Starts changes leave it
+                          // alone (see emptyOutflow's comment for why this exists at all).
+                          const patch = { start_date };
+                          if (!o._dayTouched && start_date) patch.day_of_month = new Date(start_date + 'T00:00:00').getDate();
+                          setOutflow(o.id, patch);
+                        }}
+                        title="Starts"
+                      />
+                    </div>
+                    <div style={{ flex: '1 1 130px' }}>
+                      <div style={{ fontSize: 9, color: 'var(--muted)', letterSpacing: '0.04em', textTransform: 'uppercase', marginBottom: 2 }}>Ends (optional)</div>
+                      <input type="date" style={inputStyle} value={o.end_date || ''} onChange={e => setOutflow(o.id, { end_date: e.target.value })} title="Ends (optional)" placeholder="No end" />
+                    </div>
                   </>
                 ) : (
                   <input type="date" style={{ ...inputStyle, flex: '1 1 130px' }} value={o.date || ''} onChange={e => setOutflow(o.id, { date: e.target.value })} />
