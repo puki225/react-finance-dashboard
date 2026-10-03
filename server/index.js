@@ -1499,44 +1499,6 @@ app.get('/api/pnl', async (req, res) => {
       GROUP BY 1
     `, [dateFrom, dateTo]);
 
-    // Fixed costs — the SAME known_outflows entries configured on Settings -> Cash Flow
-    // (salaries, rent, insurance, etc.), expanded into concrete dated occurrences and
-    // bucketed by period here too, so a cost entered once lands on both pages instead of
-    // only ever showing up in the forward-looking cash projection. 'one_time' lands on its
-    // own date; 'monthly' recurs on day_of_month (clamped 1-28) for every month its
-    // start_date/end_date window overlaps - generated across the full [$1,$2] range
-    // (independent of "today", unlike GET /api/cashflow's forward-only expansion) so a
-    // cost that started in the past still shows up in a historical P&L period. Account-wide
-    // like Other Fees above, so not run through the brand/parent/fulfillment/order_type
-    // filters that only make sense for product-attributable figures.
-    const fixedCostsResult = await pool.query(`
-      WITH ko AS (
-        SELECT jsonb_array_elements(COALESCE(known_outflows, '[]'::jsonb)) AS o
-        FROM cashflow_assumptions ORDER BY id LIMIT 1
-      ),
-      one_time AS (
-        SELECT COALESCE(o->>'label', 'Other') AS label, (o->>'amount')::numeric AS amount, (o->>'date')::date AS occ_date
-        FROM ko WHERE o->>'type' = 'one_time' AND o->>'date' IS NOT NULL
-      ),
-      monthly_candidates AS (
-        SELECT COALESCE(o->>'label', 'Other') AS label, (o->>'amount')::numeric AS amount,
-          (gs + (LEAST(GREATEST(COALESCE((o->>'day_of_month')::int, 1), 1), 28) - 1) * INTERVAL '1 day')::date AS occ_date,
-          (o->>'start_date')::date AS start_date, (o->>'end_date')::date AS end_date
-        FROM ko
-        CROSS JOIN LATERAL generate_series(date_trunc('month', $1::date), date_trunc('month', $2::date), INTERVAL '1 month') AS gs
-        WHERE o->>'type' = 'monthly'
-      ),
-      occurrences AS (
-        SELECT label, amount, occ_date FROM one_time
-        UNION ALL
-        SELECT label, amount, occ_date FROM monthly_candidates
-        WHERE (start_date IS NULL OR occ_date >= start_date) AND (end_date IS NULL OR occ_date <= end_date)
-      )
-      SELECT GREATEST(DATE_TRUNC('${trunc}', occ_date), $1::date)::date AS period, label, SUM(amount)::numeric AS amount
-      FROM occurrences WHERE occ_date BETWEEN $1 AND $2
-      GROUP BY 1, 2
-    `, [dateFrom, dateTo]);
-
     const reportingCurrency = await getReportingCurrency();
     const fxRate = await getPeriodRate('GBP', reportingCurrency, dateFrom, dateTo);
     const fx = (n) => (parseFloat(n || 0) * fxRate);
@@ -1575,19 +1537,6 @@ app.get('/api/pnl', async (req, res) => {
     }
     const mcfByPeriod = {};
     for (const r of mcfResult.rows) mcfByPeriod[r.period.toISOString().split('T')[0]] = parseFloat(r.mcf_fees || 0);
-
-    // Fixed costs (known_outflows): itemized by label per period, same shape as
-    // accountFeesByPeriod below, so the UI can show "Accountant -£100" etc. under OPEX.
-    const fixedCostsByPeriod = {}; // { period: { [label]: amount } }
-    const fixedCostTypeTotals = {}; // { label: totalAbsAmount } — for sorting which rows to show
-    for (const r of fixedCostsResult.rows) {
-      const key = r.period.toISOString().split('T')[0];
-      const amt = parseFloat(r.amount || 0);
-      if (!fixedCostsByPeriod[key]) fixedCostsByPeriod[key] = {};
-      fixedCostsByPeriod[key][r.label] = (fixedCostsByPeriod[key][r.label] || 0) + amt;
-      fixedCostTypeTotals[r.label] = (fixedCostTypeTotals[r.label] || 0) + Math.abs(amt);
-    }
-    const fixedCostTypes = Object.keys(fixedCostTypeTotals).sort((a, b) => fixedCostTypeTotals[b] - fixedCostTypeTotals[a]);
 
     // Account fees: group by period, split into (a) named fee_type rows for display and
     // (b) itemized Adjustment rows by fee_type (e.g. ReserveDebit, WAREHOUSE_LOST,
@@ -1691,29 +1640,20 @@ app.get('/api/pnl', async (req, res) => {
         adjustmentItems[at] = fx(adjustmentItemsRaw[at] || 0); // signed as Amazon reports it (can be +/-)
       }
       const ppcCost = -fx(ppcByPeriod[periodKey] || 0); // negative (spend)
-      // Fixed costs: the known_outflows entries from Settings -> Cash Flow (see
-      // fixedCostsResult above) - same entries the Cash Flow page's projection already
-      // spends, itemized by label here. Amounts are entered positive (a cost), so negate
-      // to match this route's "every cost is stored negative" convention.
-      const fixedCostsRaw = fixedCostsByPeriod[periodKey] || {};
-      const fixedCosts = {};
-      let fixedCostsTotal = 0;
-      for (const label of fixedCostTypes) {
-        const v = -fx(fixedCostsRaw[label] || 0);
-        fixedCosts[label] = v;
-        fixedCostsTotal += v;
-      }
 
       // Gross Margin / Product Contribution only include costs that can be attributed to a
       // specific product/order line: COGS, per-order-line fees (commission, FBA fulfillment,
       // closing fees, etc.), and PPC spend. Everything account-wide/not product-attributable
-      // (Amazon's account-level fees + adjustments, plus the manually-entered fixed costs
-      // above) lives under OPEX — the bridge from Product Contribution down to the true
-      // bottom-line Profit. Headcount has no data source yet (scaffolded at 0).
+      // (Amazon's account-level fees + adjustments, plus future headcount/fixed-cost entries)
+      // lives under OPEX — the bridge from Product Contribution down to the true bottom-line
+      // Profit. Headcount and Fixed Costs have no data source yet (scaffolded at 0), so OPEX
+      // currently equals Other Fees.
       const grossMargin = netSales + cogs.total + lineFeesTotal; // netSales minus |cogs| minus |product fees|
       const productContribution = grossMargin + ppcCost;
       const otherFeesTotal = accountFeesTotal + adjustments; // negative-leaning, but adjustments can be +
       const headcountTotal = 0; // no data source yet
+      const fixedCostsTotal = 0; // no data source yet — manual known_outflows entries are
+      // deliberately NOT wired into P&L (only Cash Flow); see Settings -> Cash Flow.
       const opexTotal = headcountTotal + otherFeesTotal + fixedCostsTotal;
       const profit = productContribution + opexTotal;
 
@@ -1768,19 +1708,15 @@ app.get('/api/pnl', async (req, res) => {
         roi_pct: roiPct.toFixed(1),
         // OPEX — account-wide operating expenses that can't be attributed to a specific
         // product, bridging Product Contribution down to Profit. Headcount and Fixed Costs
-        // are scaffolded categories with no data source yet (always 0); Other Fees holds
-        // everything Amazon charges at the account level (subscription, storage, coupons)
-        // plus inventory Adjustments (excluding Reserve Debit/Credit, which are cash-flow
-        // timing rather than P&L items — see comment above accountFeesResult). Fixed Costs
-        // is itemized by label from the SAME known_outflows entries configured on
-        // Settings -> Cash Flow (see fixedCostsResult above) — Headcount still has no data
-        // source and stays scaffolded at 0.
+        // are scaffolded categories with no data source yet (always 0) — manual
+        // known_outflows entries (Settings -> Cash Flow) are deliberately not wired in
+        // here, only into the cash projection; Other Fees holds everything Amazon charges
+        // at the account level (subscription, storage, coupons) plus inventory Adjustments
+        // (excluding Reserve Debit/Credit, which are cash-flow timing rather than P&L
+        // items — see comment above accountFeesResult).
         opex: {
           headcount: { total: headcountTotal.toFixed(2) },
-          fixed_costs: {
-            items: Object.fromEntries(Object.entries(fixedCosts).map(([k, v]) => [k, v.toFixed(2)])),
-            total: fixedCostsTotal.toFixed(2),
-          },
+          fixed_costs: { total: fixedCostsTotal.toFixed(2) },
           other_fees: {
             account_fees: Object.fromEntries(Object.entries(accountFees).map(([k, v]) => [k, v.toFixed(2)])),
             account_fees_total: accountFeesTotal.toFixed(2),
@@ -1806,7 +1742,6 @@ app.get('/api/pnl', async (req, res) => {
       ...Object.keys(accountFeesByPeriod),
       ...Object.keys(adjustmentsByPeriod),
       ...Object.keys(mcfByPeriod),
-      ...Object.keys(fixedCostsByPeriod),
     ]);
     const linesByPeriod = {};
     for (const r of linesResult.rows) linesByPeriod[r.period.toISOString().split('T')[0]] = r;
@@ -1860,11 +1795,6 @@ app.get('/api/pnl', async (req, res) => {
     for (const at of adjustmentTypes) {
       adjustmentItemsByPeriod['__total__'][at] = perPeriodAdjustmentItems.reduce((s, m) => s + (m[at] || 0), 0);
     }
-    const perPeriodFixedCosts = Object.values(fixedCostsByPeriod);
-    fixedCostsByPeriod['__total__'] = {};
-    for (const label of fixedCostTypes) {
-      fixedCostsByPeriod['__total__'][label] = perPeriodFixedCosts.reduce((s, m) => s + (m[label] || 0), 0);
-    }
     const totals = buildPeriodRow('__total__', totalRaw);
 
     res.json({
@@ -1872,7 +1802,6 @@ app.get('/api/pnl', async (req, res) => {
       totals,
       account_fee_types: accountFeeTypes,
       adjustment_types: adjustmentTypes,
-      fixed_cost_types: fixedCostTypes,
       currency_symbol: currencySymbol(reportingCurrency),
       group: trunc,
     });
