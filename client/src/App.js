@@ -8,6 +8,7 @@ import Shipments from './pages/Shipments';
 import CashFlow from './pages/CashFlow';
 import CashFlowProjection from './pages/CashFlowProjection';
 import SalesForecast from './pages/SalesForecast';
+import ActionBoard from './pages/ActionBoard';
 import Settings from './pages/Settings';
 import ChatWidget from './components/ChatWidget';
 import { useIsMobile } from './hooks/useIsMobile';
@@ -16,6 +17,12 @@ import { useIsMobile } from './hooks/useIsMobile';
 // groups, it's rendered as its own pinned item at the bottom of the nav (see SETTINGS_ITEM
 // below), separate from the day-to-day sections above it.
 const NAV_SECTIONS = [
+  {
+    label: 'Overview',
+    items: [
+      { id: 'actionboard', label: 'Action Board', icon: '◆', active: true },
+    ],
+  },
   {
     label: 'Sales',
     items: [
@@ -201,6 +208,7 @@ export default function App() {
 
       {/* Main content */}
       <div style={{ flex: 1, overflow: 'auto', background: 'var(--bg)' }}>
+        {active === 'actionboard' && <ActionBoard />}
         {active === 'sales'     && <SalesSummary />}
         {active === 'products'  && <ProductBreakdown />}
         {active === 'pnl'       && <PnL />}

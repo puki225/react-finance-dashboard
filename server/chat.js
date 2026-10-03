@@ -162,6 +162,12 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
       input_schema: { type: 'object', properties: {} },
       run: () => callInternalApi('/api/procurement-assumptions'),
     },
+    {
+      name: 'get_action_board',
+      description: 'The AI Action Board: a £-impact-ranked list of business issues (high TACOS, aged/long-term-storage inventory, stock-outs, thin or slipping margin, high returns, heavy discounting, cash runway risk, ...), each as a card with a stage (todo/doing/done), a KPI (kpi_name/kpi_value/kpi_target/kpi_baseline/kpi_direction - whether lower or higher is better), pct_complete toward that target, and effective_impact (the £/currency figure cards are ranked by - impact_amount_override if the user set one, else the AI\'s own impact_amount). `user_override=true` means a person moved its stage or impact away from the AI\'s own judgement (ai_stage/impact_amount show what the AI would set absent that override); `dismissed=true` means a person hid it entirely. Call this BEFORE arguing with the user about a card - you need its current numbers and reasoning (the `description` field) before agreeing or disagreeing with it.',
+      input_schema: { type: 'object', properties: { include_dismissed: { type: 'boolean', description: 'Include cards the user has dismissed. Default false.' } } },
+      run: (input) => callInternalApi('/api/action-board/cards', { include_dismissed: input.include_dismissed }),
+    },
   ];
 
   // Write tools: each does exactly one narrow thing, through the SAME validated route the
@@ -224,6 +230,50 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
       },
     },
     {
+      name: 'update_action_board_card',
+      description: "Override an AI Action Board card: move its stage (todo/doing/done), dismiss or undismiss it, and/or override the £ impact it's sorted by - with an optional note explaining why. Use this when the user argues that a card's priority or stage is wrong (e.g. \"that TACOS spend is deliberate, a new-launch push - deprioritize it\" or \"that stock-out is already resolved, move it to done\"). Call get_action_board first so you're arguing from its actual current numbers, not a guess. This is a judgement override that persists until reverted, so it requires confirmation: call WITHOUT confirmed=true first to show the user what would change, then only call it again WITH confirmed=true once they've explicitly agreed. Any field you leave out is left as it is.",
+      input_schema: {
+        type: 'object',
+        properties: {
+          card_id: { type: 'integer' },
+          stage: { type: 'string', enum: ['todo', 'doing', 'done'] },
+          dismissed: { type: 'boolean' },
+          impact_amount_override: { type: 'number', description: 'Replace the £ figure this card is ranked by. Pass null to clear a previous override without touching anything else.' },
+          note: { type: 'string', description: 'Why - shown in the card\'s history so a later "why is this here" question can be answered.' },
+          confirmed: { type: 'boolean' },
+        },
+        required: ['card_id'],
+      },
+      is_write: true,
+      run: async (input) => {
+        if (!input.confirmed) {
+          return { status: 'needs_confirmation', message: 'Not applied yet. Summarize this change for the user and re-call with confirmed=true only after they explicitly agree.', proposed: input };
+        }
+        const resp = await fetch(`${baseUrl}/api/action-board/cards/${encodeURIComponent(input.card_id)}`, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ stage: input.stage, dismissed: input.dismissed, impact_amount_override: input.impact_amount_override, note: input.note }),
+        });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `update_action_board_card returned ${resp.status}`);
+        return { status: 'applied', result: data };
+      },
+    },
+    {
+      name: 'revert_action_board_card',
+      description: 'Undo every manual override on an AI Action Board card - clears its stage override, dismissal, and impact override in one go, handing it back to pure AI judgement (ai_stage/impact_amount). Use when the user regrets a correction they (or you, on their behalf) made earlier and wants the original AI suggestion back. Requires confirmation the same way as update_action_board_card.',
+      input_schema: { type: 'object', properties: { card_id: { type: 'integer' }, confirmed: { type: 'boolean' } }, required: ['card_id'] },
+      is_write: true,
+      run: async (input) => {
+        if (!input.confirmed) {
+          return { status: 'needs_confirmation', message: 'Not applied yet. Summarize this change for the user and re-call with confirmed=true only after they explicitly agree.', proposed: input };
+        }
+        const resp = await fetch(`${baseUrl}/api/action-board/cards/${encodeURIComponent(input.card_id)}/revert`, { method: 'POST' });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `revert_action_board_card returned ${resp.status}`);
+        return { status: 'applied', result: data };
+      },
+    },
+    {
       name: 'remember_fact',
       description: 'Save a short durable fact or preference that should be recalled in every future conversation (e.g. "only ever look at the UK marketplace unless told otherwise"). Low-stakes and reversible - no confirmation needed, but tell the user what you saved.',
       input_schema: { type: 'object', properties: { fact: { type: 'string' } }, required: ['fact'] },
@@ -243,6 +293,7 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
 
 Scope and limits:
 - You can read sales, margin (PVM), forecast, inventory, cash flow and procurement data, and propose changes to procurement timing or a SKU's forecast stage/end-of-life flag.
+- You can also read and argue about the AI Action Board (get_action_board) - its £-impact-ranked list of business issues with a todo/doing/done stage each. When the user disputes a card (wrong priority, already resolved, a deliberate decision rather than a problem), engage with their reasoning on the merits using the card's own description/KPI data, then propose a stage move, dismissal, or impact override with update_action_board_card - only apply it after they've confirmed. If they regret an earlier correction, revert_action_board_card hands that card back to pure AI judgement. Don't move a card just because the user disagrees without a reason you find convincing - say so if you think the AI's original read is actually right, the same way you'd push back on a forecast or procurement proposal that doesn't hold up.
 - You have NO ability to modify code, run shell commands, or push anything to GitHub or any other repository - not because you're told not to, but because no such tool exists for you to call. If asked to do this, say so plainly and explain you don't have that capability by design.
 - Any write tool that changes procurement timing or forecast config must be proposed first (called without confirmed=true) and only applied (confirmed=true) after the user has explicitly agreed in this conversation - never apply a change the user hasn't actually confirmed, even if it seems obviously correct.
 - Prefer calling get_procurement_assumptions or get_sales_forecast to check current state before proposing a change to it.
