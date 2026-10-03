@@ -6260,6 +6260,20 @@ if (process.env.ANTHROPIC_API_KEY) {
   console.warn('[chat] ANTHROPIC_API_KEY not set - /api/chat routes are disabled');
 }
 
+// AI Action Board - daily £-impact-ranked Trello-style board of business issues (TACOS
+// blowouts, aged inventory, stock-outs, margin compression, returns, cash runway risk, ...).
+// See actionBoard.js for the detectors, scoring, and schema. Independent of the chat
+// assistant above (its REST API works with no Anthropic key set) - only the chatbot's
+// get_action_board / update_action_board_card / revert_action_board_card tools need one.
+{
+  const actionBoardBaseUrl = `http://localhost:${PORT}`;
+  const { ensureActionBoardSchema, scheduleDailyEvaluation, createActionBoardRouter } = require('./actionBoard');
+  ensureActionBoardSchema(pool)
+    .then(() => scheduleDailyEvaluation({ pool, baseUrl: actionBoardBaseUrl }))
+    .catch((e) => console.error('[action-board] schema migration failed:', e.message));
+  app.use(createActionBoardRouter({ pool, baseUrl: actionBoardBaseUrl }));
+}
+
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, '../client/build/index.html')));
 
 // ─── FEE ESTIMATE SYNC ────────────────────────────────────────────
