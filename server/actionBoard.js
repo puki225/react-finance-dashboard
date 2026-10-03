@@ -6,52 +6,77 @@
 // re-deriving VAT/FX/COGS/forecast logic that those routes already get right.
 //
 // Extensible by design: detectAllIssues() below is a flat list of independent checks, each
-// emitting zero or more candidate issues with a real £ figure behind them. Adding a new area
-// of the business to watch is adding one more check here, following the same shape - nothing
-// else about the schema, scoring, or UI needs to know about it.
+// emitting zero or more candidate ISSUES (one per affected SKU, or one account-level), with a
+// real £ figure behind each. Adding a new area of the business to watch is adding one more
+// check here - nothing else about the schema, scoring, or UI needs to know about it.
 //
-// How a card moves (runActionBoardEvaluation, run daily by the scheduler in index.js, or
-// on-demand via POST /reevaluate):
-//   - A candidate not currently tracked becomes a new card in 'todo', with its KPI value
-//     frozen as `kpi_baseline` - the fixed starting point `pct_complete` is measured against.
-//   - An existing, non-dismissed card has its KPI/impact refreshed and `pct_complete`
-//     recomputed against its frozen baseline and the (possibly moving - e.g. a peer-median
-//     benchmark) current target. The AI's own stage (`ai_stage`) advances todo -> doing as
-//     pct_complete climbs, snaps to 'done' once the KPI reaches target, and reopens to 'todo'
-//     if a previously-resolved issue comes back or a 'doing' one regresses.
-//   - A candidate that stops being detected at all (truly cleared) resolves its card to 'done'.
-//   - `stage` is what the board actually shows. It tracks `ai_stage` UNLESS a user has
-//     overridden it (directly, or by arguing it out with the chatbot - see chat.js's
+// Two-level model: a "card" (action_board_cards) is one flashcard on the board - ONE per
+// issue_type (same root cause, same remedy). A "member" (action_board_members) is one
+// concrete instance of that issue (one SKU, or the single account-level instance) - the
+// per-SKU detail the card's dropdown shows, with its own KPI/impact/trend. Grouping by
+// issue_type, not by anything finer, is the point: two SKUs with high TACOS share one card
+// because the fix is the same shape of action; a SKU with high TACOS and a SKU with a
+// stock-out never share a card even if both are "ads" or "inventory" broadly, because
+// issue_type already encodes "the same action applies" - no extra logic needed for "if
+// nuanced and a different action is required, a new card" (that's just a different
+// issue_type to begin with).
+//
+// How a run moves things (runActionBoardEvaluation, daily via the scheduler in index.js, or
+// on-demand via POST /reevaluate) - and the guarantee that nothing is ever lost or duplicated:
+//   - Every card and member is upserted by its natural key (issue_type alone for a card;
+//     issue_type + scope_key for a member) - never deleted, never re-created. A member not
+//     re-detected this run is marked resolved (frozen at its last known value) rather than
+//     removed, and a card whose issue_type detects zero candidates this run resolves the
+//     same way - the full history stays queryable and nothing can duplicate on a later run.
+//   - A card's KPI progress (`pct_complete`) is an impact-weighted average of its members'
+//     own progress against their frozen baselines; `ai_stage` advances todo -> doing as that
+//     climbs, snaps to 'done' once every member is resolved, and reopens to 'todo' if a
+//     resolved issue comes back or a 'doing' card regresses.
+//   - `stage` is what the board shows. It tracks `ai_stage` UNLESS a user has overridden it
+//     (directly, or by arguing it out with the chatbot - see chat.js's
 //     update_action_board_card / revert_action_board_card tools), in which case it holds
-//     wherever the user put it until they explicitly revert (POST /:id/revert), which resets
-//     the card - stage, dismissal, and any impact override - back to pure AI judgement.
+//     wherever the user put it until POST /:id/revert resets the card - stage, dismissal, and
+//     any impact override - back to pure AI judgement.
+//   - To Do is capped at MAX_TODO_CARDS (5), highest impact first - "not more than 5
+//     flashcards at a time in to do ... we can keep adding once some make it to doing". A
+//     card the AI would otherwise put in To Do but that doesn't make the cut queues in
+//     'backlog' (not one of the 3 visible Trello stages) until a slot frees up on a later
+//     run. A user who has explicitly pinned a card into To Do keeps it regardless of the cap
+//     - that's a deliberate choice, not the AI's to overrule.
 const express = require('express');
 
-const STAGES = ['todo', 'doing', 'done'];
+const STAGES = ['todo', 'doing', 'done']; // the only stages a user (or the chatbot, on their behalf) can set directly - 'backlog' is AI-internal
+const MAX_TODO_CARDS = 5;
 
 // ─── Schema ─────────────────────────────────────────────────────────────────────────────
 async function ensureActionBoardSchema(pool) {
+  // v1 (shipped a few hours before this) kept one flat card per (issue_type, SKU) - no
+  // grouping, no member/trend tables. This version's shape is incompatible (cards no longer
+  // carry scope_key/kpi_* directly - those moved to the new members table). Since v1 had been
+  // live only briefly with nothing but AI-regenerable detections (no real user data worth a
+  // hand-written migration), detect it by the presence of v1's `scope_key` column directly on
+  // action_board_cards and drop-and-recreate rather than migrate column-by-column. This only
+  // ever fires once, the first time a v2 server boots against a v1 database.
+  const v1Check = await pool.query(`
+    SELECT 1 FROM information_schema.columns
+    WHERE table_name = 'action_board_cards' AND column_name = 'scope_key'
+  `);
+  if (v1Check.rows.length) {
+    await pool.query(`
+      DROP TABLE IF EXISTS action_board_card_events CASCADE;
+      DROP TABLE IF EXISTS action_board_cards CASCADE;
+    `);
+  }
+
   await pool.query(`
     CREATE TABLE IF NOT EXISTS action_board_cards (
       id SERIAL PRIMARY KEY,
-      issue_type TEXT NOT NULL,
-      -- Natural key alongside issue_type: the SKU for a per-product issue, '' for an
-      -- account-level one. NOT NULL (not nullable) so the UNIQUE constraint below actually
-      -- enforces one card per (issue_type, scope) - Postgres treats every NULL as distinct,
-      -- which would let duplicate account-level cards slip in.
-      scope_key TEXT NOT NULL DEFAULT '',
-      sku TEXT,
+      issue_type TEXT NOT NULL UNIQUE,
       title TEXT NOT NULL,
       description TEXT,
       impact_amount NUMERIC NOT NULL DEFAULT 0,
       impact_amount_override NUMERIC,
       currency_symbol TEXT NOT NULL DEFAULT '£',
-      kpi_name TEXT,
-      kpi_value NUMERIC,
-      kpi_target NUMERIC,
-      kpi_baseline NUMERIC,
-      kpi_unit TEXT,
-      kpi_direction TEXT,
       pct_complete NUMERIC NOT NULL DEFAULT 0,
       ai_stage TEXT NOT NULL DEFAULT 'todo',
       stage TEXT NOT NULL DEFAULT 'todo',
@@ -62,8 +87,44 @@ async function ensureActionBoardSchema(pool) {
       last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       stage_changed_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS action_board_members (
+      id SERIAL PRIMARY KEY,
+      card_id INTEGER NOT NULL REFERENCES action_board_cards(id) ON DELETE CASCADE,
+      issue_type TEXT NOT NULL,
+      -- '' for the single instance of an account-level issue (not nullable - Postgres treats
+      -- every NULL as distinct, which would let duplicate account-level members slip past the
+      -- UNIQUE constraint below).
+      scope_key TEXT NOT NULL DEFAULT '',
+      sku TEXT,
+      subject TEXT, -- bare product/account name, for group-card summaries (title is a full sentence)
+      title TEXT NOT NULL,
+      description TEXT,
+      impact_amount NUMERIC NOT NULL DEFAULT 0,
+      impact_baseline NUMERIC NOT NULL DEFAULT 0, -- impact at first detection; weights this member in the card's aggregate progress
+      kpi_name TEXT,
+      kpi_value NUMERIC,
+      kpi_target NUMERIC,
+      kpi_baseline NUMERIC,
+      kpi_unit TEXT,
+      kpi_direction TEXT,
+      pct_complete NUMERIC NOT NULL DEFAULT 0,
+      resolved BOOLEAN NOT NULL DEFAULT false,
+      first_detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (issue_type, scope_key)
+    );
+    CREATE TABLE IF NOT EXISTS action_board_member_snapshots (
+      id SERIAL PRIMARY KEY,
+      member_id INTEGER NOT NULL REFERENCES action_board_members(id) ON DELETE CASCADE,
+      snapshot_date DATE NOT NULL,
+      kpi_value NUMERIC,
+      impact_amount NUMERIC,
+      pct_complete NUMERIC,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      UNIQUE (member_id, snapshot_date)
     );
     CREATE TABLE IF NOT EXISTS action_board_card_events (
       id SERIAL PRIMARY KEY,
@@ -106,11 +167,13 @@ function makeCallInternalApi(baseUrl) {
 }
 
 // ─── Detectors ──────────────────────────────────────────────────────────────────────────
-// Each candidate: { issue_type, scope_key, sku, title, description, impact_amount,
-// currency_symbol, kpi_name, kpi_value, kpi_target, kpi_unit, kpi_direction }.
-// Materiality floors (impact_amount thresholds below) exist so a card doesn't flicker in and
-// out of existence over noise - every floor is a judgment call, not a measured fact, and is a
-// reasonable first thing to loosen/tighten if the board feels too noisy or too quiet.
+// Each candidate (one MEMBER instance): { issue_type, scope_key, sku, subject, title,
+// description, impact_amount, currency_symbol, kpi_name, kpi_value, kpi_target, kpi_unit,
+// kpi_direction }. `subject` is the bare product/account name (used in group-card summaries);
+// `title`/`description` are the full, SKU-specific sentences (used as-is when a card has only
+// one member). Materiality floors (impact_amount thresholds below) exist so a card doesn't
+// flicker in and out of existence over noise - every floor is a judgment call, not a measured
+// fact, and is a reasonable first thing to loosen/tighten if the board feels too noisy or quiet.
 async function detectAllIssues({ callInternalApi }) {
   const [current, prior, peer, inventory, cashflow] = await Promise.all([
     callInternalApi('/api/product-breakdown', { from: fmt(daysAgo(29)), to: fmt(daysAgo(0)), channel: 'all' }),
@@ -136,7 +199,7 @@ async function detectAllIssues({ callInternalApi }) {
   for (const row of current) {
     const sku = row.sku;
     if (!sku) continue;
-    const title = row.product_title || sku;
+    const subject = row.product_title || sku;
     const netRevenue = num(row.net_revenue);
     const grossSales = num(row.gross_sales);
     const unitsSold = num(row.units_sold);
@@ -152,7 +215,7 @@ async function detectAllIssues({ callInternalApi }) {
       const impact = (tacos - peerTacos) / 100 * netRevenue;
       if (impact >= 30) {
         candidates.push({
-          issue_type: 'tacos_blowout', scope_key: sku, sku, title: `High TACOS on ${title}`,
+          issue_type: 'tacos_blowout', scope_key: sku, sku, subject, title: `High TACOS on ${subject}`,
           description: `TACOS is ${tacos.toFixed(1)}% vs a ${peerTacos.toFixed(1)}% peer benchmark across similar-selling SKUs (last 90 days) — ad spend here is outpacing what comparable products need.`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'TACOS', kpi_value: round1(tacos), kpi_target: round1(peerTacos),
@@ -170,7 +233,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = excessUnits * avgRefundPerUnit;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'high_returns', scope_key: sku, sku, title: `High return rate on ${title}`,
+            issue_type: 'high_returns', scope_key: sku, sku, subject, title: `High return rate on ${subject}`,
             description: `${returnRate.toFixed(1)}% of units sold are coming back vs a ${peerReturnRate.toFixed(1)}% peer benchmark — worth checking for a quality, sizing, or listing-accuracy issue.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Return rate', kpi_value: round1(returnRate), kpi_target: round1(peerReturnRate),
@@ -187,7 +250,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = (discountRate - peerDiscountRate) / 100 * grossSales;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'discount_leakage', scope_key: sku, sku, title: `Heavy discounting on ${title}`,
+            issue_type: 'discount_leakage', scope_key: sku, sku, subject, title: `Heavy discounting on ${subject}`,
             description: `${discountRate.toFixed(1)}% of gross sales is being discounted away vs a ${peerDiscountRate.toFixed(1)}% peer benchmark.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Discount rate', kpi_value: round1(discountRate), kpi_target: round1(peerDiscountRate),
@@ -204,7 +267,7 @@ async function detectAllIssues({ callInternalApi }) {
       const impact = Math.max(0, (target - marginPct) / 100) * netRevenue;
       if (impact >= 20) {
         candidates.push({
-          issue_type: 'negative_margin', scope_key: sku, sku, title: `Thin/negative margin on ${title}`,
+          issue_type: 'negative_margin', scope_key: sku, sku, subject, title: `Thin/negative margin on ${subject}`,
           description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell.`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target),
@@ -223,7 +286,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = (drop / 100) * netRevenue;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'margin_compression', scope_key: sku, sku, title: `Margin slipping on ${title}`,
+            issue_type: 'margin_compression', scope_key: sku, sku, subject, title: `Margin slipping on ${subject}`,
             description: `Gross margin dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Gross margin (vs prior period)', kpi_value: round1(marginPct), kpi_target: round1(priorMargin),
@@ -240,13 +303,13 @@ async function detectAllIssues({ callInternalApi }) {
   for (const row of inventory.rows || []) {
     const sku = row.sku;
     if (!sku) continue;
-    const title = row.product_title || sku;
+    const subject = row.product_title || sku;
 
     const surcharge = num(row.surcharge_monthly);
     if (surcharge >= 15) {
       const agedUnits = num(row.age_271_365) + num(row.age_365_plus);
       candidates.push({
-        issue_type: 'aged_inventory', scope_key: sku, sku, title: `Aged stock surcharge on ${title}`,
+        issue_type: 'aged_inventory', scope_key: sku, sku, subject, title: `Aged stock surcharge on ${subject}`,
         description: `${agedUnits} units have been sitting 271+ days, triggering a recurring ${currencySymbol}${surcharge.toFixed(2)}/month long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed.`,
         impact_amount: round2(surcharge), currency_symbol: currencySymbol,
         kpi_name: 'Aged units (271+ days)', kpi_value: agedUnits, kpi_target: 0,
@@ -268,7 +331,7 @@ async function detectAllIssues({ callInternalApi }) {
           if (impact >= 20) {
             const target = Math.max(1, Math.round(velocity * 30));
             candidates.push({
-              issue_type: 'stock_out', scope_key: sku, sku, title: `Stock-out on ${title}`,
+              issue_type: 'stock_out', scope_key: sku, sku, subject, title: `Stock-out on ${subject}`,
               description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day — an estimated ${currencySymbol}${impact.toFixed(2)}/month in lost gross profit for as long as it stays out of stock.`,
               impact_amount: round2(impact), currency_symbol: currencySymbol,
               kpi_name: 'Sellable units', kpi_value: sellable, kpi_target: target,
@@ -290,7 +353,8 @@ async function detectAllIssues({ callInternalApi }) {
       const threshold = num(cashflow.assumptions?.minimum_cash_threshold);
       const shortfall = Math.max(0, threshold - minBalance);
       candidates.push({
-        issue_type: 'cash_runway', scope_key: '', sku: null, title: 'Cash balance projected to breach minimum threshold',
+        issue_type: 'cash_runway', scope_key: '', sku: null, subject: 'Cash balance',
+        title: 'Cash balance projected to breach minimum threshold',
         description: `Projected balance dips to ${currencySymbol}${minBalance.toFixed(2)} on ${cashflow.min_balance_date}, ${currencySymbol}${shortfall.toFixed(2)} below the ${currencySymbol}${threshold.toFixed(2)} minimum threshold, in ${daysUntil} day(s).`,
         impact_amount: round2(shortfall), currency_symbol: currencySymbol,
         kpi_name: 'Days until threshold breach', kpi_value: daysUntil, kpi_target: 60,
@@ -302,7 +366,7 @@ async function detectAllIssues({ callInternalApi }) {
   return candidates;
 }
 
-// ─── Scoring: baseline-relative progress + AI stage transitions ───────────────────────────
+// ─── Scoring: baseline-relative progress + stage transitions ──────────────────────────────
 function clampPct(baseline, target, current, direction) {
   if (baseline === null || target === null || current === null) return 0;
   const range = direction === 'lower_better' ? (baseline - target) : (target - baseline);
@@ -314,116 +378,220 @@ function isResolved(kpiValue, target, direction) {
   if (kpiValue === null || target === null) return false;
   return direction === 'lower_better' ? kpiValue <= target : kpiValue >= target;
 }
+// Same todo/doing/done advancement rule for both a single member's KPI and a card's
+// impact-weighted aggregate - whichever "progress since last run" number is passed in.
+function nextStage(currentStage, prevPct, newPct, allResolved) {
+  if (allResolved) return 'done';
+  if (currentStage === 'done') return 'todo'; // was resolved, isn't any more - reopen at the top
+  if (newPct <= prevPct - 10 && currentStage !== 'todo') return 'todo'; // regressed meaningfully
+  if (newPct >= prevPct + 10 && newPct >= 15 && currentStage === 'todo') return 'doing';
+  return currentStage;
+}
+
+const ISSUE_TYPE_LABELS = {
+  tacos_blowout: 'High TACOS',
+  high_returns: 'High return rate',
+  discount_leakage: 'Heavy discounting',
+  negative_margin: 'Thin/negative margin',
+  margin_compression: 'Margin slipping',
+  aged_inventory: 'Aged stock surcharge',
+  stock_out: 'Stock-outs',
+  cash_runway: 'Cash runway risk',
+};
+
+// Builds the group card's title/description from its member rows. A single-member group
+// reads exactly like a v1 card (the member's own sentence); a multi-member group gets a
+// synthesized summary naming the top few by impact. `members` should be the active
+// (unresolved) ones when any exist, so a card doesn't keep advertising a fixed SKU in its
+// headline - callers pass allMembers only when every one of them is resolved.
+function synthesizeCardText(issueType, members, currencySymbol) {
+  const label = ISSUE_TYPE_LABELS[issueType] || issueType;
+  if (members.length === 0) return { title: `${label} — resolved`, description: 'Every affected product is back within target.' };
+  if (members.length === 1) return { title: members[0].title, description: members[0].description };
+  const sorted = [...members].sort((a, b) => parseFloat(b.impact_amount) - parseFloat(a.impact_amount));
+  const top = sorted.slice(0, 3).map(m => `${m.subject || m.sku} (${currencySymbol}${Math.round(m.impact_amount)}/mo)`);
+  const more = sorted.length > 3 ? `, and ${sorted.length - 3} more` : '';
+  return {
+    title: `${label} across ${members.length} products`,
+    description: `${members.length} products affected: ${top.join(', ')}${more}.`,
+  };
+}
 
 // ─── The daily (or on-demand) evaluation run ───────────────────────────────────────────────
 async function runActionBoardEvaluation({ pool, baseUrl }) {
   const callInternalApi = makeCallInternalApi(baseUrl);
   const candidates = await detectAllIssues({ callInternalApi });
+  const groups = new Map(); // issue_type -> candidates[]
+  for (const c of candidates) {
+    if (!groups.has(c.issue_type)) groups.set(c.issue_type, []);
+    groups.get(c.issue_type).push(c);
+  }
 
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const seenKeys = new Set();
 
-    for (const c of candidates) {
-      seenKeys.add(`${c.issue_type}::${c.scope_key}`);
-      const existing = await client.query(
-        `SELECT * FROM action_board_cards WHERE issue_type = $1 AND scope_key = $2`,
-        [c.issue_type, c.scope_key]
-      );
+    // issue_types that exist in the DB but detected zero candidates this run - handled after
+    // the main loop, same "resolve everything under it" path as a group whose members all
+    // individually cleared.
+    const existingIssueTypes = (await client.query(`SELECT DISTINCT issue_type FROM action_board_cards`)).rows.map(r => r.issue_type);
+    for (const t of existingIssueTypes) if (!groups.has(t)) groups.set(t, []);
 
-      if (!existing.rows.length) {
-        // kpi_baseline intentionally reuses the kpi_value param ($9) below - the baseline IS
-        // the value at the moment of first detection, by definition.
-        const ins = await client.query(`
-          INSERT INTO action_board_cards
-            (issue_type, scope_key, sku, title, description, impact_amount, currency_symbol,
-             kpi_name, kpi_value, kpi_target, kpi_baseline, kpi_unit, kpi_direction,
-             pct_complete, ai_stage, stage)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$9,$11,$12,0,'todo','todo')
-          RETURNING id
-        `, [c.issue_type, c.scope_key, c.sku, c.title, c.description, c.impact_amount, c.currency_symbol,
-            c.kpi_name, c.kpi_value, c.kpi_target, c.kpi_unit, c.kpi_direction]);
-        await client.query(
-          `INSERT INTO action_board_card_events (card_id, event_type, to_value) VALUES ($1,'detected',$2)`,
-          [ins.rows[0].id, String(c.kpi_value)]
-        );
+    for (const [issueType, members] of groups) {
+      let cardRow = (await client.query(`SELECT * FROM action_board_cards WHERE issue_type = $1`, [issueType])).rows[0];
+      if (!cardRow) {
+        const placeholder = members[0] ? members[0].title : issueType;
+        cardRow = (await client.query(`
+          INSERT INTO action_board_cards (issue_type, title, description, currency_symbol, ai_stage, stage)
+          VALUES ($1, $2, '', $3, 'todo', 'todo') RETURNING *
+        `, [issueType, placeholder, members[0] ? members[0].currency_symbol : '£'])).rows[0];
+      }
+      const cardId = cardRow.id;
+      if (cardRow.dismissed) {
+        // Still refresh member numbers underneath so a later undismiss/revert isn't stale,
+        // but never touch stage while dismissed - same rule as v1.
+        for (const c of members) await upsertMember(client, cardId, c);
         continue;
       }
 
-      const row = existing.rows[0];
-      if (row.dismissed) {
-        // Keep the underlying numbers fresh so a re-detected or revert()'d card isn't stale,
-        // but never touch stage/ai_stage while dismissed.
+      const detectedKeys = new Set(members.map(c => c.scope_key));
+      for (const c of members) await upsertMember(client, cardId, c);
+
+      // Any member previously tracked under this issue_type but not re-detected this run has
+      // genuinely cleared - resolve it (frozen at its last value), never delete it.
+      const trackedMembers = (await client.query(`SELECT * FROM action_board_members WHERE issue_type = $1`, [issueType])).rows;
+      for (const m of trackedMembers) {
+        if (m.resolved || detectedKeys.has(m.scope_key)) continue;
+        await client.query(`UPDATE action_board_members SET resolved = true, pct_complete = 100, updated_at = NOW() WHERE id = $1`, [m.id]);
         await client.query(`
-          UPDATE action_board_cards
-          SET title = $1, description = $2, impact_amount = $3, kpi_value = $4, kpi_target = $5,
-              updated_at = NOW(), last_seen_at = NOW()
-          WHERE id = $6
-        `, [c.title, c.description, c.impact_amount, c.kpi_value, c.kpi_target, row.id]);
-        continue;
+          INSERT INTO action_board_member_snapshots (member_id, snapshot_date, kpi_value, impact_amount, pct_complete)
+          VALUES ($1, CURRENT_DATE, $2, 0, 100)
+          ON CONFLICT (member_id, snapshot_date) DO UPDATE SET pct_complete = 100, impact_amount = 0
+        `, [m.id, m.kpi_value]);
       }
 
-      const baseline = parseFloat(row.kpi_baseline);
-      const target = c.kpi_target; // a peer benchmark or prior-period value, legitimately re-measured each run
-      const pct = clampPct(baseline, target, c.kpi_value, c.kpi_direction);
-      const resolved = isResolved(c.kpi_value, target, c.kpi_direction);
-      const prevPct = parseFloat(row.pct_complete);
+      // Aggregate the card from ALL its members (including just-resolved ones) - impact sums
+      // only the still-active ones (a resolved issue no longer costs anything), but progress
+      // is an impact-BASELINE-weighted average across everyone, so a big resolved member
+      // visibly pulls the card forward.
+      const allMembers = (await client.query(`SELECT * FROM action_board_members WHERE issue_type = $1`, [issueType])).rows;
+      const activeMembers = allMembers.filter(m => !m.resolved);
+      const totalImpact = activeMembers.reduce((s, m) => s + num(m.impact_amount), 0);
+      let weightSum = 0, weightedPct = 0;
+      for (const m of allMembers) {
+        const w = Math.max(num(m.impact_baseline), 0.01);
+        weightSum += w;
+        weightedPct += w * num(m.pct_complete);
+      }
+      const groupPct = weightSum > 0 ? Math.round(weightedPct / weightSum) : 0;
+      const allResolved = activeMembers.length === 0;
+      const currencySymbol = (members[0] || allMembers[0])?.currency_symbol || cardRow.currency_symbol;
+      const { title, description } = synthesizeCardText(issueType, allResolved ? [] : activeMembers, currencySymbol);
 
-      let aiStage = row.ai_stage;
-      if (resolved) aiStage = 'done';
-      else if (row.ai_stage === 'done') aiStage = 'todo'; // was resolved, isn't any more - reopen at the top
-      else if (pct <= prevPct - 10 && row.ai_stage !== 'todo') aiStage = 'todo'; // regressed meaningfully
-      else if (pct >= prevPct + 10 && pct >= 15 && row.ai_stage === 'todo') aiStage = 'doing';
-
-      const effectiveStage = row.user_override ? row.stage : aiStage;
+      const prevPct = num(cardRow.pct_complete);
+      const aiStage = nextStage(cardRow.ai_stage, prevPct, groupPct, allResolved);
+      const effectiveStage = cardRow.user_override ? cardRow.stage : aiStage;
 
       await client.query(`
         UPDATE action_board_cards SET
-          title = $1, description = $2, impact_amount = $3, kpi_value = $4, kpi_target = $5,
-          pct_complete = $6, ai_stage = $7, stage = $8,
-          stage_changed_at = CASE WHEN $8 IS DISTINCT FROM stage THEN NOW() ELSE stage_changed_at END,
+          title = $1, description = $2, impact_amount = $3, currency_symbol = $4,
+          pct_complete = $5, ai_stage = $6, stage = $7,
+          stage_changed_at = CASE WHEN $7 IS DISTINCT FROM stage THEN NOW() ELSE stage_changed_at END,
           updated_at = NOW(), last_seen_at = NOW()
-        WHERE id = $9
-      `, [c.title, c.description, c.impact_amount, c.kpi_value, target, pct, aiStage, effectiveStage, row.id]);
+        WHERE id = $8
+      `, [title, description, round2(totalImpact), currencySymbol, groupPct, aiStage, effectiveStage, cardId]);
 
-      if (aiStage !== row.ai_stage) {
+      if (aiStage !== cardRow.ai_stage) {
         await client.query(
           `INSERT INTO action_board_card_events (card_id, event_type, from_value, to_value) VALUES ($1,'ai_stage_change',$2,$3)`,
-          [row.id, row.ai_stage, aiStage]
+          [cardId, cardRow.ai_stage, aiStage]
         );
       }
     }
 
-    // Anything not re-detected this run (and not dismissed, not already done) has genuinely
-    // cleared - resolve it to 'done' rather than leaving a stale card sitting in 'doing'.
-    const stale = await client.query(`
-      SELECT id, issue_type, scope_key, ai_stage, stage, user_override FROM action_board_cards
-      WHERE dismissed = false AND ai_stage <> 'done'
-    `);
-    for (const row of stale.rows) {
-      if (seenKeys.has(`${row.issue_type}::${row.scope_key}`)) continue;
-      const effectiveStage = row.user_override ? row.stage : 'done';
+    // Cap: keep at most MAX_TODO_CARDS AI-assigned cards in 'todo' at once, highest impact
+    // first. Overflow queues in 'backlog' until a slot frees up on a later run (a card
+    // advancing to doing/done, getting dismissed, or reverted away). A card the user has
+    // explicitly pinned into 'todo' keeps its slot outside the cap.
+    const openCards = (await client.query(`
+      SELECT id, ai_stage, stage, user_override, COALESCE(impact_amount_override, impact_amount) AS impact
+      FROM action_board_cards WHERE dismissed = false
+    `)).rows;
+    const pinnedTodoCount = openCards.filter(r => r.user_override && r.stage === 'todo').length;
+    const remainingSlots = Math.max(0, MAX_TODO_CARDS - pinnedTodoCount);
+    const aiTodoCandidates = openCards
+      .filter(r => !r.user_override && r.ai_stage === 'todo')
+      .sort((a, b) => num(b.impact) - num(a.impact));
+    for (let i = 0; i < aiTodoCandidates.length; i++) {
+      const row = aiTodoCandidates[i];
+      const wantStage = i < remainingSlots ? 'todo' : 'backlog';
+      if (wantStage === row.ai_stage) continue;
       await client.query(`
-        UPDATE action_board_cards SET ai_stage = 'done', pct_complete = 100, stage = $1,
+        UPDATE action_board_cards SET ai_stage = $1, stage = $1,
           stage_changed_at = CASE WHEN $1 IS DISTINCT FROM stage THEN NOW() ELSE stage_changed_at END,
-          updated_at = NOW(), last_seen_at = NOW()
+          updated_at = NOW()
         WHERE id = $2
-      `, [effectiveStage, row.id]);
+      `, [wantStage, row.id]);
       await client.query(
-        `INSERT INTO action_board_card_events (card_id, event_type, from_value, to_value, note) VALUES ($1,'ai_stage_change',$2,'done','no longer detected')`,
-        [row.id, row.ai_stage]
+        `INSERT INTO action_board_card_events (card_id, event_type, from_value, to_value, note) VALUES ($1,'ai_stage_change',$2,$3,'to-do capacity')`,
+        [row.id, row.ai_stage, wantStage]
       );
     }
 
     await client.query('COMMIT');
-    return { evaluated_at: new Date().toISOString(), candidate_count: candidates.length };
+    return { evaluated_at: new Date().toISOString(), candidate_count: candidates.length, group_count: groups.size };
   } catch (e) {
     await client.query('ROLLBACK');
     throw e;
   } finally {
     client.release();
   }
+}
+
+// Upserts one member row (by issue_type + scope_key) and appends today's snapshot. Shared by
+// the dismissed- and active-card paths above so a dismissed card's members still get kept
+// current, just without touching any stage.
+async function upsertMember(client, cardId, c) {
+  const existing = (await client.query(
+    `SELECT * FROM action_board_members WHERE issue_type = $1 AND scope_key = $2`,
+    [c.issue_type, c.scope_key]
+  )).rows[0];
+
+  let memberId, baseline, impactBaseline;
+  if (!existing) {
+    // kpi_baseline intentionally reuses the kpi_value param ($9) - the baseline IS the value
+    // at the moment of first detection, by definition. Same for impact_baseline ($7/$8).
+    const ins = (await client.query(`
+      INSERT INTO action_board_members
+        (card_id, issue_type, scope_key, sku, subject, title, description, impact_amount, impact_baseline,
+         kpi_name, kpi_value, kpi_target, kpi_baseline, kpi_unit, kpi_direction, pct_complete, resolved)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$10,$12,$13,0,false)
+      RETURNING id, kpi_value AS baseline, impact_baseline
+    `, [cardId, c.issue_type, c.scope_key, c.sku, c.subject, c.title, c.description, c.impact_amount,
+        c.kpi_name, c.kpi_value, c.kpi_target, c.kpi_unit, c.kpi_direction])).rows[0];
+    memberId = ins.id; baseline = num(ins.baseline); impactBaseline = num(ins.impact_baseline);
+  } else {
+    memberId = existing.id; baseline = num(existing.kpi_baseline); impactBaseline = num(existing.impact_baseline);
+  }
+
+  const pct = clampPct(baseline, c.kpi_target, c.kpi_value, c.kpi_direction);
+  const resolved = isResolved(c.kpi_value, c.kpi_target, c.kpi_direction);
+
+  await client.query(`
+    UPDATE action_board_members SET
+      card_id = $1, subject = $2, title = $3, description = $4, impact_amount = $5,
+      kpi_value = $6, kpi_target = $7, pct_complete = $8, resolved = $9,
+      updated_at = NOW(), last_seen_at = NOW()
+    WHERE id = $10
+  `, [cardId, c.subject, c.title, c.description, c.impact_amount, c.kpi_value, c.kpi_target, pct, resolved, memberId]);
+
+  await client.query(`
+    INSERT INTO action_board_member_snapshots (member_id, snapshot_date, kpi_value, impact_amount, pct_complete)
+    VALUES ($1, CURRENT_DATE, $2, $3, $4)
+    ON CONFLICT (member_id, snapshot_date) DO UPDATE SET kpi_value = $2, impact_amount = $3, pct_complete = $4
+  `, [memberId, c.kpi_value, c.impact_amount, pct]);
+
+  return { memberId, impactBaseline };
 }
 
 // ─── Scheduling: re-run roughly once a day ─────────────────────────────────────────────────
@@ -454,16 +622,46 @@ function scheduleDailyEvaluation({ pool, baseUrl }) {
 function createActionBoardRouter({ pool, baseUrl }) {
   const router = express.Router();
 
+  // Returns every card (grouped flashcard) with its members nested underneath, each member
+  // carrying up to its last 30 daily snapshots as `trend` - the board's dropdown uses this to
+  // show the individual per-SKU trend behind a multi-member card without a second round trip.
   router.get('/api/action-board/cards', async (req, res) => {
     try {
       const includeDismissed = req.query.include_dismissed === 'true';
-      const result = await pool.query(`
+      const cardsResult = await pool.query(`
         SELECT *, COALESCE(impact_amount_override, impact_amount) AS effective_impact
         FROM action_board_cards
         ${includeDismissed ? '' : 'WHERE dismissed = false'}
         ORDER BY COALESCE(impact_amount_override, impact_amount) DESC
       `);
-      res.json({ generated_at: new Date().toISOString(), cards: result.rows });
+      const cardIds = cardsResult.rows.map(r => r.id);
+      const membersByCard = new Map();
+      if (cardIds.length) {
+        const membersResult = await pool.query(
+          `SELECT * FROM action_board_members WHERE card_id = ANY($1) ORDER BY resolved ASC, impact_amount DESC`,
+          [cardIds]
+        );
+        const memberIds = membersResult.rows.map(m => m.id);
+        const trendByMember = new Map();
+        if (memberIds.length) {
+          const trendResult = await pool.query(`
+            SELECT member_id, snapshot_date, kpi_value, impact_amount, pct_complete
+            FROM action_board_member_snapshots
+            WHERE member_id = ANY($1) AND snapshot_date >= CURRENT_DATE - INTERVAL '30 days'
+            ORDER BY snapshot_date ASC
+          `, [memberIds]);
+          for (const t of trendResult.rows) {
+            if (!trendByMember.has(t.member_id)) trendByMember.set(t.member_id, []);
+            trendByMember.get(t.member_id).push(t);
+          }
+        }
+        for (const m of membersResult.rows) {
+          if (!membersByCard.has(m.card_id)) membersByCard.set(m.card_id, []);
+          membersByCard.get(m.card_id).push({ ...m, trend: trendByMember.get(m.id) || [] });
+        }
+      }
+      const cards = cardsResult.rows.map(c => ({ ...c, members: membersByCard.get(c.id) || [] }));
+      res.json({ generated_at: new Date().toISOString(), max_todo_cards: MAX_TODO_CARDS, cards });
     } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
   });
 
@@ -480,7 +678,8 @@ function createActionBoardRouter({ pool, baseUrl }) {
   // Partial update: move stage, dismiss/undismiss, override the £ impact used for sorting,
   // and/or leave a note - used both by the board UI directly and by the chatbot's
   // update_action_board_card tool when the user argues a card's priority with it. Any stage
-  // or impact change here is a USER override: it sticks until POST /:id/revert.
+  // or impact change here is a USER override: it sticks (and, for 'todo', sits outside the
+  // 5-card cap) until POST /:id/revert.
   router.post('/api/action-board/cards/:id', async (req, res) => {
     const { id } = req.params;
     const { stage, dismissed, impact_amount_override, note } = req.body;
@@ -535,7 +734,9 @@ function createActionBoardRouter({ pool, baseUrl }) {
   });
 
   // Full reset back to pure AI judgement: clears stage override, dismissal, and impact
-  // override in one go - "regret your point of view, go back to what the AI suggested".
+  // override in one go - "regret your point of view, go back to what the AI suggested". If
+  // that hands it back to 'todo', the next evaluation run's capping pass decides whether it
+  // actually keeps a To Do slot or queues in backlog.
   router.post('/api/action-board/cards/:id/revert', async (req, res) => {
     const { id } = req.params;
     const client = await pool.connect();
@@ -579,4 +780,4 @@ function createActionBoardRouter({ pool, baseUrl }) {
   return router;
 }
 
-module.exports = { ensureActionBoardSchema, runActionBoardEvaluation, scheduleDailyEvaluation, createActionBoardRouter, STAGES };
+module.exports = { ensureActionBoardSchema, runActionBoardEvaluation, scheduleDailyEvaluation, createActionBoardRouter, STAGES, MAX_TODO_CARDS };
