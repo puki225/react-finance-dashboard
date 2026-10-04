@@ -149,7 +149,7 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
     },
     {
       name: 'get_cashflow_projection',
-      description: 'Forward cash flow projection: daily inflow (Amazon/Shopify settlements, now driven by the shipment/supply-aware sales forecast), outflow (known outflows, PPC, storage/account fees, procurement - procurement already accounts for real shipments already in transit, not just simulated reorders), resulting balance, and any scheduled procurement orders (`procurement_orders`, each with sku/trigger_date/arrival_date/payment_date/order_qty/amount - order_qty is sized to the sales forecast over the lead time, PLUS 2 extra weeks of safety stock on any order where `includes_safety_stock` is true, meaning stock was already at/below zero when it was triggered - `safety_stock_qty` gives that extra amount; a routine reorder triggered with its buffer still intact gets no padding). PPC and storage/account fees land as lump sums on their real/assumed billing dates, not smeared daily - storage/account fees post with the Amazon settlement itself (`recurring_costs.storage_and_account_fees`, same cadence as `settlement.amazon`); PPC has no real billing-date data available so it assumes a 30-day cycle starting today (`recurring_costs.ppc`) - a stated assumption, not a measured fact. Also returns an estimated credit-line need (`credit.max_utilization`/`max_utilization_date`, plus a per-day `credit_utilization` on each daily row) - how much credit draw would be needed to keep the balance at the configured minimum threshold on days cash alone would fall below it. Use for "will I have enough cash" / "when do I need to reorder X" / "will I need a credit line" questions.',
+      description: 'Forward cash flow projection: daily inflow (Amazon/Shopify settlements, now driven by the shipment/supply-aware sales forecast), outflow (known outflows, PPC, storage/account fees, procurement - procurement already accounts for real shipments already in transit, not just simulated reorders), resulting balance, and any scheduled procurement orders (`procurement_orders`, each with sku/trigger_date/arrival_date/payment_date/order_qty/amount - order_qty is sized to the sales forecast over the lead time, PLUS 2 extra weeks of safety stock on any order where `includes_safety_stock` is true, meaning stock was already at/below zero when it was triggered - `safety_stock_qty` gives that extra amount; a routine reorder triggered with its buffer still intact gets no padding - and then floored at the product\'s configured MOQ, `moq`, when `includes_moq_floor` is true, meaning forecasted demand alone wasn\'t enough to meet the supplier\'s minimum order quantity, so order_qty/amount reflect the MOQ instead of raw demand). PPC and storage/account fees land as lump sums on their real/assumed billing dates, not smeared daily - storage/account fees post with the Amazon settlement itself (`recurring_costs.storage_and_account_fees`, same cadence as `settlement.amazon`); PPC has no real billing-date data available so it assumes a 30-day cycle starting today (`recurring_costs.ppc`) - a stated assumption, not a measured fact. Also returns an estimated credit-line need (`credit.max_utilization`/`max_utilization_date`, plus a per-day `credit_utilization` on each daily row) - how much credit draw would be needed to keep the balance at the configured minimum threshold on days cash alone would fall below it. Use for "will I have enough cash" / "when do I need to reorder X" / "will I need a credit line" questions.',
       input_schema: {
         type: 'object',
         properties: { horizon_days: { type: 'integer', description: 'How many days forward to project, 1-180, default 180' } },
@@ -158,7 +158,7 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
     },
     {
       name: 'get_procurement_assumptions',
-      description: 'Configured procurement lead time and payment timing per product family (parent ASIN or standalone ASIN), plus current combined stock. Use to check what\'s configured before answering a reorder-timing question, or before proposing a change with update_procurement_assumptions.',
+      description: 'Configured procurement lead time, payment timing, and MOQ (`moq` - the supplier\'s minimum order quantity; the Cash Flow simulation never sizes a reorder below it) per product family (parent ASIN or standalone ASIN), plus current combined stock. Use to check what\'s configured before answering a reorder-timing question, or before proposing a change with update_procurement_assumptions.',
       input_schema: { type: 'object', properties: {} },
       run: () => callInternalApi('/api/procurement-assumptions'),
     },
@@ -175,13 +175,14 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
   const WRITE_TOOLS = [
     {
       name: 'update_procurement_assumptions',
-      description: "Set a product family's procurement lead time and/or payment timing (Settings -> Procurement). This changes real projected cash-outflow timing, so it requires confirmation: call this WITHOUT confirmed=true first to show the user what would change, then only call it again WITH confirmed=true after the user has explicitly agreed in this conversation.",
+      description: "Set a product family's procurement lead time, payment timing, and/or MOQ (Settings -> Procurement). This changes real projected cash-outflow timing and/or amounts, so it requires confirmation: call this WITHOUT confirmed=true first to show the user what would change, then only call it again WITH confirmed=true after the user has explicitly agreed in this conversation.",
       input_schema: {
         type: 'object',
         properties: {
           parent_asin: { type: 'string', description: 'Parent ASIN, or the standalone ASIN for a product with no parent family' },
           procurement_lead_days: { type: 'integer' },
           payment_days_after_order: { type: 'integer' },
+          moq: { type: 'integer', description: "Supplier's minimum order quantity. Every simulated reorder is sized to max(forecasted demand over the lead time, moq) - omit to leave it unchanged." },
           confirmed: { type: 'boolean', description: 'Must be true to actually apply the change' },
         },
         required: ['parent_asin'],
@@ -193,7 +194,7 @@ function createChatRouter({ pool, baseUrl, client: injectedClient }) {
         }
         const resp = await fetch(`${baseUrl}/api/procurement-assumptions/${encodeURIComponent(input.parent_asin)}`, {
           method: 'PUT', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ procurement_lead_days: input.procurement_lead_days, payment_days_after_order: input.payment_days_after_order }),
+          body: JSON.stringify({ procurement_lead_days: input.procurement_lead_days, payment_days_after_order: input.payment_days_after_order, moq: input.moq }),
         });
         const data = await resp.json();
         if (!resp.ok) throw new Error(data.error || `update_procurement_assumptions returned ${resp.status}`);

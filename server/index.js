@@ -283,8 +283,15 @@ app.use(express.static(path.join(__dirname, '../client/build')));
         parent_asin TEXT PRIMARY KEY,
         procurement_lead_days SMALLINT NOT NULL DEFAULT 90,
         payment_days_after_order SMALLINT NOT NULL DEFAULT 0,
+        -- Supplier's minimum order quantity. The Cash Flow simulation sizes every reorder at
+        -- max(forecasted demand over the lead time, moq) - below MOQ, demand alone isn't a
+        -- placeable order; above it, the order is just sized to demand as before. Default 1
+        -- is a no-op floor (every real order is at least 1 unit), so existing/unconfigured
+        -- products behave exactly as they did before this column existed.
+        moq INTEGER NOT NULL DEFAULT 1,
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE procurement_assumptions ADD COLUMN IF NOT EXISTS moq INTEGER NOT NULL DEFAULT 1;
       -- Reframe payment timing from "days before arrival" to "days after order placed" -
       -- same [0, procurement_lead_days] range, opposite anchor, easier for a user to answer
       -- directly from their own supplier terms. A straight column rename would silently
@@ -3708,6 +3715,7 @@ app.get('/api/procurement-assumptions', async (req, res) => {
       SELECT p.parent_asin, p.sku_count, p.product_name, p.image_url, p.sellable_units,
         COALESCE(pa.procurement_lead_days, 90) AS procurement_lead_days,
         COALESCE(pa.payment_days_after_order, 0) AS payment_days_after_order,
+        COALESCE(pa.moq, 1) AS moq,
         (pa.parent_asin IS NOT NULL) AS configured
       FROM parents p
       LEFT JOIN procurement_assumptions pa ON pa.parent_asin = p.parent_asin
@@ -3721,20 +3729,30 @@ app.put('/api/procurement-assumptions/:parent_asin', async (req, res) => {
   const { parent_asin } = req.params;
   const leadDays = parseInt(req.body.procurement_lead_days, 10);
   const payAfter = parseInt(req.body.payment_days_after_order, 10);
+  // moq is optional on this PUT (the chatbot's update_procurement_assumptions tool, for
+  // instance, may only ever touch lead time/payment timing) - omitted means "leave it as
+  // whatever it already is", not "reset to 1", via the COALESCE in the query below.
+  const moqProvided = req.body.moq !== undefined && req.body.moq !== null;
+  const moq = moqProvided ? parseInt(req.body.moq, 10) : null;
   if (isNaN(leadDays) || leadDays <= 0) {
     return res.status(400).json({ error: 'procurement_lead_days must be a positive integer' });
   }
   if (isNaN(payAfter) || payAfter < 0 || payAfter > leadDays) {
     return res.status(400).json({ error: 'payment_days_after_order must be between 0 and procurement_lead_days' });
   }
+  if (moqProvided && (isNaN(moq) || moq < 1)) {
+    return res.status(400).json({ error: 'moq must be a positive integer' });
+  }
   try {
     const result = await pool.query(`
-      INSERT INTO procurement_assumptions (parent_asin, procurement_lead_days, payment_days_after_order, updated_at)
-      VALUES ($1, $2, $3, NOW())
+      INSERT INTO procurement_assumptions (parent_asin, procurement_lead_days, payment_days_after_order, moq, updated_at)
+      VALUES ($1, $2, $3, COALESCE($4, 1), NOW())
       ON CONFLICT (parent_asin) DO UPDATE SET
-        procurement_lead_days = $2, payment_days_after_order = $3, updated_at = NOW()
+        procurement_lead_days = $2, payment_days_after_order = $3,
+        moq = COALESCE($4, procurement_assumptions.moq, 1),
+        updated_at = NOW()
       RETURNING *
-    `, [parent_asin, leadDays, payAfter]);
+    `, [parent_asin, leadDays, payAfter, moq]);
     res.json(result.rows[0]);
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
@@ -6098,6 +6116,7 @@ app.get('/api/cashflow', async (req, res) => {
       });
       const leadDays = pa.procurement_lead_days;
       const paymentDaysAfterOrder = pa.payment_days_after_order;
+      const moq = pa.moq || 1;
 
       let stock = row.sellable;
       // Seed with real in-transit shipments (not simulated future orders) - the loop's
@@ -6135,7 +6154,14 @@ app.get('/api/cashflow', async (req, res) => {
         // cushion instead of landing exactly empty-handed and immediately at risk again.
         const missingUnitsNow = stock <= 0;
         const safetyQty = missingUnitsNow ? SAFETY_STOCK_DAYS * avgVelocity : 0;
-        const orderQty = sumV + safetyQty;
+        const demandQty = sumV + safetyQty;
+        // MOQ floor: a supplier won't ship an order below their minimum, so demand alone
+        // isn't a placeable order quantity below it - "if demand is below the MOQ, the
+        // outflow is the MOQ quantity; if demand is higher, go with demand" (Settings ->
+        // Procurement's per-product MOQ field). Never shrinks an order that's already above
+        // MOQ on its own.
+        const orderQty = Math.max(demandQty, moq);
+        const moqApplied = moq > demandQty;
         const arrivalDay = day + leadDays;
         pendingArrivals.push({ day: arrivalDay, qty: orderQty });
         const paymentDay = day + paymentDaysAfterOrder;
@@ -6149,6 +6175,7 @@ app.get('/api/cashflow', async (req, res) => {
           order_qty: Math.round(orderQty), amount: fx(amount).toFixed(2),
           includes_safety_stock: missingUnitsNow,
           safety_stock_qty: missingUnitsNow ? Math.round(safetyQty) : 0,
+          moq, includes_moq_floor: moqApplied,
         });
       }
     }
