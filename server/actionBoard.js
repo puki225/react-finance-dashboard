@@ -153,6 +153,27 @@ function median(nums) {
   return arr.length % 2 ? arr[mid] : (arr[mid - 1] + arr[mid]) / 2;
 }
 
+// Vine giveaway units (Amazon's free-review-copy program) are a known, real drag on a SKU's
+// raw margin - COGS/fulfillment fees are incurred for a unit that brings in ~£0 revenue. That
+// is real, deliberate marketing spend, not a business PROBLEM worth a flashcard, so margin
+// detectors must never fire on a dip that Vine explains. Backs the Vine-attributable cost
+// share out of margin: per-unit COGS/fulfillment fee don't vary by channel or reason, so
+// splitting total_cogs/total_fees proportionally by (sold - vine) / sold units is exact, not
+// an approximation - same product decision as the PVM bridge's own vine-exclude toggle (see
+// pvmBaseRows in index.js), applied here from the vine_units count product-breakdown rows
+// already carry, with no extra query needed.
+function exVineMarginPct(row) {
+  const unitsSold = num(row.units_sold);
+  const netRevenue = num(row.net_revenue);
+  if (unitsSold <= 0) return num(row.gross_margin_pct);
+  const exVineUnits = Math.max(unitsSold - num(row.vine_units), 0);
+  const ratio = exVineUnits / unitsSold;
+  const exVineCogs = num(row.total_cogs) * ratio;
+  const exVineFees = num(row.total_fees) * ratio;
+  const exVineProfit = netRevenue - exVineCogs - exVineFees;
+  return netRevenue > 0 ? (exVineProfit / netRevenue * 100) : 0;
+}
+
 function makeCallInternalApi(baseUrl) {
   return async function callInternalApi(path, query = {}) {
     const qs = new URLSearchParams();
@@ -203,7 +224,7 @@ async function detectAllIssues({ callInternalApi }) {
   const peerTacos = median(peer.filter(r => num(r.ppc_cost) > 0).map(r => num(r.tacos)));
   const peerReturnRate = median(peer.filter(r => num(r.units_sold) >= 5).map(r => num(r.units_refunded) / num(r.units_sold) * 100));
   const peerDiscountRate = median(peer.filter(r => num(r.gross_sales) > 0).map(r => num(r.total_discounts) / num(r.gross_sales) * 100));
-  const peerMargin = median(peer.filter(r => num(r.net_revenue) >= 50).map(r => num(r.gross_margin_pct)));
+  const peerMargin = median(peer.filter(r => num(r.net_revenue) >= 50).map(exVineMarginPct));
 
   for (const row of current) {
     const sku = row.sku;
@@ -215,7 +236,7 @@ async function detectAllIssues({ callInternalApi }) {
     const unitsRefunded = num(row.units_refunded);
     const ppcCost = num(row.ppc_cost);
     const tacos = num(row.tacos);
-    const marginPct = num(row.gross_margin_pct);
+    const marginPct = exVineMarginPct(row); // always ex-Vine - see exVineMarginPct
 
     // TACOS blowout: ad spend materially above what peer SKUs achieve for a similar sales mix
     // (the user's own worked example: "TACOS on a given product is 40% and is costing me
@@ -277,7 +298,7 @@ async function detectAllIssues({ callInternalApi }) {
       if (impact >= 20) {
         candidates.push({
           issue_type: 'negative_margin', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Thin/negative margin on ${subject}`,
-          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell. ${inactionClause(impact)}`,
+          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days (excluding Vine giveaway units) vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell. ${inactionClause(impact)}`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target),
           kpi_unit: '%', kpi_direction: 'higher_better',
@@ -289,14 +310,14 @@ async function detectAllIssues({ callInternalApi }) {
     // erosion, or promo pressure even on a SKU whose margin is still "fine" in absolute terms.
     const priorRow = priorBySku.get(sku);
     if (priorRow && netRevenue >= 50) {
-      const priorMargin = num(priorRow.gross_margin_pct);
+      const priorMargin = exVineMarginPct(priorRow);
       const drop = priorMargin - marginPct;
       if (drop >= 8) {
         const impact = (drop / 100) * netRevenue;
         if (impact >= 20) {
           candidates.push({
             issue_type: 'margin_compression', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Margin slipping on ${subject}`,
-            description: `Gross margin dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here. ${inactionClause(impact)}`,
+            description: `Gross margin (excluding Vine giveaway units) dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Gross margin (vs prior period)', kpi_value: round1(marginPct), kpi_target: round1(priorMargin),
             kpi_unit: '%', kpi_direction: 'higher_better',
@@ -387,13 +408,18 @@ function isResolved(kpiValue, target, direction) {
   if (kpiValue === null || target === null) return false;
   return direction === 'lower_better' ? kpiValue <= target : kpiValue >= target;
 }
-// Same todo/doing/done advancement rule for both a single member's KPI and a card's
-// impact-weighted aggregate - whichever "progress since last run" number is passed in.
-function nextStage(currentStage, prevPct, newPct, allResolved) {
+// todo/doing/done advancement rule for a card's impact-weighted aggregate progress.
+// `weekAgoPct` is the comparison point a MEANINGFUL trend is measured against - null means
+// under a week of history exists yet, so no trend call can honestly be made either way; the
+// stage just holds (a 1-5 day move is exactly what this is designed to ignore). Resolving and
+// reopening are not trend calls - they're today's measured fact (the KPI crossed its target,
+// or stopped being past it) - so those still happen immediately regardless of weekAgoPct.
+function nextStage(currentStage, weekAgoPct, newPct, allResolved) {
   if (allResolved) return 'done';
   if (currentStage === 'done') return 'todo'; // was resolved, isn't any more - reopen at the top
-  if (newPct <= prevPct - 10 && currentStage !== 'todo') return 'todo'; // regressed meaningfully
-  if (newPct >= prevPct + 10 && newPct >= 15 && currentStage === 'todo') return 'doing';
+  if (weekAgoPct === null) return currentStage; // not enough history yet to call a week-long trend
+  if (newPct <= weekAgoPct - 10 && currentStage !== 'todo') return 'todo'; // regressed over the last week
+  if (newPct >= weekAgoPct + 10 && newPct >= 15 && currentStage === 'todo') return 'doing';
   return currentStage;
 }
 
@@ -508,8 +534,34 @@ async function runActionBoardEvaluation({ pool, baseUrl }) {
       const currencySymbol = (members[0] || allMembers[0])?.currency_symbol || cardRow.currency_symbol;
       const { title, description } = synthesizeCardText(issueType, allResolved ? [] : activeMembers);
 
-      const prevPct = num(cardRow.pct_complete);
-      const aiStage = nextStage(cardRow.ai_stage, prevPct, groupPct, allResolved);
+      // Stage only moves on a pattern that's held for at least a week, never a 1-5 day blip -
+      // so the comparison point is each member's own progress from 7+ days ago (its latest
+      // snapshot at or before CURRENT_DATE - 7), not yesterday's run. Same impact-baseline
+      // weighting as groupPct above, over whichever members have that much history; one that
+      // doesn't yet (card/member younger than a week) simply doesn't contribute a vote. If
+      // NOTHING has a week of history yet, weekAgoPct is null and nextStage leaves the stage
+      // exactly where it is - "resolved"/"reopened" below are the only moves that still
+      // happen immediately, since those are today's measured fact, not a trend call.
+      const memberIds = allMembers.map(m => m.id);
+      let weekAgoPct = null;
+      if (memberIds.length) {
+        const weekAgoResult = await client.query(`
+          SELECT DISTINCT ON (member_id) member_id, pct_complete
+          FROM action_board_member_snapshots
+          WHERE member_id = ANY($1) AND snapshot_date <= CURRENT_DATE - INTERVAL '7 days'
+          ORDER BY member_id, snapshot_date DESC
+        `, [memberIds]);
+        const weekAgoByMember = new Map(weekAgoResult.rows.map(r => [r.member_id, num(r.pct_complete)]));
+        let weekAgoWeightSum = 0, weekAgoWeightedPct = 0;
+        for (const m of allMembers) {
+          if (!weekAgoByMember.has(m.id)) continue;
+          const w = Math.max(num(m.impact_baseline), 0.01);
+          weekAgoWeightSum += w;
+          weekAgoWeightedPct += w * weekAgoByMember.get(m.id);
+        }
+        if (weekAgoWeightSum > 0) weekAgoPct = Math.round(weekAgoWeightedPct / weekAgoWeightSum);
+      }
+      const aiStage = nextStage(cardRow.ai_stage, weekAgoPct, groupPct, allResolved);
       const effectiveStage = cardRow.user_override ? cardRow.stage : aiStage;
 
       await client.query(`

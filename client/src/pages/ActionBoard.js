@@ -69,26 +69,42 @@ function Sparkline({ trend, direction }) {
 function ProductChip({ m }) {
   return (
     <div title={m.subject || m.sku} style={{
-      display: 'flex', alignItems: 'center', gap: 6, padding: '3px 8px 3px 3px',
-      background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8,
+      display: 'flex', alignItems: 'center', gap: 8, padding: '4px 10px 4px 4px',
+      background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 9,
       opacity: m.resolved ? 0.5 : 1, cursor: 'default',
     }}>
       {m.image_url
-        ? <img src={m.image_url} alt={m.sku} style={{ width: 22, height: 22, objectFit: 'contain', borderRadius: 4, background: 'var(--bg3)', border: '1px solid var(--border)', flexShrink: 0 }} />
-        : <div style={{ width: 22, height: 22, borderRadius: 4, background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, opacity: 0.3, flexShrink: 0 }}>◉</div>
+        ? <img src={m.image_url} alt={m.sku} style={{ width: 36, height: 36, objectFit: 'contain', borderRadius: 6, background: 'var(--bg3)', border: '1px solid var(--border)', flexShrink: 0 }} />
+        : <div style={{ width: 36, height: 36, borderRadius: 6, background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, opacity: 0.3, flexShrink: 0 }}>◉</div>
       }
-      <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{m.sku}</span>
+      <span style={{ fontSize: 11, fontFamily: 'var(--mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{m.sku}</span>
     </div>
   );
 }
 
-function ProductChipGrid({ members }) {
+// Capped at 6 chips (never more, whatever the real member count) - beyond that a plain
+// "Show N more" text line sits under the grid rather than competing with the chips for grid
+// columns, so it's never scrolled out of view the way a 7th chip would be on a narrow card.
+const MAX_VISIBLE_CHIPS = 6;
+function ProductChipGrid({ members, onShowMore }) {
+  const visible = members.slice(0, MAX_VISIBLE_CHIPS);
+  const overflow = members.length - visible.length;
   return (
-    <div style={{
-      display: 'grid', gridTemplateRows: 'repeat(2, auto)', gridAutoFlow: 'column',
-      gridAutoColumns: 'min-content', gap: 6, overflowX: 'auto', paddingBottom: 2,
-    }}>
-      {members.map(m => <ProductChip key={m.id} m={m} />)}
+    <div>
+      <div style={{
+        display: 'grid', gridTemplateRows: 'repeat(2, auto)', gridAutoFlow: 'column',
+        gridAutoColumns: 'min-content', gap: 8, overflowX: 'auto', paddingBottom: 2,
+      }}>
+        {visible.map(m => <ProductChip key={m.id} m={m} />)}
+      </div>
+      {overflow > 0 && (
+        <button onClick={onShowMore} style={{
+          marginTop: 6, fontSize: 11, color: 'var(--accent2)', background: 'none', border: 'none',
+          cursor: 'pointer', fontFamily: 'var(--font)', padding: 0, fontWeight: 600,
+        }}>
+          Show {overflow} more
+        </button>
+      )}
     </div>
   );
 }
@@ -149,7 +165,7 @@ function Card({ card, onMove, onDismiss, onUndismiss, onRevert, dragEnabled }) {
 
       <div style={{ fontSize: 12, color: 'var(--muted)', lineHeight: 1.45 }}>{card.description}</div>
 
-      {members.length > 1 && <ProductChipGrid members={members} />}
+      {members.length > 1 && <ProductChipGrid members={members} onShowMore={() => setExpanded(true)} />}
 
       {soleMember?.kpi_name && (
         <div>
