@@ -854,22 +854,27 @@ function CashFlowSettings() {
 function ProcurementRow({ row, onRefresh }) {
   const [leadDays, setLeadDays] = useState(row.procurement_lead_days);
   const [payAfter, setPayAfter] = useState(row.payment_days_after_order);
+  const [moq, setMoq] = useState(row.moq);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState(null);
 
-  const dirty = parseInt(leadDays, 10) !== row.procurement_lead_days || parseInt(payAfter, 10) !== row.payment_days_after_order;
+  const dirty = parseInt(leadDays, 10) !== row.procurement_lead_days
+    || parseInt(payAfter, 10) !== row.payment_days_after_order
+    || parseInt(moq, 10) !== row.moq;
 
   const handleSave = async () => {
     const lead = parseInt(leadDays, 10);
     const after = parseInt(payAfter, 10);
+    const moqVal = parseInt(moq, 10);
     if (isNaN(lead) || lead <= 0) { setError('Lead time must be a positive number of days'); return; }
     if (isNaN(after) || after < 0 || after > lead) { setError('Payment days after order must be between 0 and the lead time'); return; }
+    if (isNaN(moqVal) || moqVal < 1) { setError('MOQ must be a positive number of units'); return; }
     setSaving(true); setError(null); setSaved(false);
     try {
       const resp = await fetch(`/api/procurement-assumptions/${encodeURIComponent(row.parent_asin)}`, {
         method: 'PUT', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ procurement_lead_days: lead, payment_days_after_order: after }),
+        body: JSON.stringify({ procurement_lead_days: lead, payment_days_after_order: after, moq: moqVal }),
       });
       const d = await resp.json();
       if (!resp.ok) throw new Error(d.error || 'Save failed');
@@ -896,6 +901,10 @@ function ProcurementRow({ row, onRefresh }) {
       <div style={{ flex: '1 1 160px' }}>
         <label style={labelStyle}>Pay N Days After Order Placed</label>
         <input type="number" min="0" style={inputStyle} value={payAfter} onChange={e => { setPayAfter(e.target.value); setSaved(false); }} />
+      </div>
+      <div style={{ flex: '1 1 120px' }}>
+        <label style={labelStyle} title="Supplier's minimum order quantity - a reorder is never sized below this, even when forecasted demand alone would be less">MOQ (units)</label>
+        <input type="number" min="1" style={inputStyle} value={moq} onChange={e => { setMoq(e.target.value); setSaved(false); }} />
       </div>
       <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'flex-end', gap: 4, flexShrink: 0 }}>
         {saved && !dirty && <span style={{ fontSize: 11, color: 'var(--green)' }}>✓ Saved</span>}
@@ -925,10 +934,12 @@ function ProcurementSettings() {
       <div>
         <h2 style={{ fontSize: 15, fontWeight: 700, marginBottom: 4 }}>Procurement</h2>
         <p style={{ fontSize: 13, color: 'var(--muted)', lineHeight: 1.6 }}>
-          How long manufacturing + shipping takes, and how far ahead of arrival you actually pay your supplier, per product.
-          Once set, the Cash Flow tab automatically works out when each product will need reordering — from its current stock
-          and forecasted sales velocity — and schedules the resulting cash outflow, instead of you having to guess it.
-          A 2-week safety-stock cushion is built into the reorder trigger automatically, so there's still buffer left when the new stock arrives.
+          How long manufacturing + shipping takes, how far ahead of arrival you actually pay your supplier, and their minimum
+          order quantity, per product. Once set, the Cash Flow tab automatically works out when each product will need
+          reordering — from its current stock and forecasted sales velocity — and schedules the resulting cash outflow,
+          instead of you having to guess it. A 2-week safety-stock cushion is built into the reorder trigger automatically,
+          so there's still buffer left when the new stock arrives. The order is always sized to at least the MOQ — if
+          forecasted demand over the lead time is below it, the outflow reflects the MOQ quantity instead.
         </p>
       </div>
       {loading && <div style={{ padding: '48px 0', textAlign: 'center', color: 'var(--muted)' }}>Loading…</div>}
