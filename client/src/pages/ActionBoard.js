@@ -40,6 +40,19 @@ function ProgressBar({ pct }) {
   );
 }
 
+// One of a flashcard's three structured parts - Identified Problem / Drivers / Recommended
+// Action - each a short uppercase label over its body text. Renders nothing when there's no
+// content for this part yet (e.g. an older card re-evaluated before `drivers` existed).
+function Section({ label, children, muted }) {
+  if (!children) return null;
+  return (
+    <div>
+      <div style={{ fontSize: 9, color: 'var(--accent2)', letterSpacing: '0.06em', textTransform: 'uppercase', fontWeight: 700, marginBottom: 3 }}>{label}</div>
+      <div style={{ fontSize: 12, color: muted ? 'var(--muted)' : 'var(--text)', lineHeight: 1.45 }}>{children}</div>
+    </div>
+  );
+}
+
 // A tiny inline trend line from a member's daily snapshots - real history (one point per
 // evaluation run the member has existed for), not a fabricated shape. With under 2 points
 // there's nothing to draw yet, so it says so instead of rendering a flat lie of a line.
@@ -85,7 +98,7 @@ function ProductChip({ m }) {
 // Capped at 6 chips (never more, whatever the real member count) - beyond that a plain
 // "Show N more" text line sits under the grid rather than competing with the chips for grid
 // columns, so it's never scrolled out of view the way a 7th chip would be on a narrow card.
-const MAX_VISIBLE_CHIPS = 6;
+const MAX_VISIBLE_CHIPS = 4;
 function ProductChipGrid({ members, onShowMore }) {
   const visible = members.slice(0, MAX_VISIBLE_CHIPS);
   const overflow = members.length - visible.length;
@@ -118,11 +131,12 @@ function MemberRow({ m, currencySymbol }) {
         </div>
         {m.kpi_name && (
           <div style={{ fontSize: 10, color: 'var(--muted)' }}>
-            {m.kpi_name}: <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>{fmtKpi(m.kpi_value, m.kpi_unit)}</span>
+            {m.kpi_name} (14d avg): <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>{fmtKpi(m.kpi_value, m.kpi_unit)}</span>
             {' → '}
-            <span style={{ fontFamily: 'var(--mono)', color: 'var(--text)' }}>{fmtKpi(m.kpi_target, m.kpi_unit)}</span>
+            <span title={m.kpi_basis || ''} style={{ fontFamily: 'var(--mono)', color: 'var(--text)', cursor: m.kpi_basis ? 'help' : 'default' }}>{fmtKpi(m.kpi_target, m.kpi_unit)}</span>
           </div>
         )}
+        {m.drivers && <div style={{ fontSize: 10, color: 'var(--muted)', fontStyle: 'italic', marginTop: 1 }}>{m.drivers}</div>}
       </div>
       <Sparkline trend={m.trend} direction={m.kpi_direction} />
       <div style={{ fontSize: 11, fontFamily: 'var(--mono)', fontWeight: 700, width: 56, textAlign: 'right', color: m.resolved ? '#34d399' : 'var(--text)' }}>
@@ -163,24 +177,32 @@ function Card({ card, onMove, onDismiss, onUndismiss, onRevert, dragEnabled }) {
         </div>
       </div>
 
-      <div style={{ fontSize: 12, color: 'var(--muted)', lineHeight: 1.45 }}>{card.description}</div>
+      <Section label="Identified problem" muted>{card.description}</Section>
 
       {members.length > 1 && <ProductChipGrid members={members} onShowMore={() => setExpanded(true)} />}
+
+      <Section label="Drivers">{card.drivers}</Section>
 
       {soleMember?.kpi_name && (
         <div>
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>
-            <span>{soleMember.kpi_name}: <span style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{fmtKpi(soleMember.kpi_value, soleMember.kpi_unit)}</span></span>
-            <span>target <span style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{fmtKpi(soleMember.kpi_target, soleMember.kpi_unit)}</span></span>
+            <span>{soleMember.kpi_name} (14d avg): <span style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{fmtKpi(soleMember.kpi_value, soleMember.kpi_unit)}</span></span>
+            <span>goal <span style={{ color: 'var(--text)', fontFamily: 'var(--mono)' }}>{fmtKpi(soleMember.kpi_target, soleMember.kpi_unit)}</span></span>
           </div>
           <ProgressBar pct={pct} />
-          <div style={{ fontSize: 10, color: 'var(--muted)', marginTop: 3 }}>{pct}% of the way there</div>
+          <div style={{ fontSize: 10, color: pctColor(pct), fontWeight: 700, marginTop: 3 }}>{pct}% of the way there</div>
+          {soleMember.kpi_basis && (
+            <div style={{ fontSize: 9, color: 'var(--muted)', fontStyle: 'italic', marginTop: 2 }}>Goal based on: {soleMember.kpi_basis}</div>
+          )}
         </div>
       )}
 
       {members.length > 1 && (
         <div>
-          <div style={{ fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>Weighted progress across {members.length} products</div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: 11, color: 'var(--muted)', marginBottom: 4 }}>
+            <span>Weighted progress across {members.length} products</span>
+            <span style={{ fontWeight: 700, color: pctColor(pct) }}>{pct}%</span>
+          </div>
           <ProgressBar pct={pct} />
           <button onClick={() => setExpanded(!expanded)} style={{
             marginTop: 8, fontSize: 11, color: 'var(--accent2)', background: 'none', border: 'none',
@@ -195,6 +217,8 @@ function Card({ card, onMove, onDismiss, onUndismiss, onRevert, dragEnabled }) {
           )}
         </div>
       )}
+
+      <Section label="Recommended action">{card.recommended_action}</Section>
 
       <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 6, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>

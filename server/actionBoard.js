@@ -74,6 +74,8 @@ async function ensureActionBoardSchema(pool) {
       issue_type TEXT NOT NULL UNIQUE,
       title TEXT NOT NULL,
       description TEXT,
+      drivers TEXT,
+      recommended_action TEXT,
       impact_amount NUMERIC NOT NULL DEFAULT 0,
       impact_amount_override NUMERIC,
       currency_symbol TEXT NOT NULL DEFAULT '£',
@@ -102,12 +104,15 @@ async function ensureActionBoardSchema(pool) {
       image_url TEXT, -- product thumbnail for the flashcard's product chips; null for an account-level member
       title TEXT NOT NULL,
       description TEXT,
+      drivers TEXT,
+      recommended_action TEXT,
       impact_amount NUMERIC NOT NULL DEFAULT 0,
       impact_baseline NUMERIC NOT NULL DEFAULT 0, -- impact at first detection; weights this member in the card's aggregate progress
       kpi_name TEXT,
       kpi_value NUMERIC,
       kpi_target NUMERIC,
       kpi_baseline NUMERIC,
+      kpi_basis TEXT, -- plain-English explanation of what kpi_target is actually based on (self-best window, peer benchmark, a stated assumption, ...)
       kpi_unit TEXT,
       kpi_direction TEXT,
       pct_complete NUMERIC NOT NULL DEFAULT 0,
@@ -118,6 +123,11 @@ async function ensureActionBoardSchema(pool) {
       UNIQUE (issue_type, scope_key)
     );
     ALTER TABLE action_board_members ADD COLUMN IF NOT EXISTS image_url TEXT;
+    ALTER TABLE action_board_cards ADD COLUMN IF NOT EXISTS drivers TEXT;
+    ALTER TABLE action_board_cards ADD COLUMN IF NOT EXISTS recommended_action TEXT;
+    ALTER TABLE action_board_members ADD COLUMN IF NOT EXISTS drivers TEXT;
+    ALTER TABLE action_board_members ADD COLUMN IF NOT EXISTS recommended_action TEXT;
+    ALTER TABLE action_board_members ADD COLUMN IF NOT EXISTS kpi_basis TEXT;
     CREATE TABLE IF NOT EXISTS action_board_member_snapshots (
       id SERIAL PRIMARY KEY,
       member_id INTEGER NOT NULL REFERENCES action_board_members(id) ON DELETE CASCADE,
@@ -174,6 +184,105 @@ function exVineMarginPct(row) {
   return netRevenue > 0 ? (exVineProfit / netRevenue * 100) : 0;
 }
 
+// Interquartile-range outlier exclusion - drops anything more than 1.5x the IQR outside the
+// middle 50%, the standard robust-statistics rule of thumb. Returns the input unchanged (never
+// empty) when there aren't enough points to compute a meaningful IQR, or when excluding would
+// leave nothing.
+function excludeOutliers(vals) {
+  if (vals.length < 4) return vals;
+  const sorted = [...vals].sort((a, b) => a - b);
+  const q1 = sorted[Math.floor(sorted.length * 0.25)];
+  const q3 = sorted[Math.floor(sorted.length * 0.75)];
+  const iqr = q3 - q1;
+  const lo = q1 - 1.5 * iqr, hi = q3 + 1.5 * iqr;
+  const cleaned = vals.filter(v => v >= lo && v <= hi);
+  return cleaned.length ? cleaned : vals;
+}
+
+// A product's own best historical 30-day window is a more tangible, motivating end-goal than
+// an abstract peer benchmark - "get it back to where it's already proven it can be", not "be
+// as good as everyone else". Checks up to 6 trailing 30-day windows (the last ~6 months);
+// falls back to the peer figure only when there isn't enough of the product's OWN history yet
+// (under 3 qualifying windows - e.g. a product newer than ~3 months). `windowMaps` is an
+// array of Map<sku, row>, one per historical window, in any order.
+function selfBestOrPeerTarget({ sku, metricFn, validFn, direction, peerValue, windowMaps }) {
+  const vals = [];
+  for (const m of windowMaps) {
+    const row = m.get(sku);
+    if (row && validFn(row)) vals.push(metricFn(row));
+  }
+  if (vals.length >= 3) {
+    const pool = excludeOutliers(vals);
+    const target = direction === 'lower_better' ? Math.min(...pool) : Math.max(...pool);
+    return { target, basis: `this product's own best 30-day window over the last 6 months (${vals.length} windows checked, outliers excluded)` };
+  }
+  if (peerValue !== null && peerValue !== undefined) {
+    return { target: peerValue, basis: "a peer benchmark across similar-selling products (not enough of this product's own history yet for a self-referenced target)" };
+  }
+  return null;
+}
+
+// Decomposes a SKU's margin change between two product-breakdown rows into named £ drivers -
+// price (ASP), discount, refunds, COGS, and fulfillment/referral fees - and names whichever
+// moved against margin the most. Per-unit COGS/fees don't vary period to period for the same
+// product, so a per-unit delta x current volume is each driver's exact £ contribution, not an
+// approximation. ASP uses GROSS sales per unit (not net) specifically so the discount driver
+// isn't silently double-counted inside it.
+function diagnoseMarginDrivers(curRow, priorRow) {
+  const curUnits = num(curRow.units_sold), priorUnits = num(priorRow.units_sold);
+  if (curUnits <= 0 || priorUnits <= 0) return null;
+  const curAsp = num(curRow.gross_sales) / curUnits, priorAsp = num(priorRow.gross_sales) / priorUnits;
+  const curDisc = num(curRow.total_discounts) / curUnits, priorDisc = num(priorRow.total_discounts) / priorUnits;
+  const curRefund = num(curRow.total_refunded) / curUnits, priorRefund = num(priorRow.total_refunded) / priorUnits;
+  const curCogs = num(curRow.total_cogs) / curUnits, priorCogs = num(priorRow.total_cogs) / priorUnits;
+  const curFees = num(curRow.total_fees) / curUnits, priorFees = num(priorRow.total_fees) / priorUnits;
+
+  const candidates = [
+    { name: 'price', label: 'a lower selling price', amount: (curAsp - priorAsp) * curUnits },
+    { name: 'discount', label: 'heavier discounting', amount: -(curDisc - priorDisc) * curUnits },
+    { name: 'refunds', label: 'more refunds', amount: -(curRefund - priorRefund) * curUnits },
+    { name: 'cogs', label: 'rising unit cost (COGS)', amount: -(curCogs - priorCogs) * curUnits },
+    { name: 'fees', label: 'rising Amazon fees', amount: -(curFees - priorFees) * curUnits },
+  ];
+  candidates.sort((a, b) => a.amount - b.amount); // most negative = biggest drag on margin
+  const dominant = candidates[0];
+  const actionByDriver = {
+    price: 'Review pricing on this product — the list price itself has slipped.',
+    discount: 'Pull back promotional depth/frequency on this product.',
+    refunds: 'Investigate what\'s driving returns/refunds — a quality or listing-accuracy issue is the likely cause.',
+    cogs: 'Revisit the supplier cost, or raise price to offset the rising unit cost.',
+    fees: 'Check for an Amazon fee-structure or fulfillment-category change — price/cost are the main levers available to offset it.',
+  };
+  return {
+    drivers: `${dominant.label.charAt(0).toUpperCase()}${dominant.label.slice(1)} is the main driver, based on a per-unit price/discount/refund/COGS/fee breakdown vs the comparison period.`,
+    recommended_action: actionByDriver[dominant.name],
+  };
+}
+
+// Simpler 2-factor version for TACOS: is the ratio climbing because spend is rising, or
+// because sales are falling (so TACOS worsens even at flat spend)? Whichever moved more, in
+// relative terms, is named as the driver.
+function diagnoseTacosDrivers(curRow, priorRow) {
+  if (!priorRow) return { drivers: 'Based on ad spend vs. sales over the comparison period.', recommended_action: 'Review campaign targeting/bids on this product.' };
+  const curCost = num(curRow.ppc_cost), priorCost = num(priorRow.ppc_cost);
+  const curRev = num(curRow.net_revenue), priorRev = num(priorRow.net_revenue);
+  const costUpPct = priorCost > 0 ? (curCost - priorCost) / priorCost : (curCost > 0 ? 1 : 0);
+  const revDownPct = priorRev > 0 ? Math.max(0, (priorRev - curRev) / priorRev) : 0;
+  if (costUpPct > revDownPct && costUpPct > 0) {
+    return {
+      drivers: `Ad spend is up ~${Math.round(costUpPct * 100)}% vs the comparison period, outpacing sales.`,
+      recommended_action: 'Reduce bids/budget or tighten targeting on this product.',
+    };
+  }
+  if (revDownPct > 0) {
+    return {
+      drivers: `Sales are down ~${Math.round(revDownPct * 100)}% vs the comparison period while ad spend held roughly steady, which pushes TACOS up even without higher spend.`,
+      recommended_action: 'Investigate the sales decline (seasonality, stock, competition) before cutting ad spend — the ratio, not the spend, is what moved.',
+    };
+  }
+  return { drivers: "TACOS is elevated relative to this product's own best period.", recommended_action: 'Review campaign targeting/bids on this product.' };
+}
+
 function makeCallInternalApi(baseUrl) {
   return async function callInternalApi(path, query = {}) {
     const qs = new URLSearchParams();
@@ -191,17 +300,35 @@ function makeCallInternalApi(baseUrl) {
 
 // ─── Detectors ──────────────────────────────────────────────────────────────────────────
 // Each candidate (one MEMBER instance): { issue_type, scope_key, sku, subject, title,
-// description, impact_amount, currency_symbol, kpi_name, kpi_value, kpi_target, kpi_unit,
-// kpi_direction }. `subject` is the bare product/account name (used in group-card summaries);
-// `title`/`description` are the full, SKU-specific sentences (used as-is when a card has only
-// one member). Materiality floors (impact_amount thresholds below) exist so a card doesn't
-// flicker in and out of existence over noise - every floor is a judgment call, not a measured
-// fact, and is a reasonable first thing to loosen/tighten if the board feels too noisy or quiet.
+// description, drivers, recommended_action, impact_amount, currency_symbol, kpi_name,
+// kpi_value, kpi_target, kpi_basis, kpi_unit, kpi_direction }. `subject` is the bare
+// product/account name (group-card summaries); `title`/`description` are the full,
+// SKU-specific sentences (used as-is when a card has only one member). `description` states
+// the PROBLEM as a fact; `drivers` says why (where that can be diagnosed from the data);
+// `recommended_action` is a concrete next step tied to `kpi_target`; `kpi_basis` says what
+// that target is actually based on, so it's never just an unexplained number. Materiality
+// floors (impact_amount thresholds below) exist so a card doesn't flicker in and out of
+// existence over noise - every floor is a judgment call, not a measured fact, and is a
+// reasonable first thing to loosen/tighten if the board feels too noisy or quiet.
+//
+// Every per-SKU rate (TACOS, return rate, discount rate, margin) reads as its trailing
+// 14-day average - "what it looks like right now", not a slower-moving 30-day blend - and is
+// judged against the SKU's own best 30-day window over the last ~6 months (outliers
+// excluded) wherever there's enough of that SKU's own history, falling back to a peer
+// benchmark otherwise (see selfBestOrPeerTarget). £ impact is still framed as a 30-day cost,
+// so a 14-day read is scaled up by 30/14 wherever it feeds an impact calculation.
+const FOURTEEN_TO_THIRTY = 30 / 14;
 async function detectAllIssues({ callInternalApi }) {
-  const [current, prior, peer, inventory, cashflow] = await Promise.all([
-    callInternalApi('/api/product-breakdown', { from: fmt(daysAgo(29)), to: fmt(daysAgo(0)), channel: 'all' }),
-    callInternalApi('/api/product-breakdown', { from: fmt(daysAgo(59)), to: fmt(daysAgo(30)), channel: 'all' }),
-    callInternalApi('/api/product-breakdown', { from: fmt(daysAgo(89)), to: fmt(daysAgo(0)), channel: 'all' }),
+  const pb = (from, to) => callInternalApi('/api/product-breakdown', { from: fmt(from), to: fmt(to), channel: 'all' });
+  const [last14, current, prior, w2, w3, w4, w5, peer, inventory, cashflow] = await Promise.all([
+    pb(daysAgo(13), daysAgo(0)),
+    pb(daysAgo(29), daysAgo(0)),
+    pb(daysAgo(59), daysAgo(30)),
+    pb(daysAgo(89), daysAgo(60)),
+    pb(daysAgo(119), daysAgo(90)),
+    pb(daysAgo(149), daysAgo(120)),
+    pb(daysAgo(179), daysAgo(150)),
+    pb(daysAgo(89), daysAgo(0)),
     callInternalApi('/api/inventory', {}),
     callInternalApi('/api/cashflow', {}),
   ]);
@@ -209,24 +336,21 @@ async function detectAllIssues({ callInternalApi }) {
   const currencySymbol = inventory.currency_symbol || cashflow.currency_symbol || '£';
   const priorBySku = new Map(prior.map(r => [r.sku, r]));
   const peerBySku = new Map(peer.map(r => [r.sku, r]));
+  // The last ~6 months of 30-day windows, checked for each SKU's own best-ever reading of a
+  // given metric - see selfBestOrPeerTarget.
+  const windowMaps = [current, prior, w2, w3, w4, w5].map(rows => new Map(rows.map(r => [r.sku, r])));
   const candidates = [];
 
-  // Every £ figure below is framed as "what doing nothing costs over the next 30 days", not
-  // an abstract/perpetual "£/month" run-rate - a concrete, bounded number reads as more
-  // tangible than a rate that implies it just continues forever. The underlying math is
-  // already a 30-day (or 30-day-equivalent) figure for every detector that uses this - this
-  // only changes the words around the number, not the number itself.
-  const inactionClause = (impact) => `Left as-is, this is projected to cost ${currencySymbol}${impact.toFixed(2)} over the next 30 days.`;
-
-  // Peer benchmarks: medians across the wider, more stable 90-day window, each restricted to
-  // SKUs where the metric is actually meaningful (e.g. only SKUs running ads for TACOS) so a
-  // pile of zero-spend/zero-return SKUs doesn't drag the "normal" level down to nothing.
+  // Peer benchmarks (fallback only - see selfBestOrPeerTarget): medians across the wider,
+  // more stable 90-day window, each restricted to SKUs where the metric is actually
+  // meaningful (e.g. only SKUs running ads for TACOS) so a pile of zero-spend/zero-return
+  // SKUs doesn't drag the "normal" level down to nothing.
   const peerTacos = median(peer.filter(r => num(r.ppc_cost) > 0).map(r => num(r.tacos)));
   const peerReturnRate = median(peer.filter(r => num(r.units_sold) >= 5).map(r => num(r.units_refunded) / num(r.units_sold) * 100));
   const peerDiscountRate = median(peer.filter(r => num(r.gross_sales) > 0).map(r => num(r.total_discounts) / num(r.gross_sales) * 100));
   const peerMargin = median(peer.filter(r => num(r.net_revenue) >= 50).map(exVineMarginPct));
 
-  for (const row of current) {
+  for (const row of last14) {
     const sku = row.sku;
     if (!sku) continue;
     const subject = row.product_title || sku;
@@ -237,70 +361,100 @@ async function detectAllIssues({ callInternalApi }) {
     const ppcCost = num(row.ppc_cost);
     const tacos = num(row.tacos);
     const marginPct = exVineMarginPct(row); // always ex-Vine - see exVineMarginPct
+    const priorRow = priorBySku.get(sku);
 
-    // TACOS blowout: ad spend materially above what peer SKUs achieve for a similar sales mix
-    // (the user's own worked example: "TACOS on a given product is 40% and is costing me
+    // TACOS blowout: ad spend materially above this product's own best-ever rate (the
+    // user's own worked example: "TACOS on a given product is 40% and is costing me
     // £300/month overspend when I could have it at 10% with similar CTR and volume").
-    if (ppcCost > 0 && peerTacos !== null && tacos > peerTacos) {
-      const impact = (tacos - peerTacos) / 100 * netRevenue;
-      if (impact >= 30) {
-        candidates.push({
-          issue_type: 'tacos_blowout', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `High TACOS on ${subject}`,
-          description: `TACOS is ${tacos.toFixed(1)}% vs a ${peerTacos.toFixed(1)}% peer benchmark across similar-selling SKUs (last 90 days) — ad spend here is outpacing what comparable products need. ${inactionClause(impact)}`,
-          impact_amount: round2(impact), currency_symbol: currencySymbol,
-          kpi_name: 'TACOS', kpi_value: round1(tacos), kpi_target: round1(peerTacos),
-          kpi_unit: '%', kpi_direction: 'lower_better',
-        });
+    if (ppcCost > 0) {
+      const t = selfBestOrPeerTarget({
+        sku, direction: 'lower_better', peerValue: peerTacos, windowMaps,
+        validFn: r => num(r.ppc_cost) > 0, metricFn: r => num(r.tacos),
+      });
+      if (t && tacos > t.target) {
+        const impact = (tacos - t.target) / 100 * netRevenue * FOURTEEN_TO_THIRTY;
+        if (impact >= 30) {
+          const diag = diagnoseTacosDrivers(row, priorRow);
+          candidates.push({
+            issue_type: 'tacos_blowout', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `High TACOS on ${subject}`,
+            description: `TACOS is ${tacos.toFixed(1)}% over the last 14 days, ad spend outpacing what this product needs.`,
+            drivers: diag.drivers, recommended_action: `${diag.recommended_action} Target: back to ${t.target.toFixed(1)}%.`,
+            impact_amount: round2(impact), currency_symbol: currencySymbol,
+            kpi_name: 'TACOS', kpi_value: round1(tacos), kpi_target: round1(t.target), kpi_basis: t.basis,
+            kpi_unit: '%', kpi_direction: 'lower_better',
+          });
+        }
       }
     }
 
-    // High return rate vs peers - a quality/sizing/listing-accuracy signal.
-    if (unitsSold >= 5 && unitsRefunded > 0 && peerReturnRate !== null) {
+    // High return rate vs this product's own best-ever rate - a quality/sizing/listing-
+    // accuracy signal.
+    if (unitsSold >= 3 && unitsRefunded > 0) {
+      const t = selfBestOrPeerTarget({
+        sku, direction: 'lower_better', peerValue: peerReturnRate, windowMaps,
+        validFn: r => num(r.units_sold) >= 5, metricFn: r => num(r.units_refunded) / num(r.units_sold) * 100,
+      });
       const returnRate = unitsRefunded / unitsSold * 100;
-      if (returnRate > peerReturnRate) {
+      if (t && returnRate > t.target) {
         const avgRefundPerUnit = num(row.total_refunded) / unitsRefunded;
-        const excessUnits = Math.max(0, (returnRate - peerReturnRate) / 100 * unitsSold);
-        const impact = excessUnits * avgRefundPerUnit;
+        const excessUnits = Math.max(0, (returnRate - t.target) / 100 * unitsSold);
+        const impact = excessUnits * avgRefundPerUnit * FOURTEEN_TO_THIRTY;
         if (impact >= 20) {
           candidates.push({
             issue_type: 'high_returns', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `High return rate on ${subject}`,
-            description: `${returnRate.toFixed(1)}% of units sold are coming back vs a ${peerReturnRate.toFixed(1)}% peer benchmark — worth checking for a quality, sizing, or listing-accuracy issue. ${inactionClause(impact)}`,
+            description: `${returnRate.toFixed(1)}% of units sold over the last 14 days are coming back.`,
+            drivers: 'Return rate alone, with no return-reason data available from Amazon to attribute it further.',
+            recommended_action: `Review recent customer feedback/return reasons for a pattern (quality, sizing, listing accuracy). Target: back to ${t.target.toFixed(1)}%.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
-            kpi_name: 'Return rate', kpi_value: round1(returnRate), kpi_target: round1(peerReturnRate),
+            kpi_name: 'Return rate', kpi_value: round1(returnRate), kpi_target: round1(t.target), kpi_basis: t.basis,
             kpi_unit: '%', kpi_direction: 'lower_better',
           });
         }
       }
     }
 
-    // Discount leakage vs peers.
-    if (grossSales > 0 && peerDiscountRate !== null) {
+    // Discount leakage vs this product's own best-ever rate.
+    if (grossSales > 0) {
+      const t = selfBestOrPeerTarget({
+        sku, direction: 'lower_better', peerValue: peerDiscountRate, windowMaps,
+        validFn: r => num(r.gross_sales) > 0, metricFn: r => num(r.total_discounts) / num(r.gross_sales) * 100,
+      });
       const discountRate = num(row.total_discounts) / grossSales * 100;
-      if (discountRate > peerDiscountRate) {
-        const impact = (discountRate - peerDiscountRate) / 100 * grossSales;
+      if (t && discountRate > t.target) {
+        const impact = (discountRate - t.target) / 100 * grossSales * FOURTEEN_TO_THIRTY;
         if (impact >= 20) {
           candidates.push({
             issue_type: 'discount_leakage', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Heavy discounting on ${subject}`,
-            description: `${discountRate.toFixed(1)}% of gross sales is being discounted away vs a ${peerDiscountRate.toFixed(1)}% peer benchmark. ${inactionClause(impact)}`,
+            description: `${discountRate.toFixed(1)}% of gross sales over the last 14 days is being discounted away.`,
+            drivers: `Discount rate itself is the issue, not volume or price - ${discountRate.toFixed(1)}% discounted vs a ${t.target.toFixed(1)}% target.`,
+            recommended_action: `Review promo cadence/depth on this product. Target: back to ${t.target.toFixed(1)}%.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
-            kpi_name: 'Discount rate', kpi_value: round1(discountRate), kpi_target: round1(peerDiscountRate),
+            kpi_name: 'Discount rate', kpi_value: round1(discountRate), kpi_target: round1(t.target), kpi_basis: t.basis,
             kpi_unit: '%', kpi_direction: 'lower_better',
           });
         }
       }
     }
 
-    // Thin/negative margin - a hard floor (margin under 5%), not a peer comparison, since a
-    // SKU losing money is a problem regardless of what its peers do.
-    if (netRevenue >= 50 && marginPct < 5) {
-      const target = Math.max(10, peerMargin ?? 10);
-      const impact = Math.max(0, (target - marginPct) / 100) * netRevenue;
+    // Thin/negative margin - a hard floor (margin under 5%), not a self/peer comparison,
+    // since a SKU losing money is a problem regardless of what it or its peers normally do.
+    if (netRevenue >= 25 && marginPct < 5) {
+      const t = selfBestOrPeerTarget({
+        sku, direction: 'higher_better', peerValue: peerMargin, windowMaps,
+        validFn: r => num(r.net_revenue) >= 50, metricFn: exVineMarginPct,
+      });
+      const target = Math.max(10, t ? t.target : 10);
+      const basis = t ? t.basis : 'a flat 10% floor (not enough history for a self or peer reference)';
+      const impact = Math.max(0, (target - marginPct) / 100) * netRevenue * FOURTEEN_TO_THIRTY;
       if (impact >= 20) {
+        const diag = priorRow ? diagnoseMarginDrivers(row, priorRow) : null;
         candidates.push({
           issue_type: 'negative_margin', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Thin/negative margin on ${subject}`,
-          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days (excluding Vine giveaway units) vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell. ${inactionClause(impact)}`,
+          description: `Gross margin is ${marginPct.toFixed(1)}% over the last 14 days (excluding Vine giveaway units) — this product is barely covering, or losing, its own cost to sell.`,
+          drivers: diag ? diag.drivers : 'Not enough prior-period data to attribute a specific driver.',
+          recommended_action: `${diag ? diag.recommended_action : 'Review price, cost, and discounting on this product.'} Target: back to ${target.toFixed(1)}%.`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
-          kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target),
+          kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target), kpi_basis: basis,
           kpi_unit: '%', kpi_direction: 'higher_better',
         });
       }
@@ -308,18 +462,21 @@ async function detectAllIssues({ callInternalApi }) {
 
     // Margin compression vs this SKU's OWN prior 30 days - catches rising cost, price
     // erosion, or promo pressure even on a SKU whose margin is still "fine" in absolute terms.
-    const priorRow = priorBySku.get(sku);
-    if (priorRow && netRevenue >= 50) {
+    if (priorRow && netRevenue >= 25) {
       const priorMargin = exVineMarginPct(priorRow);
       const drop = priorMargin - marginPct;
       if (drop >= 8) {
-        const impact = (drop / 100) * netRevenue;
+        const impact = (drop / 100) * netRevenue * FOURTEEN_TO_THIRTY;
         if (impact >= 20) {
+          const diag = diagnoseMarginDrivers(row, priorRow);
           candidates.push({
             issue_type: 'margin_compression', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Margin slipping on ${subject}`,
-            description: `Gross margin (excluding Vine giveaway units) dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here. ${inactionClause(impact)}`,
+            description: `Gross margin (excluding Vine giveaway units) has slipped to ${marginPct.toFixed(1)}% over the last 14 days, from ${priorMargin.toFixed(1)}% in the comparison period.`,
+            drivers: diag ? diag.drivers : 'Rising cost, price erosion, or promo pressure is eating into profit here.',
+            recommended_action: `${diag ? diag.recommended_action : 'Review price, cost, and discounting on this product.'} Target: back to ${priorMargin.toFixed(1)}%.`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Gross margin (vs prior period)', kpi_value: round1(marginPct), kpi_target: round1(priorMargin),
+            kpi_basis: 'this product\'s own margin in the comparison period (30 days before the current reading)',
             kpi_unit: '%', kpi_direction: 'higher_better',
           });
         }
@@ -334,21 +491,30 @@ async function detectAllIssues({ callInternalApi }) {
     const sku = row.sku;
     if (!sku) continue;
     const subject = row.product_title || sku;
+    const velocity = num(row.daily_velocity);
 
     const surcharge = num(row.surcharge_monthly);
     if (surcharge >= 15) {
       const agedUnits = num(row.age_271_365) + num(row.age_365_plus);
+      // "Reduce only the excess units" - not all aged stock is a problem, just whatever sits
+      // beyond a reasonable buffer for how fast this product is still actually selling.
+      const coverBuffer = Math.min(agedUnits, Math.round(velocity * 30));
+      const excess = Math.max(0, agedUnits - coverBuffer);
       candidates.push({
         issue_type: 'aged_inventory', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Aged stock surcharge on ${subject}`,
-        description: `${agedUnits} units have been sitting 271+ days, triggering a long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed. ${inactionClause(surcharge)}`,
+        description: `${agedUnits} units have been sitting 271+ days, triggering a long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed.`,
+        drivers: velocity > 0
+          ? `Sales velocity (~${velocity.toFixed(1)} units/day) isn't high enough to work through this stock at a normal pace.`
+          : 'This product has had no recent sales velocity to work through the stock at all.',
+        recommended_action: `Discount or liquidate the ~${excess} excess units; the remaining ~${coverBuffer} is within a normal buffer for current velocity.`,
         impact_amount: round2(surcharge), currency_symbol: currencySymbol,
-        kpi_name: 'Aged units (271+ days)', kpi_value: agedUnits, kpi_target: 0,
+        kpi_name: 'Aged units (271+ days)', kpi_value: agedUnits, kpi_target: coverBuffer,
+        kpi_basis: `30 days of cover at this product's current sales velocity (~${velocity.toFixed(1)} units/day) — not zero, since holding some long-aged stock is normal for a slower mover`,
         kpi_unit: 'units', kpi_direction: 'lower_better',
       });
     }
 
     const sellable = num(row.sellable);
-    const velocity = num(row.daily_velocity);
     if (sellable <= 0 && velocity > 0) {
       const peerRow = peerBySku.get(sku);
       const peerUnits = peerRow ? num(peerRow.units_sold) : 0;
@@ -362,9 +528,12 @@ async function detectAllIssues({ callInternalApi }) {
             const target = Math.max(1, Math.round(velocity * 30));
             candidates.push({
               issue_type: 'stock_out', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Stock-out on ${subject}`,
-              description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day. ${inactionClause(impact)}`,
+              description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day.`,
+              drivers: 'Demand has outpaced available stock.',
+              recommended_action: `Expedite a reorder sized to restore cover (~${target} units).`,
               impact_amount: round2(impact), currency_symbol: currencySymbol,
               kpi_name: 'Sellable units', kpi_value: sellable, kpi_target: target,
+              kpi_basis: `30 days of cover at this product's current sales velocity (~${velocity.toFixed(1)} units/day)`,
               kpi_unit: 'units', kpi_direction: 'higher_better',
             });
           }
@@ -386,8 +555,11 @@ async function detectAllIssues({ callInternalApi }) {
         issue_type: 'cash_runway', scope_key: '', sku: null, subject: 'Cash balance', image_url: null,
         title: 'Cash balance projected to breach minimum threshold',
         description: `Projected balance dips to ${currencySymbol}${minBalance.toFixed(2)} on ${cashflow.min_balance_date}, ${currencySymbol}${shortfall.toFixed(2)} below the ${currencySymbol}${threshold.toFixed(2)} minimum threshold, in ${daysUntil} day(s).`,
+        drivers: 'Projected outflows (settlements, restocks, recurring fees) over the horizon exceed projected inflows before this date.',
+        recommended_action: `Arrange a credit line, or delay a discretionary outflow, before ${cashflow.min_balance_date}.`,
         impact_amount: round2(shortfall), currency_symbol: currencySymbol,
         kpi_name: 'Days until threshold breach', kpi_value: daysUntil, kpi_target: 60,
+        kpi_basis: 'a stated 60-day cash-buffer assumption, not a measured fact — adjust in Settings if your own comfort threshold differs',
         kpi_unit: 'days', kpi_direction: 'higher_better',
       });
     }
@@ -437,29 +609,35 @@ const ISSUE_TYPE_LABELS = {
 // the card no longer lists member titles in prose (the board shows their product images/SKUs
 // as chips instead - see client ActionBoard.js), so this only needs to name the shared problem.
 const ISSUE_TYPE_SUMMARY = {
-  tacos_blowout: 'running ad spend well above the peer benchmark',
-  high_returns: 'seeing return rates well above the peer benchmark',
-  discount_leakage: 'being discounted well above the peer benchmark',
-  negative_margin: 'running thin or negative margin',
-  margin_compression: "seeing margin slip from where it was 30 days ago",
-  aged_inventory: 'accumulating long-term storage surcharges on aged stock',
-  stock_out: 'out of sellable stock despite real ongoing demand',
+  tacos_blowout: { problem: 'running ad spend well above what each has proven it can run at', drivers: 'Each product\'s own drivers vary - expand below for the per-product breakdown.', action: 'Review targeting/bids product by product - see each one\'s own target and driver below.' },
+  high_returns: { problem: 'seeing return rates well above target', drivers: 'No return-reason data available from Amazon to attribute this further.', action: 'Review recent customer feedback/return reasons per product - see below.' },
+  discount_leakage: { problem: 'being discounted well above target', drivers: 'Discount rate itself is elevated on each - see below for each product\'s own target.', action: 'Review promo cadence/depth product by product - see below.' },
+  negative_margin: { problem: 'running thin or negative margin', drivers: 'Drivers vary by product (price, discounting, cost, fees, refunds) - expand below.', action: 'Review price/cost/discounting per product - see each one\'s own driver below.' },
+  margin_compression: { problem: 'seeing margin slip from the comparison period', drivers: 'Drivers vary by product - expand below for the per-product breakdown.', action: 'Review price/cost/discounting per product - see each one\'s own driver below.' },
+  aged_inventory: { problem: 'accumulating long-term storage surcharges on aged stock', drivers: 'Sales velocity on each isn\'t high enough to work through the stock at a normal pace.', action: 'Discount or liquidate the excess aged units per product - see below for each one\'s amount.' },
+  stock_out: { problem: 'out of sellable stock despite real ongoing demand', drivers: 'Demand has outpaced available stock on each.', action: 'Expedite reorders sized to restore cover - see below for each product\'s quantity.' },
 };
 
-// Builds the group card's title/description from its member rows. A single-member group
-// reads exactly like a v1 card (the member's own sentence); a multi-member group gets a
-// generic issue-level summary - which product(s) are affected is shown visually on the card
-// (product image + SKU chips, from `members`), not spelled out in this text. `members` should
-// be the active (unresolved) ones when any exist, so a card doesn't keep advertising a fixed
-// SKU in its headline - callers pass allMembers only when every one of them is resolved.
+// Builds the group card's title/description/drivers/action from its member rows. A
+// single-member group reads exactly like its one member's own diagnosis; a multi-member group
+// gets a generic issue-level summary - which product(s) are affected, and each one's own
+// driver/target, is shown visually/in the dropdown instead (product chips + MemberRow detail -
+// see client ActionBoard.js), not spelled out in this card-level text. `members` should be the
+// active (unresolved) ones when any exist, so a card doesn't keep advertising a fixed SKU in
+// its headline - callers pass allMembers only when every one of them is resolved.
 function synthesizeCardText(issueType, members) {
   const label = ISSUE_TYPE_LABELS[issueType] || issueType;
-  if (members.length === 0) return { title: `${label} — resolved`, description: 'Every affected product is back within target.' };
-  if (members.length === 1) return { title: members[0].title, description: members[0].description };
-  const summary = ISSUE_TYPE_SUMMARY[issueType] || 'affected';
+  if (members.length === 0) {
+    return { title: `${label} — resolved`, description: 'Every affected product is back within target.', drivers: null, recommended_action: null };
+  }
+  if (members.length === 1) {
+    return { title: members[0].title, description: members[0].description, drivers: members[0].drivers, recommended_action: members[0].recommended_action };
+  }
+  const s = ISSUE_TYPE_SUMMARY[issueType] || { problem: 'affected', drivers: null, action: null };
   return {
     title: `${label} across ${members.length} products`,
-    description: `${members.length} products are ${summary}.`,
+    description: `${members.length} products are ${s.problem}.`,
+    drivers: s.drivers, recommended_action: s.action,
   };
 }
 
@@ -532,7 +710,7 @@ async function runActionBoardEvaluation({ pool, baseUrl }) {
       const groupPct = weightSum > 0 ? Math.round(weightedPct / weightSum) : 0;
       const allResolved = activeMembers.length === 0;
       const currencySymbol = (members[0] || allMembers[0])?.currency_symbol || cardRow.currency_symbol;
-      const { title, description } = synthesizeCardText(issueType, allResolved ? [] : activeMembers);
+      const { title, description, drivers, recommended_action } = synthesizeCardText(issueType, allResolved ? [] : activeMembers);
 
       // Stage only moves on a pattern that's held for at least a week, never a 1-5 day blip -
       // so the comparison point is each member's own progress from 7+ days ago (its latest
@@ -566,12 +744,13 @@ async function runActionBoardEvaluation({ pool, baseUrl }) {
 
       await client.query(`
         UPDATE action_board_cards SET
-          title = $1, description = $2, impact_amount = $3, currency_symbol = $4,
-          pct_complete = $5, ai_stage = $6, stage = $7,
-          stage_changed_at = CASE WHEN $7 IS DISTINCT FROM stage THEN NOW() ELSE stage_changed_at END,
+          title = $1, description = $2, drivers = $3, recommended_action = $4,
+          impact_amount = $5, currency_symbol = $6,
+          pct_complete = $7, ai_stage = $8, stage = $9,
+          stage_changed_at = CASE WHEN $9 IS DISTINCT FROM stage THEN NOW() ELSE stage_changed_at END,
           updated_at = NOW(), last_seen_at = NOW()
-        WHERE id = $8
-      `, [title, description, round2(totalImpact), currencySymbol, groupPct, aiStage, effectiveStage, cardId]);
+        WHERE id = $10
+      `, [title, description, drivers, recommended_action, round2(totalImpact), currencySymbol, groupPct, aiStage, effectiveStage, cardId]);
 
       if (aiStage !== cardRow.ai_stage) {
         await client.query(
@@ -631,16 +810,17 @@ async function upsertMember(client, cardId, c) {
 
   let memberId, baseline, impactBaseline;
   if (!existing) {
-    // kpi_baseline intentionally reuses the kpi_value param ($9) - the baseline IS the value
-    // at the moment of first detection, by definition. Same for impact_baseline ($7/$8).
+    // kpi_baseline intentionally reuses the kpi_value param ($13) - the baseline IS the value
+    // at the moment of first detection, by definition. Same for impact_baseline ($11).
     const ins = (await client.query(`
       INSERT INTO action_board_members
-        (card_id, issue_type, scope_key, sku, subject, image_url, title, description, impact_amount, impact_baseline,
-         kpi_name, kpi_value, kpi_target, kpi_baseline, kpi_unit, kpi_direction, pct_complete, resolved)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$12,$11,$13,$14,0,false)
+        (card_id, issue_type, scope_key, sku, subject, image_url, title, description, drivers, recommended_action,
+         impact_amount, impact_baseline, kpi_name, kpi_value, kpi_target, kpi_baseline, kpi_basis, kpi_unit, kpi_direction,
+         pct_complete, resolved)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$11,$12,$13,$14,$13,$15,$16,$17,0,false)
       RETURNING id, kpi_value AS baseline, impact_baseline
-    `, [cardId, c.issue_type, c.scope_key, c.sku, c.subject, c.image_url, c.title, c.description, c.impact_amount,
-        c.kpi_name, c.kpi_value, c.kpi_target, c.kpi_unit, c.kpi_direction])).rows[0];
+    `, [cardId, c.issue_type, c.scope_key, c.sku, c.subject, c.image_url, c.title, c.description, c.drivers, c.recommended_action,
+        c.impact_amount, c.kpi_name, c.kpi_value, c.kpi_target, c.kpi_basis, c.kpi_unit, c.kpi_direction])).rows[0];
     memberId = ins.id; baseline = num(ins.baseline); impactBaseline = num(ins.impact_baseline);
   } else {
     memberId = existing.id; baseline = num(existing.kpi_baseline); impactBaseline = num(existing.impact_baseline);
@@ -651,11 +831,12 @@ async function upsertMember(client, cardId, c) {
 
   await client.query(`
     UPDATE action_board_members SET
-      card_id = $1, subject = $2, image_url = $3, title = $4, description = $5, impact_amount = $6,
-      kpi_value = $7, kpi_target = $8, pct_complete = $9, resolved = $10,
+      card_id = $1, subject = $2, image_url = $3, title = $4, description = $5, drivers = $6, recommended_action = $7,
+      impact_amount = $8, kpi_value = $9, kpi_target = $10, kpi_basis = $11, pct_complete = $12, resolved = $13,
       updated_at = NOW(), last_seen_at = NOW()
-    WHERE id = $11
-  `, [cardId, c.subject, c.image_url, c.title, c.description, c.impact_amount, c.kpi_value, c.kpi_target, pct, resolved, memberId]);
+    WHERE id = $14
+  `, [cardId, c.subject, c.image_url, c.title, c.description, c.drivers, c.recommended_action,
+      c.impact_amount, c.kpi_value, c.kpi_target, c.kpi_basis, pct, resolved, memberId]);
 
   await client.query(`
     INSERT INTO action_board_member_snapshots (member_id, snapshot_date, kpi_value, impact_amount, pct_complete)
