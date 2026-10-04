@@ -99,6 +99,7 @@ async function ensureActionBoardSchema(pool) {
       scope_key TEXT NOT NULL DEFAULT '',
       sku TEXT,
       subject TEXT, -- bare product/account name, for group-card summaries (title is a full sentence)
+      image_url TEXT, -- product thumbnail for the flashcard's product chips; null for an account-level member
       title TEXT NOT NULL,
       description TEXT,
       impact_amount NUMERIC NOT NULL DEFAULT 0,
@@ -116,6 +117,7 @@ async function ensureActionBoardSchema(pool) {
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       UNIQUE (issue_type, scope_key)
     );
+    ALTER TABLE action_board_members ADD COLUMN IF NOT EXISTS image_url TEXT;
     CREATE TABLE IF NOT EXISTS action_board_member_snapshots (
       id SERIAL PRIMARY KEY,
       member_id INTEGER NOT NULL REFERENCES action_board_members(id) ON DELETE CASCADE,
@@ -222,7 +224,7 @@ async function detectAllIssues({ callInternalApi }) {
       const impact = (tacos - peerTacos) / 100 * netRevenue;
       if (impact >= 30) {
         candidates.push({
-          issue_type: 'tacos_blowout', scope_key: sku, sku, subject, title: `High TACOS on ${subject}`,
+          issue_type: 'tacos_blowout', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `High TACOS on ${subject}`,
           description: `TACOS is ${tacos.toFixed(1)}% vs a ${peerTacos.toFixed(1)}% peer benchmark across similar-selling SKUs (last 90 days) — ad spend here is outpacing what comparable products need. ${inactionClause(impact)}`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'TACOS', kpi_value: round1(tacos), kpi_target: round1(peerTacos),
@@ -240,7 +242,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = excessUnits * avgRefundPerUnit;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'high_returns', scope_key: sku, sku, subject, title: `High return rate on ${subject}`,
+            issue_type: 'high_returns', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `High return rate on ${subject}`,
             description: `${returnRate.toFixed(1)}% of units sold are coming back vs a ${peerReturnRate.toFixed(1)}% peer benchmark — worth checking for a quality, sizing, or listing-accuracy issue. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Return rate', kpi_value: round1(returnRate), kpi_target: round1(peerReturnRate),
@@ -257,7 +259,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = (discountRate - peerDiscountRate) / 100 * grossSales;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'discount_leakage', scope_key: sku, sku, subject, title: `Heavy discounting on ${subject}`,
+            issue_type: 'discount_leakage', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Heavy discounting on ${subject}`,
             description: `${discountRate.toFixed(1)}% of gross sales is being discounted away vs a ${peerDiscountRate.toFixed(1)}% peer benchmark. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Discount rate', kpi_value: round1(discountRate), kpi_target: round1(peerDiscountRate),
@@ -274,7 +276,7 @@ async function detectAllIssues({ callInternalApi }) {
       const impact = Math.max(0, (target - marginPct) / 100) * netRevenue;
       if (impact >= 20) {
         candidates.push({
-          issue_type: 'negative_margin', scope_key: sku, sku, subject, title: `Thin/negative margin on ${subject}`,
+          issue_type: 'negative_margin', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Thin/negative margin on ${subject}`,
           description: `Gross margin is ${marginPct.toFixed(1)}% over the last 30 days vs a ${target.toFixed(1)}% target — this SKU is barely covering, or losing, its own cost to sell. ${inactionClause(impact)}`,
           impact_amount: round2(impact), currency_symbol: currencySymbol,
           kpi_name: 'Gross margin', kpi_value: round1(marginPct), kpi_target: round1(target),
@@ -293,7 +295,7 @@ async function detectAllIssues({ callInternalApi }) {
         const impact = (drop / 100) * netRevenue;
         if (impact >= 20) {
           candidates.push({
-            issue_type: 'margin_compression', scope_key: sku, sku, subject, title: `Margin slipping on ${subject}`,
+            issue_type: 'margin_compression', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Margin slipping on ${subject}`,
             description: `Gross margin dropped from ${priorMargin.toFixed(1)}% to ${marginPct.toFixed(1)}% vs the 30 days before — rising cost, price erosion, or promo pressure is eating into profit here. ${inactionClause(impact)}`,
             impact_amount: round2(impact), currency_symbol: currencySymbol,
             kpi_name: 'Gross margin (vs prior period)', kpi_value: round1(marginPct), kpi_target: round1(priorMargin),
@@ -316,7 +318,7 @@ async function detectAllIssues({ callInternalApi }) {
     if (surcharge >= 15) {
       const agedUnits = num(row.age_271_365) + num(row.age_365_plus);
       candidates.push({
-        issue_type: 'aged_inventory', scope_key: sku, sku, subject, title: `Aged stock surcharge on ${subject}`,
+        issue_type: 'aged_inventory', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Aged stock surcharge on ${subject}`,
         description: `${agedUnits} units have been sitting 271+ days, triggering a long-term storage surcharge that repeats every cycle until the stock sells, gets discounted out, or is removed. ${inactionClause(surcharge)}`,
         impact_amount: round2(surcharge), currency_symbol: currencySymbol,
         kpi_name: 'Aged units (271+ days)', kpi_value: agedUnits, kpi_target: 0,
@@ -338,7 +340,7 @@ async function detectAllIssues({ callInternalApi }) {
           if (impact >= 20) {
             const target = Math.max(1, Math.round(velocity * 30));
             candidates.push({
-              issue_type: 'stock_out', scope_key: sku, sku, subject, title: `Stock-out on ${subject}`,
+              issue_type: 'stock_out', scope_key: sku, sku, subject, image_url: row.image_url || null, title: `Stock-out on ${subject}`,
               description: `Out of sellable stock while still selling ~${velocity.toFixed(1)} units/day. ${inactionClause(impact)}`,
               impact_amount: round2(impact), currency_symbol: currencySymbol,
               kpi_name: 'Sellable units', kpi_value: sellable, kpi_target: target,
@@ -360,7 +362,7 @@ async function detectAllIssues({ callInternalApi }) {
       const threshold = num(cashflow.assumptions?.minimum_cash_threshold);
       const shortfall = Math.max(0, threshold - minBalance);
       candidates.push({
-        issue_type: 'cash_runway', scope_key: '', sku: null, subject: 'Cash balance',
+        issue_type: 'cash_runway', scope_key: '', sku: null, subject: 'Cash balance', image_url: null,
         title: 'Cash balance projected to breach minimum threshold',
         description: `Projected balance dips to ${currencySymbol}${minBalance.toFixed(2)} on ${cashflow.min_balance_date}, ${currencySymbol}${shortfall.toFixed(2)} below the ${currencySymbol}${threshold.toFixed(2)} minimum threshold, in ${daysUntil} day(s).`,
         impact_amount: round2(shortfall), currency_symbol: currencySymbol,
@@ -405,22 +407,33 @@ const ISSUE_TYPE_LABELS = {
   stock_out: 'Stock-outs',
   cash_runway: 'Cash runway risk',
 };
+// One-clause description of what's wrong, reused across every member of a multi-member card -
+// the card no longer lists member titles in prose (the board shows their product images/SKUs
+// as chips instead - see client ActionBoard.js), so this only needs to name the shared problem.
+const ISSUE_TYPE_SUMMARY = {
+  tacos_blowout: 'running ad spend well above the peer benchmark',
+  high_returns: 'seeing return rates well above the peer benchmark',
+  discount_leakage: 'being discounted well above the peer benchmark',
+  negative_margin: 'running thin or negative margin',
+  margin_compression: "seeing margin slip from where it was 30 days ago",
+  aged_inventory: 'accumulating long-term storage surcharges on aged stock',
+  stock_out: 'out of sellable stock despite real ongoing demand',
+};
 
 // Builds the group card's title/description from its member rows. A single-member group
 // reads exactly like a v1 card (the member's own sentence); a multi-member group gets a
-// synthesized summary naming the top few by impact. `members` should be the active
-// (unresolved) ones when any exist, so a card doesn't keep advertising a fixed SKU in its
-// headline - callers pass allMembers only when every one of them is resolved.
-function synthesizeCardText(issueType, members, currencySymbol) {
+// generic issue-level summary - which product(s) are affected is shown visually on the card
+// (product image + SKU chips, from `members`), not spelled out in this text. `members` should
+// be the active (unresolved) ones when any exist, so a card doesn't keep advertising a fixed
+// SKU in its headline - callers pass allMembers only when every one of them is resolved.
+function synthesizeCardText(issueType, members) {
   const label = ISSUE_TYPE_LABELS[issueType] || issueType;
   if (members.length === 0) return { title: `${label} — resolved`, description: 'Every affected product is back within target.' };
   if (members.length === 1) return { title: members[0].title, description: members[0].description };
-  const sorted = [...members].sort((a, b) => parseFloat(b.impact_amount) - parseFloat(a.impact_amount));
-  const top = sorted.slice(0, 3).map(m => `${m.subject || m.sku} (${currencySymbol}${Math.round(m.impact_amount)} over 30d)`);
-  const more = sorted.length > 3 ? `, and ${sorted.length - 3} more` : '';
+  const summary = ISSUE_TYPE_SUMMARY[issueType] || 'affected';
   return {
     title: `${label} across ${members.length} products`,
-    description: `${members.length} products affected: ${top.join(', ')}${more}.`,
+    description: `${members.length} products are ${summary}.`,
   };
 }
 
@@ -493,7 +506,7 @@ async function runActionBoardEvaluation({ pool, baseUrl }) {
       const groupPct = weightSum > 0 ? Math.round(weightedPct / weightSum) : 0;
       const allResolved = activeMembers.length === 0;
       const currencySymbol = (members[0] || allMembers[0])?.currency_symbol || cardRow.currency_symbol;
-      const { title, description } = synthesizeCardText(issueType, allResolved ? [] : activeMembers, currencySymbol);
+      const { title, description } = synthesizeCardText(issueType, allResolved ? [] : activeMembers);
 
       const prevPct = num(cardRow.pct_complete);
       const aiStage = nextStage(cardRow.ai_stage, prevPct, groupPct, allResolved);
@@ -570,11 +583,11 @@ async function upsertMember(client, cardId, c) {
     // at the moment of first detection, by definition. Same for impact_baseline ($7/$8).
     const ins = (await client.query(`
       INSERT INTO action_board_members
-        (card_id, issue_type, scope_key, sku, subject, title, description, impact_amount, impact_baseline,
+        (card_id, issue_type, scope_key, sku, subject, image_url, title, description, impact_amount, impact_baseline,
          kpi_name, kpi_value, kpi_target, kpi_baseline, kpi_unit, kpi_direction, pct_complete, resolved)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,$9,$10,$11,$10,$12,$13,0,false)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$9,$10,$11,$12,$11,$13,$14,0,false)
       RETURNING id, kpi_value AS baseline, impact_baseline
-    `, [cardId, c.issue_type, c.scope_key, c.sku, c.subject, c.title, c.description, c.impact_amount,
+    `, [cardId, c.issue_type, c.scope_key, c.sku, c.subject, c.image_url, c.title, c.description, c.impact_amount,
         c.kpi_name, c.kpi_value, c.kpi_target, c.kpi_unit, c.kpi_direction])).rows[0];
     memberId = ins.id; baseline = num(ins.baseline); impactBaseline = num(ins.impact_baseline);
   } else {
@@ -586,11 +599,11 @@ async function upsertMember(client, cardId, c) {
 
   await client.query(`
     UPDATE action_board_members SET
-      card_id = $1, subject = $2, title = $3, description = $4, impact_amount = $5,
-      kpi_value = $6, kpi_target = $7, pct_complete = $8, resolved = $9,
+      card_id = $1, subject = $2, image_url = $3, title = $4, description = $5, impact_amount = $6,
+      kpi_value = $7, kpi_target = $8, pct_complete = $9, resolved = $10,
       updated_at = NOW(), last_seen_at = NOW()
-    WHERE id = $10
-  `, [cardId, c.subject, c.title, c.description, c.impact_amount, c.kpi_value, c.kpi_target, pct, resolved, memberId]);
+    WHERE id = $11
+  `, [cardId, c.subject, c.image_url, c.title, c.description, c.impact_amount, c.kpi_value, c.kpi_target, pct, resolved, memberId]);
 
   await client.query(`
     INSERT INTO action_board_member_snapshots (member_id, snapshot_date, kpi_value, impact_amount, pct_complete)

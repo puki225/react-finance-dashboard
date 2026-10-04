@@ -61,6 +61,38 @@ function Sparkline({ trend, direction }) {
   );
 }
 
+// Product image + SKU, title on hover (native title attr) - used on the collapsed flashcard
+// instead of spelling out product names in prose, which got unreadable once a card could
+// have many members. Grid below lays these out 2-per-column (gridTemplateRows: 2 + auto-flow
+// column), so 2 products make one column, 4 make two, etc. - same shape the dropdown's
+// MemberRow list gives in full detail below, for whoever wants it.
+function ProductChip({ m }) {
+  return (
+    <div title={m.subject || m.sku} style={{
+      display: 'flex', alignItems: 'center', gap: 6, padding: '3px 8px 3px 3px',
+      background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 8,
+      opacity: m.resolved ? 0.5 : 1, cursor: 'default',
+    }}>
+      {m.image_url
+        ? <img src={m.image_url} alt={m.sku} style={{ width: 22, height: 22, objectFit: 'contain', borderRadius: 4, background: 'var(--bg3)', border: '1px solid var(--border)', flexShrink: 0 }} />
+        : <div style={{ width: 22, height: 22, borderRadius: 4, background: 'var(--bg3)', border: '1px solid var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 9, opacity: 0.3, flexShrink: 0 }}>◉</div>
+      }
+      <span style={{ fontSize: 10, fontFamily: 'var(--mono)', color: 'var(--text)', whiteSpace: 'nowrap' }}>{m.sku}</span>
+    </div>
+  );
+}
+
+function ProductChipGrid({ members }) {
+  return (
+    <div style={{
+      display: 'grid', gridTemplateRows: 'repeat(2, auto)', gridAutoFlow: 'column',
+      gridAutoColumns: 'min-content', gap: 6, overflowX: 'auto', paddingBottom: 2,
+    }}>
+      {members.map(m => <ProductChip key={m.id} m={m} />)}
+    </div>
+  );
+}
+
 function MemberRow({ m, currencySymbol }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '8px 0', borderTop: '1px solid var(--border)' }}>
@@ -116,6 +148,8 @@ function Card({ card, onMove, onDismiss, onUndismiss, onRevert, dragEnabled }) {
       </div>
 
       <div style={{ fontSize: 12, color: 'var(--muted)', lineHeight: 1.45 }}>{card.description}</div>
+
+      {members.length > 1 && <ProductChipGrid members={members} />}
 
       {soleMember?.kpi_name && (
         <div>
