@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import DateRangePicker, { getRange } from '../components/DateRangePicker';
+import MoneyFunnel from '../components/MoneyFunnel';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
 
@@ -283,6 +284,12 @@ export default function PnL() {
           No account-level fee data yet (subscription, storage, coupons). Run the Amazon Finances sync to backfill this — until then, OPEX's Other Fees will read £0 and Profit will equal Product Contribution.
         </div>
       )}
+
+      {/* Money Funnel — a visual Sales -> Cost of Goods -> Marketing -> Profit bridge for the
+          same date range as the grid below, with Sales itself split by price/volume/mix vs.
+          the equal-length period right before it. Independent of `group` (always a single-
+          period read for the selected range). */}
+      <MoneyFunnel from={range.from} to={range.to} />
 
       {/* Grid */}
       <div style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, overflow: 'hidden' }}>
