@@ -6276,6 +6276,133 @@ app.get('/api/cashflow', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// ─── COMMAND CENTER ──────────────────────────────────────────────────────
+// A small, fixed set of headline KPIs for a glanceable "is anything wrong" view - deliberately
+// NOT exhaustive (research on NOC/exec dashboards converges on 5-7 headline metrics, cutting
+// anything that doesn't drive a decision - a wall of 20 tiles defeats the point). Every number
+// is reused from /api/pnl (day granularity, already VAT/FX/COGS-correct) and /api/cashflow via
+// an internal self-fetch - same reuse pattern as chat.js and actionBoard.js, never fresh SQL.
+//
+// Current = the trailing 14 days, summed/rated (never averaged day-by-day - a day with £50 of
+// sales shouldn't count as much as a day with £5,000 when rolling a RATE up, so every rate
+// tile is sum(numerator)/sum(denominator) across the window, not an average of daily %s).
+// Compared against two reference points: the PRIOR 14 days (immediate momentum - "previous
+// month" in spirit) and a 90-day baseline (the "previous quarter average" ask), scaled to a
+// 14-day-equivalent for £/unit totals so the two periods are comparable. Sparklines plot the
+// last 60 days from the same already-fetched series - no extra query - using a 7-day rolling
+// window for rate tiles specifically (a single day's margin/TACOS % is noisy enough to obscure
+// the trend shape a sparkline exists to show; a raw daily total like revenue isn't).
+app.get('/api/command-center', async (req, res) => {
+  try {
+    const baseUrl = `http://localhost:${PORT}`;
+    const ccFmt = (d) => d.toISOString().split('T')[0];
+    const ccDaysAgo = (n) => { const d = new Date(); d.setUTCDate(d.getUTCDate() - n); return d; };
+    const ccCallInternal = async (path, query = {}) => {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) { if (v !== undefined && v !== null && v !== '') qs.set(k, v); }
+      const r = await fetch(`${baseUrl}${path}${qs.toString() ? '?' + qs.toString() : ''}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `${path} returned ${r.status}`);
+      return d;
+    };
+
+    const [pnl, cashflow] = await Promise.all([
+      ccCallInternal('/api/pnl', { from: ccFmt(ccDaysAgo(89)), to: ccFmt(ccDaysAgo(0)), group: 'day', channel: 'all' }),
+      ccCallInternal('/api/cashflow', {}),
+    ]);
+
+    const periods = pnl.periods || [];
+    const sym = pnl.currency_symbol || cashflow.currency_symbol || '£';
+    const n = periods.length;
+    const last14 = periods.slice(Math.max(0, n - 14));
+    const prior14 = periods.slice(Math.max(0, n - 28), Math.max(0, n - 14));
+    const baseline = periods; // up to 90 days
+    const baselineDays = baseline.length || 90;
+
+    const ccNum = (v) => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
+    const ccSum = (rows, f) => rows.reduce((s, r) => s + f(r), 0);
+    const round2 = (v) => Math.round(v * 100) / 100;
+    const round1 = (v) => Math.round(v * 10) / 10;
+    // % change of cur vs base - null (not 0 or Infinity) when there's no real baseline to
+    // compare against yet, so the frontend can show "—" instead of a nonsense number.
+    const pctDelta = (cur, base) => (!Number.isFinite(base) || base === 0) ? null : round1((cur - base) / Math.abs(base) * 100);
+    // "Bad" direction normalized regardless of whether higher or lower is the good way for
+    // this KPI to move, so one threshold table drives severity for every tile.
+    const severity = (direction, deltaPct) => {
+      if (deltaPct === null) return 'ok';
+      const bad = direction === 'higher_better' ? -deltaPct : deltaPct;
+      if (bad >= 15) return 'alert';
+      if (bad >= 5) return 'watch';
+      return 'ok';
+    };
+    const rollingRateSpark = (numFn, denFn, windowDays) => {
+      const pts = [];
+      const start = Math.max(0, baseline.length - 60);
+      for (let i = start; i < baseline.length; i++) {
+        const win = baseline.slice(Math.max(0, i - windowDays + 1), i + 1);
+        const den = ccSum(win, denFn);
+        pts.push({ date: baseline[i].period, value: den > 0 ? round2(ccSum(win, numFn) / den * 100) : null });
+      }
+      return pts;
+    };
+
+    function sumTile({ id, group, label, unit, direction, valueFn }) {
+      const cur = ccSum(last14, valueFn);
+      const prior = ccSum(prior14, valueFn);
+      const baseEquiv = ccSum(baseline, valueFn) * (14 / baselineDays); // scaled to a 14-day-equivalent total
+      const vsPrior = pctDelta(cur, prior);
+      return {
+        id, group, label, unit, direction, value: round2(cur),
+        vs_prior_14d_pct: vsPrior, vs_quarter_avg_pct: pctDelta(cur, baseEquiv),
+        severity: severity(direction, vsPrior),
+        sparkline: baseline.slice(Math.max(0, baseline.length - 60)).map(r => ({ date: r.period, value: round2(valueFn(r)) })),
+      };
+    }
+    function rateTile({ id, group, label, unit, direction, numFn, denFn }) {
+      const rateOf = (rows) => { const d = ccSum(rows, denFn); return d > 0 ? ccSum(rows, numFn) / d * 100 : 0; };
+      const cur = rateOf(last14);
+      const vsPrior = pctDelta(cur, rateOf(prior14));
+      return {
+        id, group, label, unit, direction, value: round1(cur),
+        vs_prior_14d_pct: vsPrior, vs_quarter_avg_pct: pctDelta(cur, rateOf(baseline)),
+        severity: severity(direction, vsPrior),
+        sparkline: rollingRateSpark(numFn, denFn, 7),
+      };
+    }
+
+    const tiles = [
+      sumTile({ id: 'net_revenue', group: 'Sales', label: 'Net Revenue', unit: 'currency', direction: 'higher_better',
+        valueFn: r => ccNum(r.net_revenue) }),
+      sumTile({ id: 'units_sold', group: 'Sales', label: 'Units Sold', unit: 'number', direction: 'higher_better',
+        valueFn: r => ccNum(r.units_sold) }),
+      rateTile({ id: 'margin_pct', group: 'Profitability', label: 'Gross Margin', unit: 'percent', direction: 'higher_better',
+        numFn: r => ccNum(r.gross_margin), denFn: r => ccNum(r.net_sales) }),
+      sumTile({ id: 'product_contribution', group: 'Profitability', label: 'Product Contribution', unit: 'currency', direction: 'higher_better',
+        valueFn: r => ccNum(r.product_contribution) }),
+      rateTile({ id: 'tacos', group: 'Advertising', label: 'TACOS', unit: 'percent', direction: 'lower_better',
+        numFn: r => ccNum(r.ppc_cost), denFn: r => ccNum(r.net_sales) }),
+      rateTile({ id: 'return_rate', group: 'Quality', label: 'Return Rate', unit: 'percent', direction: 'lower_better',
+        numFn: r => ccNum(r.units_refunded), denFn: r => ccNum(r.units_sold) }),
+    ];
+
+    // Cash is a point-in-time risk reading (how close to the configured minimum threshold
+    // the FORWARD projection gets), not a trailing-14-day rollup - there's no historical daily
+    // balance series to sparkline against, so this tile is shaped differently on purpose
+    // rather than faking a trend from data that doesn't exist.
+    const daysUntilBreach = cashflow.threshold_breach_date
+      ? Math.round((new Date(cashflow.threshold_breach_date).getTime() - Date.now()) / 86400000) : null;
+    tiles.push({
+      id: 'cash_runway', group: 'Cash', label: 'Cash Runway', unit: 'days_until_breach', direction: null,
+      value: round2(ccNum(cashflow.min_balance)), threshold: round2(ccNum(cashflow.assumptions?.minimum_cash_threshold)),
+      days_until_breach: daysUntilBreach, breach_date: cashflow.threshold_breach_date || null,
+      vs_prior_14d_pct: null, vs_quarter_avg_pct: null, sparkline: [],
+      severity: daysUntilBreach === null ? 'ok' : daysUntilBreach <= 14 ? 'alert' : daysUntilBreach <= 30 ? 'watch' : 'ok',
+    });
+
+    res.json({ currency_symbol: sym, generated_at: new Date().toISOString(), window_days: n, tiles });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // AI chat assistant - see chat.js for the tool definitions and guardrails. Mounted with its
 // own base URL for the internal fetch() calls each read/write tool makes back into this same
 // process's routes. Must stay ABOVE the app.get('*', ...) SPA fallback below, same reasoning
