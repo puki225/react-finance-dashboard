@@ -6403,6 +6403,84 @@ app.get('/api/command-center', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
+// Money Funnel - a single-period visual bridge from Sales down to Profit (Sales -> Cost of
+// Goods [COGS + Amazon/Shopify selling fees + storage/account fees/adjustments, i.e. every
+// OPEX line - lumped together per the product ask] -> Marketing [PPC spend] -> Profit), with
+// the Sales stage itself broken into its Price/Volume/Mix drivers vs the immediately-prior
+// period of equal length. Same internal self-fetch pattern as /api/command-center above:
+// composes the already-correct /api/pnl and /api/pvm routes rather than re-deriving their
+// VAT/FX/COGS/fee logic here.
+app.get('/api/money-funnel', async (req, res) => {
+  try {
+    const { from, to, channel = 'all' } = req.query;
+    if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
+
+    // Prior period = the same number of days immediately before `from`, so the Price/Volume/
+    // Mix bridge always compares like-for-like window lengths (mirrors the "vs prior 14d"
+    // convention already used by Test Board/command-center).
+    const msPerDay = 86400000;
+    const days = Math.round((new Date(to).getTime() - new Date(from).getTime()) / msPerDay) + 1;
+    const priorTo = new Date(new Date(from).getTime() - msPerDay).toISOString().split('T')[0];
+    const priorFrom = new Date(new Date(from).getTime() - days * msPerDay).toISOString().split('T')[0];
+
+    const baseUrl = `http://localhost:${PORT}`;
+    const mfCallInternal = async (path, query = {}) => {
+      const qs = new URLSearchParams();
+      for (const [k, v] of Object.entries(query)) { if (v !== undefined && v !== null && v !== '') qs.set(k, v); }
+      const r = await fetch(`${baseUrl}${path}${qs.toString() ? '?' + qs.toString() : ''}`);
+      const d = await r.json();
+      if (!r.ok) throw new Error(d.error || `${path} returned ${r.status}`);
+      return d;
+    };
+
+    const [pnl, pvm] = await Promise.all([
+      mfCallInternal('/api/pnl', { from, to, group: 'month', channel }),
+      mfCallInternal('/api/pvm', { s1_from: priorFrom, s1_to: priorTo, s2_from: from, s2_to: to, metric: 'revenue', level: 'asin', channel }),
+    ]);
+
+    const t = pnl.totals || {};
+    const mfNum = (v) => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
+    const round2 = (v) => Math.round(v * 100) / 100;
+
+    // Sales/COGS/Marketing/Profit all come from /api/pnl's own already-reconciled totals (the
+    // same numbers the P&L page shows), not re-derived here - this guarantees the funnel ties
+    // out exactly: currentSales - costOfGoods - marketing === profit, by construction.
+    const currentSales = mfNum(t.net_sales);
+    // "Cost of Goods" is deliberately the ALL-IN bucket the product ask described: product COGS
+    // + per-order-line Amazon/Shopify selling fees + every OPEX line (account-level fees like
+    // storage/subscription, adjustments, headcount/fixed costs) - everything except ad spend,
+    // which gets its own "Marketing" stage below.
+    const costOfGoods = -(mfNum(t.cogs?.total) + mfNum(t.fees?.total) + mfNum(t.opex?.total));
+    const marketing = -mfNum(t.ppc_cost);
+    const profit = mfNum(t.profit);
+    const afterCogs = round2(currentSales - costOfGoods);
+
+    // Price/Volume/Mix bridge into the Sales stage, from PVM. Its own scenario2 value is
+    // computed independently of /api/pnl's net_sales (same underlying data and filters, so the
+    // two should agree to well within a rounding penny) - shown only as the bridge's own
+    // endpoint, with the funnel below it keyed off /api/pnl's figure as the source of truth.
+    const salesBridge = {
+      prior: { from: priorFrom, to: priorTo, value: round2(mfNum(pvm.scenario1?.value)) },
+      price: round2(mfNum(pvm.bridge?.price)),
+      volume: round2(mfNum(pvm.bridge?.volume)),
+      mix: round2(mfNum(pvm.bridge?.mix)),
+      current: { from, to, value: round2(mfNum(pvm.scenario2?.value)) },
+    };
+
+    res.json({
+      currency_symbol: pnl.currency_symbol || '£',
+      current: { from, to },
+      prior: { from: priorFrom, to: priorTo },
+      sales_bridge: salesBridge,
+      funnel: [
+        { id: 'sales', label: 'Sales', value: round2(currentSales) },
+        { id: 'after_cogs', label: 'After Cost of Goods', value: afterCogs, removed: round2(costOfGoods), removed_label: 'Cost of Goods' },
+        { id: 'profit', label: 'Profit', value: round2(profit), removed: round2(marketing), removed_label: 'Marketing' },
+      ],
+    });
+  } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
+});
+
 // AI chat assistant - see chat.js for the tool definitions and guardrails. Mounted with its
 // own base URL for the internal fetch() calls each read/write tool makes back into this same
 // process's routes. Must stay ABOVE the app.get('*', ...) SPA fallback below, same reasoning
