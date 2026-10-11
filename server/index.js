@@ -6403,25 +6403,21 @@ app.get('/api/command-center', async (req, res) => {
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
 
-// Money Funnel - a single-period visual bridge from Sales down to Profit (Sales -> Cost of
-// Goods [COGS + Amazon/Shopify selling fees + storage/account fees/adjustments, i.e. every
-// OPEX line - lumped together per the product ask] -> Marketing [PPC spend] -> Profit), with
-// the Sales stage itself broken into its Price/Volume/Mix drivers vs the immediately-prior
-// period of equal length. Same internal self-fetch pattern as /api/command-center above:
-// composes the already-correct /api/pnl and /api/pvm routes rather than re-deriving their
-// VAT/FX/COGS/fee logic here.
-app.get('/api/money-funnel', async (req, res) => {
+// Money Flow - a single-period running-balance walk from Sales down to Profit, read as a
+// margin-health line rather than a stack of bars: Sales -> Discounts -> Returns -> Cost of
+// Goods -> Selling Fees -> Marketing -> Storage & OPEX -> Profit (refunds sit early, right
+// where they land in /api/pnl's own math; storage/account fees sit last, since OPEX is the
+// final bridge to Profit there too - no reordering of the underlying numbers needed, just a
+// different presentation of them). Each point also carries the running margin (balance so far
+// / gross sales) and a zone - healthy/watch/loss - using the same >=20% / >=0% / <0% bands
+// /pages/PnL.js already colors percentage rows with, so a Test Board viewer can watch the
+// line go from green to amber to red exactly where the business's own margin would.
+// Single internal self-fetch into /api/pnl (same pattern as /api/command-center above) - every
+// figure is /api/pnl's own already-reconciled total, so the walk ties out to Profit exactly.
+app.get('/api/money-flow', async (req, res) => {
   try {
     const { from, to, channel = 'all' } = req.query;
     if (!from || !to) return res.status(400).json({ error: 'from and to are required' });
-
-    // Prior period = the same number of days immediately before `from`, so the Price/Volume/
-    // Mix bridge always compares like-for-like window lengths (mirrors the "vs prior 14d"
-    // convention already used by Test Board/command-center).
-    const msPerDay = 86400000;
-    const days = Math.round((new Date(to).getTime() - new Date(from).getTime()) / msPerDay) + 1;
-    const priorTo = new Date(new Date(from).getTime() - msPerDay).toISOString().split('T')[0];
-    const priorFrom = new Date(new Date(from).getTime() - days * msPerDay).toISOString().split('T')[0];
 
     const baseUrl = `http://localhost:${PORT}`;
     const mfCallInternal = async (path, query = {}) => {
@@ -6433,50 +6429,44 @@ app.get('/api/money-funnel', async (req, res) => {
       return d;
     };
 
-    const [pnl, pvm] = await Promise.all([
-      mfCallInternal('/api/pnl', { from, to, group: 'month', channel }),
-      mfCallInternal('/api/pvm', { s1_from: priorFrom, s1_to: priorTo, s2_from: from, s2_to: to, metric: 'revenue', level: 'asin', channel }),
-    ]);
-
+    const pnl = await mfCallInternal('/api/pnl', { from, to, group: 'month', channel });
     const t = pnl.totals || {};
     const mfNum = (v) => { const x = parseFloat(v); return Number.isFinite(x) ? x : 0; };
     const round2 = (v) => Math.round(v * 100) / 100;
 
-    // Sales/COGS/Marketing/Profit all come from /api/pnl's own already-reconciled totals (the
-    // same numbers the P&L page shows), not re-derived here - this guarantees the funnel ties
-    // out exactly: currentSales - costOfGoods - marketing === profit, by construction.
-    const currentSales = mfNum(t.net_sales);
-    // "Cost of Goods" is deliberately the ALL-IN bucket the product ask described: product COGS
-    // + per-order-line Amazon/Shopify selling fees + every OPEX line (account-level fees like
-    // storage/subscription, adjustments, headcount/fixed costs) - everything except ad spend,
-    // which gets its own "Marketing" stage below.
-    const costOfGoods = -(mfNum(t.cogs?.total) + mfNum(t.fees?.total) + mfNum(t.opex?.total));
-    const marketing = -mfNum(t.ppc_cost);
-    const profit = mfNum(t.profit);
-    const afterCogs = round2(currentSales - costOfGoods);
+    const grossSales = mfNum(t.gross_sales);
+    const zoneOf = (marginPct) => marginPct >= 20 ? 'healthy' : marginPct >= 0 ? 'watch' : 'loss';
+    const marginPctOf = (value) => grossSales > 0 ? (value / grossSales) * 100 : 0;
 
-    // Price/Volume/Mix bridge into the Sales stage, from PVM. Its own scenario2 value is
-    // computed independently of /api/pnl's net_sales (same underlying data and filters, so the
-    // two should agree to well within a rounding penny) - shown only as the bridge's own
-    // endpoint, with the funnel below it keyed off /api/pnl's figure as the source of truth.
-    const salesBridge = {
-      prior: { from: priorFrom, to: priorTo, value: round2(mfNum(pvm.scenario1?.value)) },
-      price: round2(mfNum(pvm.bridge?.price)),
-      volume: round2(mfNum(pvm.bridge?.volume)),
-      mix: round2(mfNum(pvm.bridge?.mix)),
-      current: { from, to, value: round2(mfNum(pvm.scenario2?.value)) },
+    // `delta` is the change FROM the previous point - null for Sales, which seeds the running
+    // balance at gross sales rather than being a change from something before it.
+    let running = grossSales;
+    const point = (id, label, delta) => {
+      if (delta !== null) running += delta;
+      const marginPct = marginPctOf(running);
+      return { id, label, delta: delta === null ? null : round2(delta), value: round2(running), margin_pct: round2(marginPct), zone: zoneOf(marginPct) };
     };
+
+    const points = [
+      point('sales', 'Sales', null),
+      point('discounts', 'Discounts', mfNum(t.total_discounts)),
+      point('returns', 'Returns', mfNum(t.total_refunded)),
+      point('cogs', 'Cost of Goods', mfNum(t.cogs?.total)),
+      point('fees', 'Selling Fees', mfNum(t.fees?.total)),
+      point('marketing', 'Marketing', mfNum(t.ppc_cost)),
+      point('opex', 'Storage & OPEX', mfNum(t.opex?.total)),
+    ];
+    // Profit is /api/pnl's own figure directly (not the running total above) so the line's
+    // endpoint always matches the P&L page's bottom line exactly, even to the penny.
+    const profit = mfNum(t.profit);
+    const profitMarginPct = marginPctOf(profit);
+    points.push({ id: 'profit', label: 'Profit', delta: null, value: round2(profit), margin_pct: round2(profitMarginPct), zone: zoneOf(profitMarginPct) });
 
     res.json({
       currency_symbol: pnl.currency_symbol || '£',
       current: { from, to },
-      prior: { from: priorFrom, to: priorTo },
-      sales_bridge: salesBridge,
-      funnel: [
-        { id: 'sales', label: 'Sales', value: round2(currentSales) },
-        { id: 'after_cogs', label: 'After Cost of Goods', value: afterCogs, removed: round2(costOfGoods), removed_label: 'Cost of Goods' },
-        { id: 'profit', label: 'Profit', value: round2(profit), removed: round2(marketing), removed_label: 'Marketing' },
-      ],
+      gross_sales: round2(grossSales),
+      points,
     });
   } catch (err) { console.error(err); res.status(500).json({ error: err.message }); }
 });
