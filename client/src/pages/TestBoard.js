@@ -1,6 +1,7 @@
 import React, { useMemo } from 'react';
 import { useApi } from '../hooks/useApi';
 import { useIsMobile } from '../hooks/useIsMobile';
+import MoneyFlow from '../components/MoneyFlow';
 
 // A small, fixed set of headline KPIs for a glanceable "is anything wrong" view - see
 // server/index.js's /api/command-center for why these 7 and not more (NOC/exec-dashboard
@@ -105,9 +106,20 @@ function Tile({ tile, sym }) {
   );
 }
 
+// Trailing 14 days, matching the rest of this page's own convention (see the tiles above) -
+// computed once per mount rather than on every render.
+function last14Range() {
+  const to = new Date();
+  const from = new Date(to);
+  from.setUTCDate(from.getUTCDate() - 13);
+  const iso = (d) => d.toISOString().split('T')[0];
+  return { from: iso(from), to: iso(to) };
+}
+
 export default function TestBoard() {
   const isMobile = useIsMobile();
   const { data, loading, error } = useApi('/api/command-center');
+  const flowRange = useMemo(() => last14Range(), []);
 
   const grouped = useMemo(() => {
     const m = {};
@@ -161,6 +173,8 @@ export default function TestBoard() {
               </div>
             </div>
           ))}
+
+          <MoneyFlow from={flowRange.from} to={flowRange.to} />
         </>
       )}
     </div>
