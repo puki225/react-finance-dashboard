@@ -9,6 +9,7 @@ import CashFlow from './pages/CashFlow';
 import CashFlowProjection from './pages/CashFlowProjection';
 import SalesForecast from './pages/SalesForecast';
 import ActionBoard from './pages/ActionBoard';
+import TestBoard from './pages/TestBoard';
 import Settings from './pages/Settings';
 import ChatWidget from './components/ChatWidget';
 import { useIsMobile } from './hooks/useIsMobile';
@@ -21,6 +22,7 @@ const NAV_SECTIONS = [
     label: 'Overview',
     items: [
       { id: 'actionboard', label: 'Action Board', icon: '◆', active: true },
+      { id: 'testboard', label: 'Test Board', icon: '◆', active: true },
     ],
   },
   {
@@ -209,6 +211,7 @@ export default function App() {
       {/* Main content */}
       <div style={{ flex: 1, overflow: 'auto', background: 'var(--bg)' }}>
         {active === 'actionboard' && <ActionBoard />}
+        {active === 'testboard'  && <TestBoard />}
         {active === 'sales'     && <SalesSummary />}
         {active === 'products'  && <ProductBreakdown />}
         {active === 'pnl'       && <PnL />}
